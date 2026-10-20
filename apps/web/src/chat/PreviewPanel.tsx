@@ -15,7 +15,8 @@ const GIT_C_ESCAPES: Record<number, string> = {
   0x0b: "\\v", 0x0c: "\\f", 0x0d: "\\r", 0x22: '\\"', 0x5c: "\\\\",
 };
 
-function gitQuoted(p: string): string {
+// 引号内的转义内容(不含外层引号):目录前缀匹配需要它,以便拼出 "a/<dir>/ 这样的前缀
+function gitQuoteBody(p: string): string {
   let out = "";
   for (const b of new TextEncoder().encode(p)) {
     const esc = GIT_C_ESCAPES[b];
@@ -23,16 +24,35 @@ function gitQuoted(p: string): string {
     else if (b >= 0x20 && b < 0x7f) out += String.fromCharCode(b);
     else out += `\\${b.toString(8).padStart(3, "0")}`;
   }
-  return `"${out}"`;
+  return out;
 }
 
-// 目标路径在 diff 头里的候选形态:同一路径的普通/引号两种头,以及 rename 段
-// (a/旧路径 b/新路径)里目标侧出现在头行末尾的情况。
+function gitQuoted(p: string): string {
+  return `"${gitQuoteBody(p)}"`;
+}
+
+// 目标路径在 diff 头里的候选形态:
+// - heads:本路径作为源文件出现在头行开头(普通/引号两种);后两条带尾空格,兼容 rename 段
+//   "a/旧路径 b/新路径" 的旧路径侧。已知残余:文件名自身含 " b" 的极端情况可能靠尾空格
+//   误命中,概率极低,不处理。
+// - tails:本路径作为目标文件出现在头行末尾(rename 的新路径侧)。
 function gitPathVariants(p: string): { heads: string[]; tails: string[] } {
   return {
-    heads: [`diff --git a/${p} b/${p}`, `diff --git ${gitQuoted(`a/${p}`)} ${gitQuoted(`b/${p}`)}`],
+    heads: [
+      `diff --git a/${p} b/${p}`,
+      `diff --git ${gitQuoted(`a/${p}`)} ${gitQuoted(`b/${p}`)}`,
+      `diff --git a/${p} `,
+      `diff --git ${gitQuoted(`a/${p}`)} `,
+    ],
     tails: [` b/${p}`, ` ${gitQuoted(`b/${p}`)}`],
   };
+}
+
+// 目录在头行里的前缀:未加引号 a/<dir>/ 与加引号 "a/<dir>/。
+// 引号形态不补收尾引号——头行是 "a/<dir>/file",目录前缀的 "/" 后面还有文件名。
+// 前缀带 "/",避免目录 src 误命中 src2/x。
+function dirPrefixes(p: string): string[] {
+  return [`diff --git a/${p}/`, `diff --git "a/${gitQuoteBody(`${p}/`)}`];
 }
 
 // 归一化为 git 头风格的相对路径:反斜杠转正斜杠,工作区内绝对路径只保留相对部分,
@@ -40,6 +60,8 @@ function gitPathVariants(p: string): { heads: string[]; tails: string[] } {
 function normalizePath(p: string, workspace: string): string {
   let s = p.replace(/\\/g, "/");
   const ws = workspace.replace(/\\/g, "/").replace(/\/+$/, "");
+  // 与工作区根仅大小写差异地相等时归一化为空串(工作区根,按目录处理)
+  if (ws && s.length === ws.length && s.toLowerCase() === ws.toLowerCase()) return "";
   // 按前缀长度切片而非用 lowercase 后的字符串切,避免非 ASCII 大小写折叠改变长度
   if (ws && s.slice(0, ws.length).toLowerCase() === ws.toLowerCase() && s[ws.length] === "/") {
     s = s.slice(ws.length + 1);
@@ -47,15 +69,22 @@ function normalizePath(p: string, workspace: string): string {
   return s.replace(/^(\.\/)+/, "").replace(/^\/+/, "");
 }
 
-// 按 "diff --git " 切段,找头行指向目标路径的段;找不到返回空串。
-function pickDiffSegment(text: string, p: string): string {
+// 按 "diff --git " 切段,找头行指向目标路径的段。
+// 单文件未命中时,再判断该路径是否是没有尾斜杠的目录(files.list 常给 "src" 这类裸目录名):
+// 任一段头行以该目录前缀开头即视为目录,返回 dirFallback,由调用方显示完整 diff。
+function pickDiff(text: string, p: string): { segment: string; dirFallback: boolean } {
   const { heads, tails } = gitPathVariants(p);
+  const dirs = dirPrefixes(p);
+  let dirFallback = false;
   for (const seg of text.split(/^(?=diff --git )/m)) {
     const nl = seg.indexOf("\n");
     const head = nl < 0 ? seg : seg.slice(0, nl);
-    if (heads.some((h) => head.startsWith(h)) || tails.some((t) => head.endsWith(t))) return seg;
+    if (heads.some((h) => head.startsWith(h)) || tails.some((t) => head.endsWith(t))) {
+      return { segment: seg, dirFallback: false };
+    }
+    if (!dirFallback && dirs.some((h) => head.startsWith(h))) dirFallback = true;
   }
-  return "";
+  return { segment: "", dirFallback };
 }
 
 export function PreviewPanel({ preview }: { preview: Preview }) {
@@ -111,10 +140,13 @@ export function PreviewPanel({ preview }: { preview: Preview }) {
   const rel = preview.path ? normalizePath(preview.path, preview.workspace) : "";
   // 工具给的 path 可能是目录(如 files.list 的 "src/" 或 "."):按单文件过滤必然找不到,
   // 此时不过滤,直接显示工作区完整 diff 并说明原因。
-  const isDir = rel === "" || rel === "." || rel.endsWith("/");
+  // 无尾斜杠的裸目录名("src")先按单文件试,未命中再看是否作为目录前缀出现在头行。
+  let isDir = rel === "" || rel === "." || rel.endsWith("/");
   if (preview.path && !isDir) {
-    text = pickDiffSegment(text, rel);
-    if (!text) return <div className="preview-body"><div className="preview-sub mono">未在该工作区的 git diff 中找到此路径的改动（未跟踪文件不在 git diff HEAD 中）</div></div>;
+    const hit = pickDiff(text, rel);
+    if (hit.segment) text = hit.segment;
+    else if (hit.dirFallback) isDir = true;
+    else return <div className="preview-body"><div className="preview-sub mono">未在该工作区的 git diff 中找到此路径的改动（未跟踪文件不在 git diff HEAD 中）</div></div>;
   }
   const truncated = text.length >= MAX_DIFF;
   if (truncated) text = text.slice(0, MAX_DIFF);
