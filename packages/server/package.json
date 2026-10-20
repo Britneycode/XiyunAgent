@@ -1,0 +1,12 @@
+{
+  "name": "@xiyun/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "@xiyun/runtime": "workspace:*",
+    "@xiyun/shared": "workspace:*",
+    "hono": "^4.7.0"
+  }
+}

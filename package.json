@@ -1,0 +1,26 @@
+{
+  "name": "xiyun-agent",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "node packages/server/src/index.ts",
+    "dev:web": "pnpm --filter @xiyun/web dev",
+    "dev:desktop": "pnpm --filter @xiyun/desktop dev",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "pnpm --filter @xiyun/web build",
+    "build:server": "esbuild packages/server/src/index.ts --bundle --platform=node --format=esm --outfile=apps/desktop/server.mjs",
+    "dist": "pnpm build && pnpm build:server && pnpm --filter @xiyun/desktop dist"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "packageManager": "pnpm@12.9.1+sha512.06b055fff5cd20dc12781de173ced3310ce0951bf2ec620211a16045d5444d5c93a663210764ef29a653a610459ba0368f0e74f84d80c54723cf95aae7bc0d6d"
+}

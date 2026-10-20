@@ -1,0 +1,20 @@
+# Local project handoff and development records
+AGENTS.md
+PROJECT_INDEX.md
+NOW.md
+MAP.md
+RUNBOOK.md
+DECISIONS.md
+RISKS.md
+history/
+
+# Node / build
+node_modules/
+dist/
+data/
+*.local
+
+# 构建产物
+apps/desktop/dist/
+apps/desktop/server.mjs
+apps/web/dist/

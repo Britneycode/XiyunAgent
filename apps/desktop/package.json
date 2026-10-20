@@ -1,0 +1,22 @@
+{
+  "name": "@xiyun/desktop",
+  "productName": "XiyunAgent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "dev": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.xiyun.agent",
+    "productName": "XiyunAgent",
+    "files": ["main.mjs", "server.mjs", { "from": "../web/dist", "to": "web" }],
+    "win": { "target": "nsis" }
+  }
+}
