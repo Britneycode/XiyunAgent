@@ -1,21 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { marked } from "marked";
 import type { ChatMessage } from "@xiyun/shared";
 import { api, streamChat } from "./api.ts";
-
-const escapeHtml = (s: string) =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-
-marked.use({
-  renderer: {
-    code({ text, lang }) {
-      if (typeof hljs !== "undefined" && lang && hljs.getLanguage(lang)) {
-        return `<pre><code class="hljs">${hljs.highlight(text, { language: lang }).value}</code></pre>`;
-      }
-      return `<pre><code class="hljs">${escapeHtml(text)}</code></pre>`;
-    },
-  },
-});
+import { renderMarkdown } from "./chat/markdown.ts";
 
 export function ChatPage({ sessionId, onBranch }: { sessionId: string; onBranch?: (messageId: number) => void }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -138,7 +124,7 @@ export function ChatPage({ sessionId, onBranch }: { sessionId: string; onBranch?
         {messages.length === 0 && <div className="empty">这个会话还没有消息。</div>}
         {messages.map((m, i) => (
           <div className={`msg ${m.role}`} key={m.id ?? i}>
-            <div className="msg-body" dangerouslySetInnerHTML={{ __html: marked.parse(m.content, { async: false }) }} />
+            <div className="msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} />
             {!busy && m.content && (
               <div className="msg-actions">
                 <button title="复制" onClick={(e) => copyMsg(m.content, e)}>⧉</button>
