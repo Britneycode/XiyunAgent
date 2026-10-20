@@ -120,7 +120,7 @@ export function WorkPage({ session, onSessionChanged }: { session: SessionMeta; 
           </aside>
         )}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-          <ChatPage key={session.id} sessionId={session.id} />
+          <ChatPage key={session.id} session={session} />
         </div>
         {drawer === "todos" && (
           <aside className="work-side">

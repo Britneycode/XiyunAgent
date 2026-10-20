@@ -254,7 +254,14 @@ export function App() {
               <div className="empty">新建或选择一个 Code 会话开始。</div>
             )
           ) : active ? (
-            <ChatPage key={active.id} sessionId={active.id} onBranch={(mid) => void branchTo(active.id, mid)} />
+            <ChatPage
+              key={active.id}
+              session={active}
+              onBranch={(mid) => void branchTo(active.id, mid)}
+              onPreview={() => {}}
+              onNewSession={() => void newSession()}
+              onCandidatesChanged={refreshCandidates}
+            />
           ) : (
             <div className="empty">新建或选择一个 Chat 会话开始。</div>
           )}

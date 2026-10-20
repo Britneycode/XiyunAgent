@@ -128,7 +128,7 @@ export function CodePage({ session, onSessionChanged }: { session: SessionMeta; 
           </button>
         ))}
       </div>
-      <ChatPage key={session.id} sessionId={session.id} />
+      <ChatPage key={session.id} session={session} />
       {drawer && (
         <div className="code-drawer">
           {drawer === "terminal" && (
