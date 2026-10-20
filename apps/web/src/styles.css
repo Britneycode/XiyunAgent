@@ -242,3 +242,68 @@ button.icon { padding: 4px 6px; line-height: 1; }
 @media (max-width: 980px) {
   .work-side { width: 240px; }
 }
+
+/* ===== 块渲染:思考 / 工具 / 引用 ===== */
+.mono { font-family: var(--code-font, monospace); }
+.msg-body.blocks { display: flex; flex-direction: column; gap: 8px; }
+.block-text p:first-child { margin-top: 0; }
+.block-text p:last-child { margin-bottom: 0; }
+
+.think { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
+.think-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  border: none; background: transparent; color: var(--muted); padding: 6px 10px; font-size: 12px; text-align: left;
+}
+.think-head:hover { color: var(--text); }
+.think-head .chev { margin-left: auto; }
+.think-body {
+  padding: 8px 12px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 12px; line-height: 1.6;
+  max-height: 260px; overflow-y: auto; white-space: pre-wrap;
+}
+.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: breath 1.4s ease-in-out infinite; }
+.pulse.done { animation: none; opacity: 0.45; }
+@keyframes breath { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.1); } }
+
+.tool { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.tool.error { border-color: #d6453d55; }
+.tool-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  border: none; background: transparent; padding: 6px 10px; font-size: 12px; text-align: left; color: var(--text);
+}
+.tool-name { font-weight: 600; }
+.tool-args { color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-status { color: var(--muted); font-size: 11px; }
+.tool-status.error { color: #d6453d; }
+.tool .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.tool.pending .dot { animation: breath 1.4s ease-in-out infinite; }
+.tool.error .dot { background: #d6453d; animation: none; }
+.tool-body { border-top: 1px solid var(--border); padding: 8px 10px; }
+.tool-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.tool-body pre { margin: 0 0 6px; font-size: 12px; max-height: 220px; overflow: auto; }
+.tool-err, .tool-target { font-size: 11px; color: var(--muted); }
+.tool-actions { display: flex; gap: 6px; padding: 0 10px 8px; }
+.tool-actions button { font-size: 11px; padding: 2px 8px; }
+
+.ref-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; justify-content: flex-end; }
+.ref-chip {
+  font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+  border-radius: 999px; padding: 1px 8px; background: var(--surface);
+}
+
+.code-block { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin: 8px 0; }
+.code-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 3px 10px; background: var(--surface); border-bottom: 1px solid var(--border);
+  font-family: var(--code-font, monospace); font-size: 11px; color: var(--muted);
+}
+.code-head button { border: none; background: transparent; color: var(--muted); font-size: 11px; padding: 2px 6px; cursor: pointer; }
+.code-head button:hover { color: var(--text); }
+.code-block pre { margin: 0; border-radius: 0; }
+.code-block code { counter-reset: line; }
+.code-block .line { display: block; }
+.code-block .line::before {
+  counter-increment: line; content: counter(line);
+  display: inline-block; width: 2.5em; margin-right: 1em;
+  text-align: right; color: var(--muted); opacity: 0.55; user-select: none;
+}
