@@ -24,11 +24,29 @@ export interface ProviderConfig {
   capabilities?: string[];
 }
 
+export type ChatBlock =
+  | { id: string; kind: "thinking"; text: string; durationMs?: number }
+  | {
+      id: string;
+      kind: "tool";
+      name: string;
+      rawArgs: string; // 拼接后的原始参数字符串,始终保留
+      args?: unknown; // rawArgs 解析成功时存在
+      argsError?: string; // 解析失败原因
+      status: "pending" | "success" | "error"; // 本轮只会出现 pending / error
+      note?: string; // 例如 "已中断"
+      target?: { workspace?: string; path?: string }; // 服务端填写
+    }
+  | { id: string; kind: "text"; text: string }
+  | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string }; // 仅 user 消息
+
 export interface ChatMessage {
   // id 仅持久化消息有(数据库自增主键);流式中的临时气泡没有
   id?: number;
   role: "system" | "user" | "assistant";
   content: string;
+  blocks?: ChatBlock[];
+  aborted?: boolean;
 }
 
 export interface Fact {

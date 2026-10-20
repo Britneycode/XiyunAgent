@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openDb, SCHEMA_VERSION } from "./db.ts";
+import type { ChatBlock, ChatMessage } from "@xiyun/shared";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "xiyun-db-"));
 
@@ -77,4 +78,11 @@ describe("db 迁移与备份(阶段 7)", () => {
     expect(readdirSync(dir)).not.toContain("backups");
     rmSync(dir, { recursive: true, force: true });
   });
+});
+
+it("ChatMessage 支持 blocks 与 aborted", () => {
+  const b: ChatBlock = { id: "t1", kind: "text", text: "hi" };
+  const m: ChatMessage = { id: 1, role: "assistant", content: "hi", blocks: [b], aborted: true };
+  expect(m.blocks?.[0].kind).toBe("text");
+  expect(m.aborted).toBe(true);
 });
