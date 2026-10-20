@@ -96,7 +96,7 @@
 - SQLite 用 Node 内置 `node:sqlite`(实验性),避免原生编译;FTS5 使用 `trigram` 分词以支持中文,<3 字符查询退化 LIKE;MATCH 整体短语化防语法冲突;短语无结果时退化为 3 字滑窗 OR 提升自然语言召回(2026-10-07,验收中发现纯短语匹配对长问句零召回)。
 - 记忆:事实带有效期,更新=结束旧事实有效期;软删除不进检索;`hard=true` 彻底忘记;`scope` 取值 `global`/模式名/工作区路径,Chat 检索只含当前三层。
 - 规则加载:全局 `data/rules/global.md`、模式 `data/rules/<mode>.md`、项目 `AGENTS.md`/`CLAUDE.md` 按序拼接进 system,项目规则最后优先级最高。
-- Chat 路由:优先 `registry().byRole("main")`,无角色标记时回退激活 Provider。
+- Chat 路由:优先激活 Provider(`activeProvider()`),无激活 Provider 时以 `main` 角色兜底。
 - 子智能体调度(阶段 3):`ModelRole` 扩展出 coder/reviewer/tester/researcher/tutor 绑定标签;子任务严格按角色解析模型,未绑定即失败、不回退未授权模型,临时覆盖需显式 `providerId`;只读角色(reviewer/researcher/tutor/memory)可并行,写角色(coder/tester)同工作区串行;pipeline 只把上游 `result.summary` 注入下游;子智能体读筛选后的模式/工作区记忆,产出只进候选区;结构化结果要求模型输出 ```json 块(status/summary/artifacts/changedFiles/risks/memoryCandidates),解析失败按纯文本兜底。
 - 记忆工具(补齐):`memchat.ts` 只在消息含意图词(记住/忘掉/别记等)时调一次小模型解析 JSON;remember 直接写事实(source=chat:cmd),forget 检索命中后软删除;FTS 召回为空时 `MemoryStore.recent` 兜底返回最近有效事实。
 - 工具层(阶段 4):PathGuard 复用 `assertInside`;命令三级分类——deny(rm -rf 根、format、shutdown、递归强删等直接拒绝,确认也不放行)、safe(git status/diff/log、ls、测试命令等免确认)、confirm(其余须 confirmed=true,API 返回 409 needsConfirm);命令参数含盘符/绝对路径/`~/`/`..` 时白名单命令也升级为 confirm(R-007);git commit 强制 confirmed;子智能体用 ```tool JSON 块协议调用工具(≤5 轮,不依赖 function calling),coder 可写文件,reviewer/tester/researcher 只读。

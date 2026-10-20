@@ -51,7 +51,7 @@ $env:XIYUN_EXPOSE_TOOLS = "1"
 pnpm dev
 ```
 
-生效条件(三者同时满足):环境变量为 `1`;Provider 配置的 capabilities 含 `tools`;会话已绑定工作区。仅下发只读工具定义(files.read/git.status/git.diff 等),无执行循环——模型请求工具后由前端展示调用卡片,不会自动执行。
+生效条件(三者同时满足):环境变量为 `1`;Provider 配置的 capabilities 含 `tools`;会话已绑定工作区。仅下发只读工具定义(list_files/read_file 等),无执行循环——模型请求工具后由前端展示调用卡片,不会自动执行。
 
 ## Windows 安装包
 
