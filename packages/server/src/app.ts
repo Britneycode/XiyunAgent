@@ -4,7 +4,7 @@ import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { AgentRole, ChatMessage, ProviderConfig, SessionMeta, TaskStatus } from "@xiyun/shared";
+import type { AgentRole, ChatBlock, ChatMessage, ProviderConfig, SessionMeta, TaskStatus } from "@xiyun/shared";
 import { MemoryStore } from "./memory.ts";
 import { ProviderStore } from "./providers.ts";
 import { loadRuleFiles } from "./workspace.ts";
@@ -146,11 +146,32 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
     db.prepare("DELETE FROM messages WHERE session_id = ?").run(c.req.param("id"));
     return c.json({ ok: true });
   });
+  // 损坏的 blocks JSON 按纯文本降级为 undefined,不让整个接口 500
+  const parseBlocks = (raw: string | null) => {
+    if (!raw) return undefined;
+    try {
+      const v = JSON.parse(raw) as unknown;
+      return Array.isArray(v) ? (v as ChatBlock[]) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   app.get("/sessions/:id/messages", (c) => {
     const rows = db
-      .prepare("SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id")
-      .all(c.req.param("id")) as unknown as ChatMessage[];
-    return c.json(rows);
+      .prepare("SELECT id, role, content, blocks, aborted FROM messages WHERE session_id = ? ORDER BY id")
+      .all(c.req.param("id")) as unknown as Array<{
+      id: number; role: string; content: string; blocks: string | null; aborted: number;
+    }>;
+    return c.json(
+      rows.map((r) => ({
+        id: r.id,
+        role: r.role,
+        content: r.content,
+        blocks: parseBlocks(r.blocks),
+        aborted: r.aborted ? true : undefined,
+      })),
+    );
   });
   // 编辑某条 user 消息:删除该条及其后所有消息,返回被删前的消息(供前端重新发送)。
   // 用于"编辑并重新生成"——截断历史后由 /chat 重新走一轮。

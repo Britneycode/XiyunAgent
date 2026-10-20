@@ -44,6 +44,23 @@ describe("数据导出", () => {
   });
 });
 
+describe("消息块读取", () => {
+  it("GET messages 解析 blocks,坏 JSON 不 500", async () => {
+    const { app, db } = setup();
+    const sres = await post(app, "/sessions", { title: "块" });
+    const s = (await sres.json()) as { id: string };
+    db.prepare("INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, 'assistant', 'a', ?, 1, 't')")
+      .run(s.id, JSON.stringify([{ id: "t1", kind: "text", text: "a" }]));
+    db.prepare("INSERT INTO messages (session_id, role, content, blocks, created_at) VALUES (?, 'assistant', 'b', '{bad', 't')").run(s.id);
+    const res = await app.request(`/sessions/${s.id}/messages`);
+    expect(res.status).toBe(200);
+    const msgs = (await res.json()) as Array<{ blocks?: unknown; aborted?: boolean }>;
+    expect(msgs[0].blocks).toEqual([{ id: "t1", kind: "text", text: "a" }]);
+    expect(msgs[0].aborted).toBe(true);
+    expect(msgs[1].blocks).toBeUndefined();
+  });
+});
+
 describe("数据导入", () => {
   const packWith = (sid: string, extra: Record<string, unknown> = {}) => ({
     kind: "xiyun-export", version: 1, exportedAt: "2026-01-01",

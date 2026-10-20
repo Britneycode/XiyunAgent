@@ -70,6 +70,26 @@ describe("db 迁移与备份(阶段 7)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("v4 老库升级到 v5 后 messages 具备 blocks/aborted", () => {
+    const dir = tmp();
+    const file = join(dir, "old.db");
+    // 模拟 v4 库:只建旧结构并写 user_version=4
+    const old = new DatabaseSync(file);
+    old.exec(`
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'chat', workspace TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+      PRAGMA user_version = 4;
+    `);
+    old.close();
+    const db = openDb(file);
+    const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toContain("blocks");
+    expect(cols).toContain("aborted");
+    expect(Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)).toBe(5);
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("已是最新版本的库不重复备份", () => {
     const dir = tmp();
     const file = join(dir, "app.db");
