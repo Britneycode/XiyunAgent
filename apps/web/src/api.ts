@@ -1,4 +1,19 @@
-import type { AgentRole, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, WorkDoc } from "@xiyun/shared";
+import type { AgentRole, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, WorkDoc } from "@xiyun/shared";
+
+// /chat SSE 事件:typed 块事件 + 旧版 plain delta/error/done
+export type StreamEvent =
+  | { type: "block"; id: string; block: { kind: "text" | "thinking" } | { kind: "tool"; name: string; status: string } }
+  | { type: "block_delta"; id: string; delta: string }
+  | { type: "block_end"; id: string; block: ChatBlock }
+  | { delta: string; id?: string }
+  | { error: string }
+  | { done: true; messageId?: number; userMessageId?: number };
+
+export interface RefPayload {
+  refType: "message" | "doc" | "file";
+  label: string;
+  excerpt: string;
+}
 
 // 打包态 Electron 用 loadFile 加载 file:// 页面,没有 vite proxy,/api 会被当文件路径。
 // file: 协议时直连 Server 127.0.0.1:3777(CORS 白名单已含 null origin,无 Origin 头放行)。
@@ -77,6 +92,8 @@ export const api = {
   // ---- 阶段 5:Work ----
   listFiles: (workspace: string, path?: string) =>
     req<{ files: string[] }>("/tools/list", { method: "POST", body: JSON.stringify({ workspace, path }) }),
+  readFile: (workspace: string, path: string) =>
+    req<{ content: string }>("/tools/read", { method: "POST", body: JSON.stringify({ workspace, path }) }),
   workDocs: (workspace?: string) => req<WorkDoc[]>(`/work/docs${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`),
   workDoc: (id: string) => req<WorkDoc>(`/work/docs/${id}`),
   importDocFile: (b: { workspace: string; path: string; sessionId?: string }) =>
@@ -118,12 +135,18 @@ export async function streamChat(
   onDelta: (delta: string) => void,
   signal?: AbortSignal,
   regenerate = false,
+  // opts.onEvent 不为空时,所有事件原样透传(含块事件);否则退回旧 onDelta 行为
+  opts?: { onEvent?: (ev: StreamEvent) => void; context?: string; refs?: RefPayload[] },
 ): Promise<void> {
   const res = await fetch(`${base}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     // regenerate=true 时 server 不再落库 user 消息(该消息此前已入库),并覆盖上一条 assistant 回复
-    body: JSON.stringify({ sessionId, message, regenerate }),
+    body: JSON.stringify({
+      sessionId, message, regenerate,
+      context: opts?.context,
+      refs: opts?.refs,
+    }),
     signal: signal ?? null,
   });
   if (!res.ok || !res.body) throw new Error(await res.text());
@@ -139,9 +162,16 @@ export async function streamChat(
     for (const b of blocks) {
       const line = b.split("\n").find((l) => l.startsWith("data:"));
       if (!line) continue;
-      const ev = JSON.parse(line.slice(5).trim()) as { delta?: string; error?: string; done?: boolean };
-      if (ev.error) throw new Error(ev.error);
-      if (ev.delta) onDelta(ev.delta);
+      let ev: StreamEvent;
+      try {
+        ev = JSON.parse(line.slice(5).trim()) as StreamEvent;
+      } catch {
+        continue; // 坏 JSON 跳过
+      }
+      if ("error" in ev && ev.error) throw new Error(ev.error);
+      if (opts?.onEvent) opts.onEvent(ev);
+      // 旧调用方只收未带 type 的 delta,块事件(type 字段)不下漏到消息文本
+      else if (!("type" in ev) && "delta" in ev && ev.delta) onDelta(ev.delta);
     }
   }
 }
