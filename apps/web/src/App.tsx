@@ -6,6 +6,8 @@ import { MemoryPage } from "./MemoryPage.tsx";
 import { TasksPanel } from "./TasksPanel.tsx";
 import { CodePage } from "./CodePage.tsx";
 import { WorkPage } from "./WorkPage.tsx";
+import type { Preview } from "./chat/blocks.tsx";
+import { PreviewPanel } from "./chat/PreviewPanel.tsx";
 import { api, health } from "./api.ts";
 import { applyTheme, loadTheme } from "./theme.ts";
 
@@ -40,13 +42,21 @@ export function App() {
   const [query, setQuery] = useState("");
   // 窗口 <980px 时 aside 变浮层,默认收起避免遮挡主区;用户可用顶栏按钮展开
   const [asideOpen, setAsideOpen] = useState(() => window.innerWidth >= 980);
-  const [asideTab, setAsideTab] = useState<"candidates" | "tasks">("candidates");
+  const [asideTab, setAsideTab] = useState<"candidates" | "tasks" | "preview">("candidates");
+  const [preview, setPreview] = useState<Preview>(null);
   const [candidates, setCandidates] = useState<MemoryCandidate[]>([]);
   const [online, setOnline] = useState(true);
   const [showArchived, setShowArchived] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; title: string } | null>(null);
   // 窗口 <720px 时 rail 变浮层,默认收起避免遮挡主区;顶栏按钮展开
   const [railOpen, setRailOpen] = useState(() => window.innerWidth >= 720);
+
+  // 预览入口:记录内容并自动展开 aside 切到预览 tab
+  const showPreview = (p: Preview) => {
+    setPreview(p);
+    setAsideTab("preview");
+    setAsideOpen(true);
+  };
 
   useEffect(() => applyTheme(loadTheme()), []);
 
@@ -258,7 +268,7 @@ export function App() {
               key={active.id}
               session={active}
               onBranch={(mid) => void branchTo(active.id, mid)}
-              onPreview={() => {}}
+              onPreview={showPreview}
               onNewSession={() => void newSession()}
               onCandidatesChanged={refreshCandidates}
             />
@@ -275,8 +285,13 @@ export function App() {
               <button className={asideTab === "tasks" ? "active" : ""} onClick={() => setAsideTab("tasks")}>
                 子任务
               </button>
+              <button className={asideTab === "preview" ? "active" : ""} onClick={() => setAsideTab("preview")}>
+                预览
+              </button>
             </div>
-            {asideTab === "tasks" ? (
+            {asideTab === "preview" ? (
+              <PreviewPanel preview={preview} />
+            ) : asideTab === "tasks" ? (
               // 只在当前模式的活动会话有效时绑定 sessionId/mode/workspace,否则仅传当前 mode 用于预设文案。
               <TasksPanel
                 sessionId={active?.id ?? null}
