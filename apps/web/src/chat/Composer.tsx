@@ -280,14 +280,21 @@ export function Composer(props: {
   );
 }
 
-// 导出格式:正文原样;thinking 引用块;tool 单行;aborted 标注
+// 导出格式:正文原样;thinking 引用块;tool 单行;ref 引用标记;aborted 标注
 function toMarkdown(title: string, messages: UIMessage[]): string {
   const out: string[] = [`# ${title}`, ""];
   for (const m of messages) {
     out.push(`## ${m.role === "user" ? "用户" : "助手"}`, "");
-    const blocks = m.blocks?.length ? m.blocks : [{ id: "", kind: "text" as const, text: m.content }];
+    // 带 refs 的 user 消息 content 存原话、blocks 只有 ref 块,正文必须始终取自 content
+    const blocks =
+      m.role === "user"
+        ? [{ id: "", kind: "text" as const, text: m.content }, ...(m.blocks ?? [])]
+        : m.blocks?.length
+          ? m.blocks
+          : [{ id: "", kind: "text" as const, text: m.content }];
     for (const b of blocks) {
       if (b.kind === "text") out.push(b.text, "");
+      else if (b.kind === "ref") out.push(`> @${b.label}`, "");
       else if (b.kind === "thinking") {
         out.push(`> 思考（${((b.durationMs ?? 0) / 1000).toFixed(1)}s）`);
         out.push(...b.text.split("\n").map((l) => `> ${l}`), "");
