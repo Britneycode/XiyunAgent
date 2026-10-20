@@ -14,19 +14,18 @@ const secs = (ms?: number) => `${((ms ?? 0) / 1000).toFixed(1)}s`;
 export function ThinkingBlock({
   block,
   streaming,
-  autoCollapse,
 }: {
   block: Extract<ChatBlock, { kind: "thinking" }>;
   streaming: boolean;
-  autoCollapse: boolean;
 }) {
   const [open, setOpen] = useState(true);
+  const touched = useRef(false);
   useEffect(() => {
-    if (!streaming && autoCollapse) setOpen(false);
-  }, [streaming, autoCollapse]);
+    if (!streaming && !touched.current) setOpen(false);
+  }, [streaming]);
   return (
     <div className={`think${open ? " open" : ""}`}>
-      <button className="think-head" onClick={() => setOpen(!open)} type="button">
+      <button className="think-head" onClick={() => { touched.current = true; setOpen(!open); }} type="button">
         <i className={`pulse${streaming ? "" : " done"}`} />
         <span>{streaming ? "思考中" : "已思考"}</span>
         <span className="mono">{streaming ? "" : secs(block.durationMs)}</span>
@@ -46,7 +45,8 @@ export function ToolBlock({
 }) {
   const [open, setOpen] = useState(false);
   const summary = (block.rawArgs || "").slice(0, 60);
-  const label = block.status === "error" ? (block.note || "错误") : block.note || "待执行";
+  const label =
+    block.status === "error" ? (block.note || "错误") : block.status === "success" ? (block.note || "完成") : (block.note || "待执行");
   return (
     <div className={`tool ${block.status}`}>
       <button className="tool-head" onClick={() => setOpen(!open)} type="button">
@@ -112,13 +112,11 @@ export function MessageBody({
   blocks,
   streaming,
   onPreview,
-  manualOpen,
 }: {
   content: string;
   blocks?: ChatBlock[];
   streaming?: boolean;
   onPreview?: (p: Preview) => void;
-  manualOpen?: Set<string>;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -141,15 +139,14 @@ export function MessageBody({
 
   // 只渲染 text/thinking/tool;ref 块在用户消息上方单独渲染
   return (
-    <div className="msg-body blocks">
+    <div className="msg-body blocks" ref={ref}>
       {blocks.map((b) => {
         if (b.kind === "thinking")
           return (
             <ThinkingBlock
               key={b.id}
               block={b}
-              streaming={!!streaming}
-              autoCollapse={!manualOpen?.has(b.id)}
+              streaming={!!streaming && b.durationMs === undefined}
             />
           );
         if (b.kind === "tool") return <ToolBlock key={b.id} block={b} onPreview={onPreview} />;
