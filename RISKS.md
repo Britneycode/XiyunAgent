@@ -87,3 +87,11 @@
 **触发条件**：修改 markdown.ts 渲染链或升级 vendor 依赖。
 
 **处理**：改动 renderMarkdown 时必须保持：HTML 注解标签不解析、image 的 href/text/title 与 code 内容全过 escapeHtml；新增任何 dangerouslySetInnerHTML 使用点需说明输入来源。既有遗留：链接 href 不过滤 `javascript:` 协议（2026-10-21 裁决不修，如需处理应在 link renderer 做协议白名单）。
+
+## R-012：重新生成丢失引用上下文
+
+**影响**：带 @引用（文件/文档）的消息点"重新生成"时，重发只用消息正文（D-015 规定引用内容不落库、仅注入当次 context），重新生成的回答看不到原引用内容，用户无提示。
+
+**触发条件**：对带 ref 块的消息执行 regenerate。
+
+**处理**：当前登记为已知限制；后续可在 regenerate 时按 ref 块元数据重新拉取注入，或对带引用消息禁用/提示重新生成。

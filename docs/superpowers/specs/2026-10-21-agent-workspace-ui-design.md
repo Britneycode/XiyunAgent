@@ -63,11 +63,15 @@ export type ChatBlock =
       id: string;
       kind: "tool";
       name: string;
-      args: unknown;
-      status: "pending" | "success" | "error";
-      target?: { workspace?: string; path?: string };
+      rawArgs: string; // 拼接后的原始参数字符串,始终保留
+      args?: unknown; // rawArgs 解析成功时存在
+      argsError?: string; // 解析失败原因
+      status: "pending" | "success" | "error"; // 本轮只会出现 pending / error
+      note?: string; // 例如 "已中断"
+      target?: { workspace?: string; path?: string }; // 服务端填写
     }
-  | { id: string; kind: "text"; text: string };
+  | { id: string; kind: "text"; text: string }
+  | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string }; // 仅 user 消息
 ```
 
 `ChatMessage` 增加可选字段 `blocks?: ChatBlock[]`。
@@ -80,7 +84,7 @@ export type ChatBlock =
 { "delta": "..." }                                     // 正文增量，保留
 { "type": "block", "id": "...", "block": { "kind": "thinking" } }
 { "type": "block_delta", "id": "...", "delta": "..." } // thinking 与 tool args 增量
-{ "type": "block_end", "id": "...", "meta": { "durationMs": 1234, "status": "pending" } }
+{ "type": "block_end", "id": "...", "block": { ... } } // 该块完整 ChatBlock 快照
 { "done": true }
 { "error": "..." }
 ```
@@ -88,8 +92,8 @@ export type ChatBlock =
 规则：
 
 - 正文仍同时发 `{delta}`，并作为 `kind:"text"` 块参与 `blocks` 顺序。
-- `thinking` 块在首个 reasoning 增量到达时发 `block`，增量发 `block_delta`，结束时发 `block_end` 带耗时。
-- `tool` 块：`tool_start` 发 `block`（含 `name`、`status:"pending"`），`tool_args` 发 `block_delta`，`tool_end` 发 `block_end`（`meta.status` 固定 `pending`，`args` 解析失败时 `meta.status:"error"` 且保留原始字符串）。本轮不执行工具。
+- `thinking` 块在首个 reasoning 增量到达时发 `block`，增量发 `block_delta`，结束时发 `block_end` 携带该块完整快照 `block`（耗时在快照的 `durationMs` 字段）。
+- `tool` 块：`tool_start` 发 `block`（含 `name`、`status:"pending"`），`tool_args` 发 `block_delta`，`tool_end` 发 `block_end` 携带该块完整快照 `block`（终态在快照的 `status` 字段，固定 `pending`，参数解析失败时为 `error`；解析结果在 `args`，失败时保留 `rawArgs` 并带 `argsError`）。本轮不执行工具。
 - 未知 `type` 与坏 JSON 由客户端跳过；服务端不依赖客户端确认。
 
 ### 2.4 持久化
