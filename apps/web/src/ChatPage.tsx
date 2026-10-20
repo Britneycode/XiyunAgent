@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import type { SessionMeta } from "@xiyun/shared";
 import { api } from "./api.ts";
 import { MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
+import { Composer } from "./chat/Composer.tsx";
 import { useChatStream } from "./chat/useChatStream.ts";
 import { renderMarkdown as renderMarkdownSafe } from "./chat/markdown.ts";
-// 注意:本任务不引入 Composer(Task 11 才创建);输入区沿用原 chat-input-wrap 实现,见下方 JSX。
 
 export interface ChatPageProps {
   session: SessionMeta;
@@ -20,7 +20,6 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
   });
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
-  const [inputText, setInputText] = useState("");
   const scroller = useRef<HTMLDivElement>(null);
 
   // 仅在接近底部时自动滚动;瞬时定位避免 smooth 造成抖动
@@ -69,9 +68,6 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, stop]);
 
-  const lastIsAssistant = messages[messages.length - 1]?.role === "assistant";
-  const lastIsError = lastIsAssistant && !!messages[messages.length - 1]?.error;
-
   return (
     <>
       <div className="chat-messages" ref={scroller} onClick={onCopyClick}>
@@ -118,60 +114,19 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
           </div>
         ))}
       </div>
-      {/* 输入区:本任务沿用原 chat-input-wrap 结构,Task 11 才整体替换为 Composer。
-          与原实现的差异:editingId 改为状态对(editingId/editText),重发走 send(text)。 */}
-      <div className="chat-input-wrap">
-        {editingId != null && (
-          <div className="editing-bar">
-            正在编辑消息,发送后将替换该条及其后的对话
-            <button onClick={() => { setEditingId(null); setEditText(""); }}>取消编辑</button>
-          </div>
-        )}
-        <div className="chat-input">
-          <textarea
-            value={editingId != null ? editText : inputText}
-            onChange={(e) => (editingId != null ? setEditText(e.target.value) : setInputText(e.target.value))}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !busy) {
-                e.preventDefault();
-                if (editingId != null) void submitEdit();
-                else {
-                  const text = inputText.trim();
-                  if (text) { setInputText(""); void send(text); }
-                }
-              }
-            }}
-            placeholder={editingId != null ? "编辑消息,Enter 重新生成" : "输入消息,Enter 发送,Shift+Enter 换行,Esc 停止"}
-            disabled={busy}
-          />
-          {busy ? (
-            <>
-              <span className="hint">生成中…(Esc 停止)</span>
-              <button className="danger" onClick={stop}>停止</button>
-            </>
-          ) : (
-            <>
-              {lastIsAssistant && messages.length > 0 && editingId == null && (
-                <button onClick={regenerate} title="对同一问题重新生成回答">
-                  {lastIsError ? "重试" : "重新生成"}
-                </button>
-              )}
-              <button
-                className="primary"
-                onClick={() => {
-                  if (editingId != null) void submitEdit();
-                  else {
-                    const text = inputText.trim();
-                    if (text) { setInputText(""); void send(text); }
-                  }
-                }}
-              >
-                发送
-              </button>
-            </>
-          )}
-        </div>
-      </div>
+      <Composer
+        session={session}
+        busy={busy}
+        editingId={editingId}
+        editText={editText}
+        onEditText={setEditText}
+        onCancelEdit={() => { setEditingId(null); setEditText(""); }}
+        onSubmit={(text, o) => (editingId != null ? void submitEdit() : void send(text, o))}
+        onStop={stop}
+        onNewSession={onNewSession}
+        onCandidatesChanged={onCandidatesChanged}
+        messages={messages}
+      />
     </>
   );
 }
