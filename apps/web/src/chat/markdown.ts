@@ -49,8 +49,16 @@ const renderer = {
   html({ text }: { text: string }) {
     return escapeHtml(text);
   },
+  // 图片 alt/title/href 均来自模型可控文本,属性位置一律转义(marked 默认会透传 alt 内的 HTML)
+  image({ href, title, text }: { href: string; title: string | null; text: string }) {
+    return (
+      `<img src="${escapeHtml(href ?? "")}" alt="${escapeHtml(text ?? "")}"` +
+      (title ? ` title="${escapeHtml(title)}"` : "") +
+      `>`
+    );
+  },
   code({ text, lang, raw }: { text: string; lang?: string; raw: string }) {
-    const fence = /^(```|~~~)/.exec(raw)?.[1] ?? "";
+    const fence = /^[ \t]*(```|~~~)/.exec(raw)?.[1] ?? "";
     const trimmed = raw.trimEnd();
     // 流式中最后一个代码块可能还没闭合:只输出转义纯文本,避免半截高亮与行号
     const closed = fence !== "" && trimmed.endsWith(fence) && trimmed.lastIndexOf(fence) > 0;
