@@ -195,16 +195,20 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
     if (!src) return c.json({ error: "session not found" }, 404);
     const maxId = typeof body.messageId === "number" ? body.messageId : Number.MAX_SAFE_INTEGER;
     const msgs = db
-      .prepare("SELECT role, content, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
-      .all(sessionId, maxId) as unknown as Array<{ role: string; content: string; created_at: string }>;
+      .prepare("SELECT role, content, blocks, aborted, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
+      .all(sessionId, maxId) as unknown as Array<{
+      role: string; content: string; blocks: string | null; aborted: number; created_at: string;
+    }>;
     const nid = randomUUID();
     const title = (body.title?.trim() || `${src.title}(分支)`).slice(0, 80);
     const ts = now();
     db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at) VALUES (?, ?, ?, ?, ?)").run(
       nid, title, src.mode, src.workspace, ts,
     );
-    const ins = db.prepare("INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)");
-    for (const m of msgs) ins.run(nid, m.role, m.content, m.created_at);
+    const ins = db.prepare(
+      "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.created_at);
     return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts });
   });
 
@@ -639,7 +643,7 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
 
   app.get("/admin/export", (c) => {
     const sessions = db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>;
-    const messages = db.prepare("SELECT session_id, role, content, created_at FROM messages ORDER BY id").all();
+    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, created_at FROM messages ORDER BY id").all();
     const docs = db.prepare("SELECT * FROM docs ORDER BY created_at").all();
     const todos = db.prepare("SELECT * FROM todos ORDER BY created_at").all();
     const facts = db.prepare("SELECT * FROM facts WHERE deleted_at IS NULL ORDER BY valid_from").all();
@@ -696,14 +700,26 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
         insSession.run(r.id, String(r.title ?? "导入会话"), String(r.mode ?? "chat"), String(r.workspace ?? ""), String(r.created_at ?? now()), r.archived ? 1 : 0);
         add.sessions++;
       }
-      const insMsg = db.prepare("INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)");
+      const insMsg = db.prepare(
+        "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      );
       // 消息无稳定 id,重复导入同一导出包时按 (session_id, role, content, created_at) 去重,避免二次落库
       const hasMsg = db.prepare("SELECT 1 FROM messages WHERE session_id = ? AND role = ? AND content = ? AND created_at = ?");
       for (const r of (d.messages ?? []) as Array<Record<string, unknown>>) {
         if (typeof r.session_id !== "string" || !sessionIds.has(r.session_id)) continue;
         const role = String(r.role ?? "user"), content = String(r.content ?? ""), created = String(r.created_at ?? now());
         if (hasMsg.get(r.session_id, role, content, created)) continue;
-        insMsg.run(r.session_id, role, content, created);
+        // 非合法 JSON 的 blocks 存 NULL,避免把坏数据带进来
+        let blocks: string | null = null;
+        if (typeof r.blocks === "string") {
+          try {
+            JSON.parse(r.blocks);
+            blocks = r.blocks;
+          } catch {
+            blocks = null;
+          }
+        }
+        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, created);
         add.messages++;
       }
       const simple = (table: string, cols: string[], rows: unknown[] | undefined, key: keyof typeof skip) => {

@@ -128,3 +128,43 @@ describe("数据导入", () => {
     expect(db.prepare("SELECT 1 FROM facts WHERE id = 'f_bad'").get()).toBeUndefined();
   });
 });
+
+it("分支、导出、导入保留 blocks 与 aborted", async () => {
+  const { app, db } = setup();
+  const s = (await (await post(app, "/sessions", {})).json()) as { id: string };
+  const blocks = JSON.stringify([{ id: "t1", kind: "text", text: "hi" }]);
+  db.prepare("INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, 'assistant', 'hi', ?, 1, 't')")
+    .run(s.id, blocks);
+
+  const branch = await app.request(`/sessions/${s.id}/branch`, {
+    method: "POST", headers: json, body: JSON.stringify({}),
+  });
+  const b = (await branch.json()) as { id: string };
+  const copied = db.prepare("SELECT blocks, aborted FROM messages WHERE session_id = ?").get(b.id) as {
+    blocks: string; aborted: number;
+  };
+  expect(JSON.parse(copied.blocks)).toEqual(JSON.parse(blocks));
+  expect(copied.aborted).toBe(1);
+
+  const exp = (await (await app.request("/admin/export")).json()) as {
+    data: {
+      sessions: Array<Record<string, unknown>>;
+      messages: Array<{ session_id: string; role: string; content: string; created_at: string; blocks?: string; aborted?: number }>;
+    };
+  };
+  const exported = exp.data.messages.find((m) => m.blocks === blocks);
+  expect(exported?.aborted).toBe(1);
+
+  // 导入到空库:保留 blocks(只取原会话的消息,避免分支副本影响计数)
+  const fresh = setup();
+  const res = await fresh.app.request("/admin/import", {
+    method: "POST", headers: json, body: JSON.stringify({
+      kind: "xiyun-export", version: 1,
+      data: { ...exp.data, messages: exp.data.messages.filter((m) => m.session_id === s.id) },
+    }),
+  });
+  expect(res.status).toBe(200);
+  const imported = fresh.db.prepare("SELECT blocks FROM messages WHERE blocks IS NOT NULL").all() as Array<{ blocks: string }>;
+  expect(imported).toHaveLength(1);
+  expect(JSON.parse(imported[0].blocks)).toEqual(JSON.parse(blocks));
+});
