@@ -769,9 +769,16 @@ export function createApp(
     return c.json(r);
   });
   app.post("/tools/git/diff", async (c) => {
-    const b = (await c.req.json()) as { workspace: string };
-    const r = await shellExec({ workspace: b.workspace, command: "git diff HEAD" });
-    return c.json(r);
+    const b = (await c.req.json().catch(() => ({}))) as { workspace: string };
+    try {
+      const r = await shellExec({ workspace: b.workspace, command: "git diff HEAD" });
+      // shellExec 对非零退出码不抛错(如非 git 目录),这里统一转为 400;
+      // stderr 可能带整段 git usage,只取首行作为错误信息
+      if (r.exitCode !== 0) throw new Error(r.stderr.trim().split("\n")[0] || `git diff 失败:exit ${r.exitCode}`);
+      return c.json(r);
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : "diff failed" }, 400);
+    }
   });
   app.post("/tools/git/preview", async (c) => {
     const b = (await c.req.json()) as { workspace: string };

@@ -274,6 +274,21 @@ describe("/chat 块协议", () => {
     }
   });
 
+  it("门控关闭时不下发 tools", async () => {
+    // 仅声明 tools 能力,不设置 XIYUN_EXPOSE_TOOLS,Provider 不应收到工具定义
+    let received: unknown = "unset";
+    const provider = fakeProvider([{ type: "text", delta: "ok" }, { type: "finish", reason: "stop" }], { toolsCap: true });
+    const orig = provider.streamEvents!;
+    provider.streamEvents = async function* (m, opts) {
+      received = opts?.tools;
+      yield* orig(m, opts);
+    };
+    const { app } = setup(provider);
+    const s = await session(app);
+    await post(app, { sessionId: s.id, message: "hi" });
+    expect(received).toBeUndefined(); // 未设置 XIYUN_EXPOSE_TOOLS
+  });
+
   it("中断时落半截并标记 aborted", async () => {
     // 用内部 AbortController 模拟 stream.onAbort:假 Provider 挂起,触发 abort 后抛 AbortError
     let internal!: AbortController;
