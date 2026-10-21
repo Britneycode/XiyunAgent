@@ -17,6 +17,7 @@ import { Inspector, type InspectorTab } from "./layout/Inspector.tsx";
 import { InspectorBridgeProvider, type InspectorBridge } from "./layout/inspectorBridge.tsx";
 import type { RenameState } from "./layout/SessionList.tsx";
 import { SideRail } from "./layout/SideRail.tsx";
+import { ShortcutsDialog } from "./layout/ShortcutsDialog.tsx";
 import { Sidebar } from "./layout/Sidebar.tsx";
 import { StatusBar } from "./layout/StatusBar.tsx";
 import { StreamHeader } from "./layout/StreamHeader.tsx";
@@ -92,6 +93,12 @@ export function App() {
   useHotkey("1", () => changeMode("chat"), { mod: true });
   useHotkey("2", () => changeMode("work"), { mod: true });
   useHotkey("3", () => changeMode("code"), { mod: true });
+  // M6:与主流聊天应用一致的快捷键;完整清单见 shortcuts.ts / Ctrl+/
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const closeShortcuts = useCallback(() => setShortcutsOpen(false), []);
+  useHotkey("o", () => void newSession(), { mod: true, shift: true });
+  useHotkey("s", () => setSideOpen(!sideOpen), { mod: true, shift: true });
+  useHotkey("/", () => setShortcutsOpen((v) => !v), { mod: true });
 
   const openInspector = (tab: InspectorTabId) => {
     setInspectorTab(tab);
@@ -308,6 +315,7 @@ export function App() {
         onPreview={showPreview}
         onNewSession={() => void newSession()}
         onCandidatesChanged={refreshCandidates}
+        onSessionChanged={refresh}
       />
     );
 
@@ -458,6 +466,7 @@ export function App() {
         onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
       />
       {mainContent}
+      <ShortcutsDialog open={shortcutsOpen} onClose={closeShortcuts} />
     </Workbench>
     </InspectorBridgeProvider>
   );

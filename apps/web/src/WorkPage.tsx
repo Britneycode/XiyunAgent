@@ -107,6 +107,7 @@ export function WorkPage({ session, onSessionChanged, onPreview, onBranch, onNew
         onBranch={onBranch}
         onNewSession={onNewSession}
         onCandidatesChanged={onCandidatesChanged}
+        onSessionChanged={onSessionChanged}
       />
 
       <InspectorPortal id="docs">

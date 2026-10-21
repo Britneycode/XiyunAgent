@@ -7,6 +7,7 @@ export type StreamEvent =
   | { type: "block_end"; id: string; block: ChatBlock }
   | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
   | { type: "meta"; userMessageId: number | null } // 首个事件:本轮 user 消息的落库 id
+  | { type: "title"; title: string } // 新会话自动命名完成(模型起的标题)
   | { delta: string; id?: string }
   // 出错时 server 已落库的半截 assistant 带 messageId(未落库为 null)
   | { error: string; messageId?: number | null; userMessageId?: number | null }
@@ -16,6 +17,7 @@ export interface RefPayload {
   refType: "message" | "doc" | "file";
   label: string;
   excerpt: string;
+  path?: string; // 文件引用的工作区相对路径
 }
 
 // 打包态 Electron 用 loadFile 加载 file:// 页面,没有 vite proxy,/api 会被当文件路径。

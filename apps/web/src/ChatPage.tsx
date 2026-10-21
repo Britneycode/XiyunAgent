@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { ArrowDown, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
+import { ArrowDown, Check, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
 import type { ChatBlock, SessionMeta } from "@xiyun/shared";
 import { api } from "./api.ts";
 import { CopyButton, MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
@@ -12,6 +12,8 @@ import { UsageBadge } from "./chat/UsageBadge.tsx";
 import { useChatStream, type UIMessage } from "./chat/useChatStream.ts";
 import { useStickToBottom } from "./chat/useStickToBottom.ts";
 import { MODE_META, type Mode } from "./layout/types.ts";
+import { lastCodeBlock } from "./shortcuts.ts";
+import { useHotkey } from "./ui/hooks.ts";
 import { cn } from "./ui/cn.ts";
 import { Button, IconButton } from "./ui/primitives.tsx";
 
@@ -21,6 +23,7 @@ export interface ChatPageProps {
   onPreview?: (p: Preview) => void;
   onNewSession?: () => void;
   onCandidatesChanged?: () => void;
+  onSessionChanged?: () => void; // 新消息 / 自动命名后刷新会话列表
 }
 
 // 消息项的操作经由 ref 传入,保持引用稳定,让历史消息在流式过程中跳过重渲染
@@ -164,9 +167,10 @@ const MessageItem = memo(function MessageItem({
   );
 });
 
-export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandidatesChanged }: ChatPageProps) {
+export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandidatesChanged, onSessionChanged }: ChatPageProps) {
   const { messages, setMessages, send, stop, regenerate, busy } = useChatStream(session, {
     onDone: onCandidatesChanged,
+    onSessionChanged,
   });
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
@@ -199,10 +203,43 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
   const actions = useRef<ItemActions>({ regenerate, startEdit });
   actions.current = { regenerate, startEdit, branch: onBranch, preview: onPreview };
 
-  // Esc 停止生成
+  // 复制快捷键的结果提示:底部浮出,1.6s 后消失
+  const [toast, setToast] = useState<{ text: string; ok: boolean } | null>(null);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 1600);
+    return () => clearTimeout(t);
+  }, [toast]);
+  const copy = (text: string | null, ok: string, empty: string) => {
+    if (!text) return setToast({ text: empty, ok: false });
+    void navigator.clipboard.writeText(text).then(
+      () => setToast({ text: ok, ok: true }),
+      () => setToast({ text: "复制失败", ok: false }),
+    );
+  };
+  // 已完成的 assistant 消息,从新到旧
+  const finished = () => messages.filter((m) => m.role === "assistant" && !m.streaming && m.content).reverse();
+  useHotkey("c", () => copy(finished()[0]?.content ?? null, "已复制最后一条回复", "还没有可复制的回复"), { mod: true, shift: true });
+  useHotkey(
+    "Semicolon",
+    () => {
+      let code: string | null = null;
+      for (const m of finished()) if ((code = lastCodeBlock(m.content)) !== null) break;
+      copy(code, "已复制最后一个代码块", "回复里还没有代码块");
+    },
+    { mod: true, shift: true },
+  );
+
+  // 输入框为空时 ↑:编辑最后一条已落库的 user 消息
+  const editLast = () => {
+    const last = [...messages].reverse().find((m) => m.role === "user" && m.id != null);
+    if (last) startEdit(last.id!, last.content);
+  };
+
+  // Esc 停止生成(Shift+Esc 留给"聚焦输入框")
   useEffect(() => {
     if (!busy) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && stop();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !e.shiftKey && stop();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, stop]);
@@ -237,7 +274,27 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
             )}
           </div>
         </div>
-        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex flex-col items-center gap-2">
+          <AnimatePresence>
+            {toast && (
+              <motion.div
+                key="toast"
+                role="status"
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 6 }}
+                transition={{ duration: 0.15 }}
+                className="inline-flex h-8 items-center gap-1.5 rounded-full border border-line bg-elevated px-3 text-xs text-muted shadow-pop"
+              >
+                {toast.ok ? (
+                  <Check size={13} strokeWidth={2} className="text-ok" aria-hidden />
+                ) : (
+                  <TriangleAlert size={13} strokeWidth={1.75} className="text-warn" aria-hidden />
+                )}
+                {toast.text}
+              </motion.div>
+            )}
+          </AnimatePresence>
           <AnimatePresence>
             {!atBottom && messages.length > 0 && (
               <motion.button
@@ -271,6 +328,7 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
         onStop={stop}
         onNewSession={onNewSession}
         onCandidatesChanged={onCandidatesChanged}
+        onEditLast={editLast}
         messages={messages}
       />
     </div>

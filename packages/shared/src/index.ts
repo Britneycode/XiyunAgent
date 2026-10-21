@@ -96,6 +96,7 @@ export interface SessionMeta {
   mode: string;
   workspace: string;
   createdAt: string;
+  updatedAt?: string; // 最近活动时间(最后一条消息);老数据缺省时用 createdAt
   archived?: boolean;
 }
 

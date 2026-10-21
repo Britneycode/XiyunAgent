@@ -25,6 +25,8 @@ import {
 } from "react";
 import type { SessionMeta, WorkDoc } from "@xiyun/shared";
 import { api, type RefPayload } from "../api.ts";
+import { useHotkey } from "../ui/hooks.ts";
+import { loadDraft, saveDraft } from "./drafts.ts";
 import { cn } from "../ui/cn.ts";
 import { Highlight, MenuGroupLabel, MenuItem, MenuList, PopoverSurface, useActiveIndex } from "../ui/menu.tsx";
 import { Button, IconButton, Kbd, StatusDot } from "../ui/primitives.tsx";
@@ -39,6 +41,15 @@ type RefItem = {
   label: string;
   excerpt: string;
   detail?: string; // 文档 id 或文件路径
+};
+
+// 从草稿恢复的引用:结构不完整的丢弃
+const isRefItem = (v: unknown): v is RefItem => {
+  const r = v as Partial<RefItem> | null;
+  return (
+    !!r && typeof r.key === "string" && typeof r.label === "string" && typeof r.excerpt === "string" &&
+    (r.refType === "message" || r.refType === "doc" || r.refType === "file")
+  );
 };
 
 type CommandName = "new" | "export" | "memory";
@@ -107,10 +118,13 @@ export function Composer(props: {
   onStop: () => void;
   onNewSession?: () => void;
   onCandidatesChanged?: () => void;
+  onEditLast?: () => void; // 输入框为空时按 ↑ 编辑上一条消息
   messages: UIMessage[];
 }) {
-  const [text, setText] = useState("");
-  const [refs, setRefs] = useState<RefItem[]>([]);
+  // 草稿按会话恢复(Composer 随会话切换重新挂载)
+  const [draft] = useState(() => loadDraft(props.session.id));
+  const [text, setText] = useState(draft?.text ?? "");
+  const [refs, setRefs] = useState<RefItem[]>(() => (draft?.refs ?? []).filter(isRefItem));
   const [trigger, setTrigger] = useState<Trigger | null>(null);
   const [files, setFiles] = useState<string[]>([]);
   const [docs, setDocs] = useState<WorkDoc[]>([]);
@@ -126,6 +140,14 @@ export function Composer(props: {
   const suppressRef = useRef<string | null>(null); // Esc 关闭的触发器,同一锚点不再自动弹出
   const submittingRef = useRef(false);
   const menuId = useId();
+
+  // 未发送的输入随改随存;发送后 text / refs 清空,草稿随之删除
+  useEffect(() => {
+    saveDraft(props.session.id, { text, refs });
+  }, [props.session.id, text, refs]);
+
+  // Shift+Esc:从任意位置回到输入框
+  useHotkey("Escape", () => taRef.current?.focus(), { shift: true });
 
   const editing = props.editingId != null;
   const value = editing ? props.editText : text;
@@ -368,7 +390,11 @@ export function Composer(props: {
           .catch(() => path);
       }
       parts.push(`## ${r.label}\n${body}`);
-      payload.push({ refType: r.refType, label: r.label, excerpt: r.excerpt.slice(0, 80) });
+      // 文件引用带上路径:服务端据此匹配 .mdc globs 与目录级规则
+      payload.push({
+        refType: r.refType, label: r.label, excerpt: r.excerpt.slice(0, 80),
+        ...(r.refType === "file" && r.detail ? { path: r.detail } : {}),
+      });
     }
     let context = parts.join("\n\n");
     if (context.length > MAX_CONTEXT) {
@@ -461,6 +487,16 @@ export function Composer(props: {
     if (e.key === "Escape" && editing && !props.busy) {
       e.preventDefault();
       props.onCancelEdit();
+      return;
+    }
+
+    // 输入框为空时 ↑ 编辑上一条消息(与终端 / 聊天应用一致)
+    if (
+      e.key === "ArrowUp" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey &&
+      !editing && !value && refs.length === 0 && !props.busy && props.onEditLast
+    ) {
+      e.preventDefault();
+      props.onEditLast();
       return;
     }
 

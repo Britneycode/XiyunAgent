@@ -38,6 +38,15 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
     const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
     if (!cols.includes("error")) db.exec("ALTER TABLE messages ADD COLUMN error TEXT");
   },
+  // v8:sessions.updated_at(最近活动时间,会话列表按它排序);老会话回填为最后一条消息的时间
+  (db) => {
+    const cols = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cols.includes("updated_at")) db.exec("ALTER TABLE sessions ADD COLUMN updated_at TEXT");
+    db.exec(
+      `UPDATE sessions SET updated_at = COALESCE((SELECT MAX(created_at) FROM messages WHERE messages.session_id = sessions.id), created_at)
+       WHERE updated_at IS NULL`,
+    );
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

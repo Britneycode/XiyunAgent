@@ -224,7 +224,7 @@ function SkillsSection() {
       <h2>Skill</h2>
       {error && <p className="tool-out err">{error}</p>}
       <div className="row" style={{ display: "flex", gap: 6 }}>
-        <input style={{ flex: 1 }} value={path} placeholder="Skill 目录或 ZIP 的绝对路径(示例见仓库 examples/skills/)"
+        <input style={{ flex: 1 }} value={path} placeholder="Skill 目录或 ZIP 的绝对路径;只有 SKILL.md(frontmatter 含 name / description)也可导入"
           onChange={(e) => setPath(e.target.value)} />
         <button className="primary" disabled={!path.trim()}
           onClick={() => void run(async () => { await api.importSkill(path.trim()); setPath(""); })}>
@@ -381,9 +381,9 @@ export function SettingsPage() {
         {cat === "外观" && <AppearanceSection />}
         {cat === "模型" && <ProvidersSection />}
         {cat === "子智能体" && <SubagentsSection />}
-        {cat === "通用" && <PlaceholderSection title="通用" note="界面语言跟随系统;默认模式为 Chat;每个模式独立记住最近活动会话,重启后自动恢复。对话快捷键:Enter 发送,Shift+Enter 换行,Esc 停止生成;生成失败可点「重试」,对回答不满意可点「重新生成」。界面密度在「外观」页。" />}
+        {cat === "通用" && <PlaceholderSection title="通用" note="界面语言跟随系统;默认模式为 Chat;每个模式独立记住最近活动会话,重启后自动恢复。对话快捷键:Enter 发送,Shift+Enter 换行,Esc 停止生成,Ctrl+Shift+O 新建会话,Ctrl+Shift+C 复制最后一条回复,按 Ctrl+/ 查看全部快捷键;未发送的输入按会话自动保存为草稿;生成失败可点「重试」,对回答不满意可点「重新生成」。界面密度在「外观」页。" />}
         {cat === "记忆" && <PlaceholderSection title="记忆" note="记忆事实与候选的筛选、确认、删除在顶栏「记忆」页。" />}
-        {cat === "工作区" && <PlaceholderSection title="工作区" note="工作区在 Code/Work 页顶部绑定;文件与命令工具由 PathGuard 限制在工作区内。规则文件按序加载:全局 data/rules/global.md → 模式 data/rules/<mode>.md → 项目 AGENTS.md/CLAUDE.md,项目规则优先级最高。" />}
+        {cat === "工作区" && <PlaceholderSection title="工作区" note="工作区在 Code/Work 页顶部绑定;文件与命令工具由 PathGuard 限制在工作区内。规则文件按序加载(后加载的优先级更高):全局 data/rules/global.md → 模式 data/rules/<mode>.md → 用户 ~/.claude/CLAUDE.md(仅 Code)→ 项目 AGENTS.md / CLAUDE.md / .cursorrules / .github/copilot-instructions.md → .cursor/rules/*.mdc 与 .github/instructions/*.instructions.md(alwaysApply 总是加载,globs / applyTo 在 @ 引用了匹配文件时加载)→ 被引用文件所在目录的 AGENTS.md / CLAUDE.md → CLAUDE.local.md。规则中的 @路径 会展开为对应文件内容(限工作区内)。" />}
         {cat === "权限与安全" && <SecuritySection />}
         {cat === "数据" && <DataSection />}
         {cat === "Skill" && <SkillsSection />}

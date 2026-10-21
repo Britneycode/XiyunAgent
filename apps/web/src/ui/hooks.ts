@@ -73,7 +73,8 @@ export function useHotkey(key: string, handler: (e: KeyboardEvent) => void, opts
       if (e.isComposing || e.altKey) return;
       if ((e.ctrlKey || e.metaKey) !== mod) return;
       if (e.shiftKey !== shift) return;
-      if (e.key.toLowerCase() !== key.toLowerCase()) return;
+      // 同时匹配 e.code:Shift 会改变符号键的 e.key(Shift+; 得到 ":"),这类键用 code 名注册,如 "Semicolon"
+      if (e.key.toLowerCase() !== key.toLowerCase() && e.code !== key) return;
       e.preventDefault();
       handlerRef.current(e);
     };

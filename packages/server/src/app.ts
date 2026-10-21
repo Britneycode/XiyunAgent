@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
 import type { AgentRole, ChatBlock, ChatMessage, ProviderConfig, SessionMeta, TaskStatus, TokenUsage } from "@xiyun/shared";
 import type { ChatProvider, ProviderEvent, ToolDef } from "../../runtime/src/index.ts";
@@ -16,6 +17,7 @@ import { SkillStore } from "./skills.ts";
 import { MAX_GROUP_TASKS, Scheduler, TaskStore } from "./tasks.ts";
 import { detectShells, gitCommit, gitPreview, listTool, readTool, shellExec, writeTool } from "./tools.ts";
 import { DATA_DIR, backupDb } from "./db.ts";
+import { DEFAULT_TITLE, generateTitle, heuristicTitle } from "./title.ts";
 
 const now = () => new Date().toISOString();
 
@@ -24,7 +26,8 @@ export function createApp(
   db: DatabaseSync,
   memory: MemoryStore,
   providers: ProviderStore,
-  opts?: { chatProvider?: () => ChatProvider },
+  // titleProvider:会话自动命名用的模型,缺省同记忆提取(测试可注入)
+  opts?: { chatProvider?: () => ChatProvider; titleProvider?: () => ChatProvider | undefined },
 ) {
   const app = new Hono();
   // CORS 白名单:只放行本机来源(localhost/127.0.0.1/[::1] 的 http(s),覆盖 vite 5173 与桌面渲染器)。
@@ -39,7 +42,7 @@ export function createApp(
     store: taskStore,
     memory,
     registry: () => providers.registry(),
-    skillsFor: (mode, role) => skills.promptFor(mode, role),
+    skillsFor: (mode, role, query) => skills.promptFor(mode, role, query),
     onEvent: (type, payload) =>
       db.prepare("INSERT INTO events (type, payload, created_at) VALUES (?, ?, ?)").run(
         type, JSON.stringify(payload), now(),
@@ -51,6 +54,9 @@ export function createApp(
     db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('task.recovered', ?, ?)").run(
       JSON.stringify({ count: recovered }), now(),
     );
+
+  // 会话最近活动时间:新消息落库时刷新,列表据此排序
+  const touchSession = (id: string) => db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(now(), id);
 
   // 记忆提取专用 Provider:memory 角色优先,回退 main/激活。未配置则不提取。
   const memoryProvider = () =>
@@ -123,13 +129,16 @@ export function createApp(
     const where = archived === "all" ? "" : "WHERE archived = ?";
     const args = archived === "all" ? [] : [archived === "1" ? 1 : 0];
     const total = (db.prepare(`SELECT COUNT(*) c FROM sessions ${where}`).get(...args) as { c: number }).c;
-    const sql = `SELECT * FROM sessions ${where} ORDER BY created_at DESC` + (limit ? " LIMIT ? OFFSET ?" : "");
+    // 按最近活动排序:有新消息的会话浮到最前(D-019)
+    const sql =
+      `SELECT * FROM sessions ${where} ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC` +
+      (limit ? " LIMIT ? OFFSET ?" : "");
     const rows = (limit
       ? db.prepare(sql).all(...args, limit, offset)
       : db.prepare(sql).all(...args)) as Array<Record<string, string | number>>;
     const list = rows.map((r) => ({
       id: r.id, title: r.title, mode: r.mode, workspace: r.workspace,
-      createdAt: r.created_at, archived: Number(r.archived) === 1,
+      createdAt: r.created_at, updatedAt: r.updated_at || r.created_at, archived: Number(r.archived) === 1,
     }));
     // 兼容旧前端:无 limit 时返回数组;有 limit 时返回 { list, total, hasMore }
     return limit ? c.json({ list, total, hasMore: offset + rows.length < total }) : c.json(list);
@@ -143,8 +152,9 @@ export function createApp(
       workspace: body.workspace || process.cwd(),
       createdAt: now(),
     };
-    db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at) VALUES (?, ?, ?, ?, ?)").run(
-      s.id, s.title, s.mode, s.workspace, s.createdAt,
+    s.updatedAt = s.createdAt;
+    db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+      s.id, s.title, s.mode, s.workspace, s.createdAt, s.updatedAt,
     );
     return c.json(s);
   });
@@ -226,14 +236,14 @@ export function createApp(
     const nid = randomUUID();
     const title = (body.title?.trim() || `${src.title}(分支)`).slice(0, 80);
     const ts = now();
-    db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at) VALUES (?, ?, ?, ?, ?)").run(
-      nid, title, src.mode, src.workspace, ts,
+    db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+      nid, title, src.mode, src.workspace, ts, ts,
     );
     const ins = db.prepare(
       "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     );
     for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.error, m.created_at);
-    return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts });
+    return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts, updatedAt: ts });
   });
 
   // ---- Chat:规则文件 + 相关记忆 + 历史,流式回复,落库 ----
@@ -243,7 +253,7 @@ export function createApp(
       message?: string;
       regenerate?: boolean;
       context?: string;
-      refs?: Array<{ refType: "message" | "doc" | "file"; label: string; excerpt: string }>;
+      refs?: Array<{ refType: "message" | "doc" | "file"; label: string; excerpt: string; path?: string }>;
     };
     if (!body.sessionId || typeof body.message !== "string" || !body.message.trim())
       return c.json({ error: "缺少 sessionId/message" }, 400);
@@ -256,14 +266,17 @@ export function createApp(
     const context = typeof body.context === "string" ? body.context : "";
     const refs = Array.isArray(body.refs) ? body.refs : [];
     const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
-      | { id: string; workspace: string; mode: string }
+      | { id: string; workspace: string; mode: string; title: string }
       | undefined;
     if (!session) return c.json({ error: "session not found" }, 404);
     // D1:激活 Provider 优先,角色兜底——模型下拉才能生效
     const provider = opts?.chatProvider?.() ?? providers.activeProvider() ?? providers.registry().byRole("main");
     if (!provider) return c.json({ error: "no provider configured" }, 400);
 
-    const rules = loadRuleFiles(session.workspace, { dataDir: DATA_DIR, mode: session.mode });
+    // 规则层:引用的文件参与匹配 .mdc globs 与目录级 AGENTS.md / CLAUDE.md(D-019)
+    const refFiles = refs.flatMap((r) => (r.refType === "file" && typeof r.path === "string" ? [r.path] : []));
+    const rules = loadRuleFiles(session.workspace, { dataDir: DATA_DIR, mode: session.mode, homeDir: homedir(), files: refFiles });
+    const skillText = skills.promptFor(session.mode, "main", message);
     const scopes = ["global", session.mode, session.workspace];
     // 记忆链路只用用户原话:引用上下文不参与记忆指令与检索(D5)
     const memNote = await runMemoryTool({ provider, memory, message: message, scopes, scope: session.mode });
@@ -288,7 +301,7 @@ export function createApp(
           : "你是 XiyunAgent 的 Chat 助手,帮助用户学习、总结、解释和复习。",
       memNote && `# 记忆操作\n${memNote}\n请在回复中向用户确认该操作结果。`,
       rules && `# 规则\n${rules}`,
-      skills.promptFor(session.mode) && `# 已启用 Skill\n${skills.promptFor(session.mode)}`,
+      skillText && `# 已启用 Skill\n${skillText}`,
       memories.length && `# 相关记忆\n${memories.join("\n")}`,
       docHits.length > 0 &&
         `# 相关资料(引用时标注来源)\n${docHits.map((d) => `## ${d.title}(来源:${d.source})\n${d.snippet}`).join("\n\n")}`,
@@ -314,6 +327,8 @@ export function createApp(
 
     // user 落库:content 只存原话,refs 作为 ref 块(D5)
     let userMessageId: number | null = null;
+    // 模型起标题的异步结果(成功覆盖时为新标题);流还开着就推给客户端
+    let titlePending: Promise<string | null> | null = null;
     if (!regenerate) {
       const r = db
         .prepare("INSERT INTO messages (session_id, role, content, blocks, created_at) VALUES (?, 'user', ?, ?, ?)")
@@ -326,6 +341,24 @@ export function createApp(
           now(),
         );
       userMessageId = Number(r.lastInsertRowid);
+      touchSession(sessionId);
+      // 自动命名:仍是默认标题时,先落启发式标题,较长的消息再异步请模型起短标题(只覆盖启发式标题,不动用户改过的)
+      if (session.title === DEFAULT_TITLE) {
+        const quick = heuristicTitle(message);
+        if (quick) {
+          db.prepare("UPDATE sessions SET title = ? WHERE id = ? AND title = ?").run(quick, sessionId, DEFAULT_TITLE);
+          const titler = opts?.titleProvider ? opts.titleProvider() : memoryProvider();
+          if (titler && (Array.from(message.trim()).length > 20 || message.includes("\n"))) {
+            titlePending = generateTitle(titler, message)
+              .then((t) => {
+                if (!t || t === quick) return null;
+                const r2 = db.prepare("UPDATE sessions SET title = ? WHERE id = ? AND title = ?").run(t, sessionId, quick);
+                return Number(r2.changes) > 0 ? t : null;
+              })
+              .catch(() => null);
+          }
+        }
+      }
     } else {
       const prev = db
         .prepare("SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1")
@@ -367,6 +400,10 @@ export function createApp(
       };
       // 先下发已落库的 user 消息 id:中断或出错时客户端也能立即编辑 / 分支这条消息
       void send({ type: "meta", userMessageId });
+      let streamOpen = true;
+      void titlePending?.then((title) => {
+        if (title && streamOpen) void send({ type: "title", title });
+      });
 
       const blocks: ChatBlock[] = [];
       const toolBlocks = new Map<string, Extract<ChatBlock, { kind: "tool" }>>();
@@ -543,6 +580,8 @@ export function createApp(
         );
         void send({ done: true, messageId, userMessageId });
         queueExtract(sessionId, session.mode, session.workspace);
+        // 标题通常早于回复完成;还没好时最多再等 1.5s,超时则只落库,下次刷新列表可见
+        if (titlePending) await Promise.race([titlePending, new Promise((r) => setTimeout(r, 1500))]);
       } catch (e) {
         // 中断后不再消费 Provider;主动关闭迭代器,让上游连接释放
         if (ac.signal.aborted) void it?.return?.();
@@ -576,6 +615,7 @@ export function createApp(
       } finally {
         // 客户端已断开时 writeSSE 可能永久挂起,不再等待,让响应流直接关闭
         if (!ac.signal.aborted) await writing;
+        streamOpen = false;
       }
 
       function textOf(list: ChatBlock[]): string {
@@ -610,6 +650,7 @@ export function createApp(
               now(),
             );
           db.exec("COMMIT");
+          touchSession(sessionId);
           return Number(r.lastInsertRowid);
         } catch (e) {
           db.exec("ROLLBACK");
@@ -1013,14 +1054,15 @@ export function createApp(
     const add = { sessions: 0, docs: 0, todos: 0, facts: 0, messages: 0 };
     try {
       db.exec("BEGIN");
-      const insSession = db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, archived) VALUES (?, ?, ?, ?, ?, ?)");
+      const insSession = db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, archived, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
       const hasSession = db.prepare("SELECT 1 FROM sessions WHERE id = ?");
       const sessionIds = new Set<string>();
       for (const r of (d.sessions ?? []) as Array<Record<string, unknown>>) {
         if (typeof r.id !== "string") continue;
         sessionIds.add(r.id);
         if (hasSession.get(r.id)) { skip.sessions++; continue; }
-        insSession.run(r.id, String(r.title ?? "导入会话"), String(r.mode ?? "chat"), String(r.workspace ?? ""), String(r.created_at ?? now()), r.archived ? 1 : 0);
+        // 旧导出包没有 updated_at:先留空,消息导入后按最后一条消息回填
+        insSession.run(r.id, String(r.title ?? "导入会话"), String(r.mode ?? "chat"), String(r.workspace ?? ""), String(r.created_at ?? now()), r.archived ? 1 : 0, typeof r.updated_at === "string" ? r.updated_at : null);
         add.sessions++;
       }
       const insMsg = db.prepare(
@@ -1048,6 +1090,10 @@ export function createApp(
         insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, error, created);
         add.messages++;
       }
+      db.exec(
+        `UPDATE sessions SET updated_at = COALESCE((SELECT MAX(created_at) FROM messages WHERE messages.session_id = sessions.id), created_at)
+         WHERE updated_at IS NULL`,
+      );
       const simple = (table: string, cols: string[], rows: unknown[] | undefined, key: keyof typeof skip) => {
         const has = db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`);
         const ins = db.prepare(`INSERT INTO ${table} (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`);

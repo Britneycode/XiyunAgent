@@ -99,7 +99,8 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   return next;
 }
 
-export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void }) {
+// onSessionChanged:会话元信息可能变化(新消息改变排序、自动命名)时通知外层刷新列表
+export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void; onSessionChanged?: () => void }) {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -156,7 +157,14 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
       try {
         await streamChat(
           session.id, text, () => {}, abortRef.current.signal, o?.regenerate === true,
-          { onEvent: enqueue, context: o?.context, refs: o?.refs },
+          {
+            onEvent: (ev) => {
+              enqueue(ev);
+              if ("type" in ev && (ev.type === "meta" || ev.type === "title")) opts?.onSessionChanged?.();
+            },
+            context: o?.context,
+            refs: o?.refs,
+          },
         );
         flush(); // 收尾必须同步 flush
         setMessages((ms) => {

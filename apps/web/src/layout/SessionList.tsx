@@ -63,14 +63,15 @@ function shortTime(iso: string, today: number): string {
 export function SessionList(props: SessionListProps) {
   const { sessions, activeId, loaded, showArchived, renaming, hasMore } = props;
 
-  // 服务端按 created_at 倒序返回;分组保持组内原顺序
+  // 服务端按最近活动(updatedAt)倒序返回;分组与时间同样按最近活动,组内保持原顺序
   const groups = useMemo(() => {
     const today = startOfDay(new Date());
     const map = new Map<Group, Array<{ s: SessionMeta; time: string }>>();
     for (const s of sessions) {
-      const g = groupOf(s.createdAt, today);
+      const at = s.updatedAt ?? s.createdAt;
+      const g = groupOf(at, today);
       const list = map.get(g) ?? [];
-      list.push({ s, time: shortTime(s.createdAt, today) });
+      list.push({ s, time: shortTime(at, today) });
       map.set(g, list);
     }
     return GROUPS.filter((g) => map.has(g)).map((g) => ({ group: g, items: map.get(g)! }));

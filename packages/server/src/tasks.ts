@@ -174,7 +174,7 @@ export interface SchedulerDeps {
   memory: MemoryStore;
   registry: () => ModelRegistry; // 每次执行时取最新注册表(配置可能已改)
   onEvent?: (type: string, payload: unknown) => void;
-  skillsFor?: (mode: string, role: string) => string; // 阶段 6:启用 Skill 注入
+  skillsFor?: (mode: string, role: string, query?: string) => string; // 阶段 6:启用 Skill 注入;query 用于渐进注入选相关 Skill
 }
 
 export class Scheduler {
@@ -242,7 +242,7 @@ export class Scheduler {
       .map((f) => `- ${f.content}`);
     // code 模式且角色有工具时,注入工具协议(阶段 4)。
     const roleTools = task.mode === "code" ? (ROLE_TOOLS[task.role] ?? []) : [];
-    const skillsText = this.deps.skillsFor?.(task.mode, task.role) ?? "";
+    const skillsText = this.deps.skillsFor?.(task.mode, task.role, task.prompt) ?? "";
     const system = [
       ROLE_PRESETS[task.role],
       skillsText && `# 已启用 Skill\n${skillsText}`,

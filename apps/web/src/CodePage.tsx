@@ -249,6 +249,7 @@ export function CodePage({ session, onSessionChanged, onPreview, onBranch, onNew
         onBranch={onBranch}
         onNewSession={onNewSession}
         onCandidatesChanged={onCandidatesChanged}
+        onSessionChanged={onSessionChanged}
       />
 
       <InspectorPortal id="changes">
