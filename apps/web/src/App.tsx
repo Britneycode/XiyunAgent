@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Brain, Eye, ListTodo, LoaderCircle, Plus, WifiOff } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Brain, Eye, GitCompareArrows, Library, ListTodo, LoaderCircle, Plus, SquareCheckBig, SquareTerminal, WifiOff } from "lucide-react";
 import type { MemoryCandidate, SessionMeta } from "@xiyun/shared";
 import { ChatPage } from "./ChatPage.tsx";
 import { SettingsPage } from "./SettingsPage.tsx";
@@ -14,13 +14,14 @@ import { applyTheme, loadTheme } from "./theme.ts";
 import { CandidateList } from "./layout/CandidateList.tsx";
 import { EmptyState } from "./layout/EmptyState.tsx";
 import { Inspector, type InspectorTab } from "./layout/Inspector.tsx";
+import { InspectorBridgeProvider, type InspectorBridge } from "./layout/inspectorBridge.tsx";
 import type { RenameState } from "./layout/SessionList.tsx";
 import { SideRail } from "./layout/SideRail.tsx";
 import { Sidebar } from "./layout/Sidebar.tsx";
 import { StatusBar } from "./layout/StatusBar.tsx";
 import { StreamHeader } from "./layout/StreamHeader.tsx";
 import { Workbench } from "./layout/Workbench.tsx";
-import { MODE_META, MODES, type InspectorTabId, type Mode, type Page } from "./layout/types.ts";
+import { MODE_META, MODES, type InspectorTabId, type Mode, type Page, type PanelId } from "./layout/types.ts";
 import { Button, Kbd } from "./ui/primitives.tsx";
 import { isBoolean, useHotkey, useMediaQuery, usePersistentState } from "./ui/hooks.ts";
 
@@ -30,7 +31,7 @@ const SIDE_KEY = "xiyun.layout.sideOpen";
 const SIDE_OVERLAY_QUERY = "(max-width: 759px)";
 const INSPECTOR_OVERLAY_QUERY = "(max-width: 1099px)";
 
-// 未迁移的页面包在 .legacy 中,沿用 styles.css 的旧样式与排版
+// 未迁移的页面(设置、记忆、子任务面板)包在 .legacy 中,沿用 styles.css 的旧样式与排版
 const legacy = (node: ReactNode) => <div className="legacy flex min-h-0 flex-1 flex-col bg-canvas">{node}</div>;
 
 const emptyByMode = (): Record<Mode, string | null> => ({ chat: null, work: null, code: null });
@@ -96,6 +97,19 @@ export function App() {
     setInspectorTab(tab);
     setInspectorOpen(true);
   };
+
+  // ---- 检查器面板槽位:Code / Work 页通过 portal 把面板渲染进对应标签页 ----
+  const [slots, setSlots] = useState<Partial<Record<PanelId, HTMLElement>>>({});
+  const slotRef = useMemo(() => {
+    const make = (id: PanelId) => (el: HTMLDivElement | null) =>
+      setSlots((prev) => (prev[id] === (el ?? undefined) ? prev : { ...prev, [id]: el ?? undefined }));
+    return { changes: make("changes"), terminal: make("terminal"), docs: make("docs"), todos: make("todos") };
+  }, []);
+  const [badges, setBadges] = useState<Partial<Record<PanelId, number>>>({});
+  const setBadge = useCallback(
+    (id: PanelId, count: number | undefined) => setBadges((prev) => (prev[id] === count ? prev : { ...prev, [id]: count })),
+    [],
+  );
 
   // 预览入口:记录内容并自动展开检查器切到预览 tab
   const showPreview = (p: Preview) => {
@@ -269,33 +283,61 @@ export function App() {
     ) : !active ? (
       emptyMain
     ) : mode === "work" ? (
-      legacy(<WorkPage session={active} onSessionChanged={refresh} />)
+      <WorkPage
+        session={active}
+        onSessionChanged={refresh}
+        onPreview={showPreview}
+        onBranch={(mid) => void branchTo(active.id, mid)}
+        onNewSession={() => void newSession()}
+        onCandidatesChanged={refreshCandidates}
+      />
     ) : mode === "code" ? (
-      legacy(<CodePage session={active} onSessionChanged={refresh} />)
+      <CodePage
+        session={active}
+        onSessionChanged={refresh}
+        onPreview={showPreview}
+        onBranch={(mid) => void branchTo(active.id, mid)}
+        onNewSession={() => void newSession()}
+        onCandidatesChanged={refreshCandidates}
+      />
     ) : (
-      legacy(
-        <ChatPage
-          key={active.id}
-          session={active}
-          onBranch={(mid) => void branchTo(active.id, mid)}
-          onPreview={showPreview}
-          onNewSession={() => void newSession()}
-          onCandidatesChanged={refreshCandidates}
-        />,
-      )
+      <ChatPage
+        key={active.id}
+        session={active}
+        onBranch={(mid) => void branchTo(active.id, mid)}
+        onPreview={showPreview}
+        onNewSession={() => void newSession()}
+        onCandidatesChanged={refreshCandidates}
+      />
     );
+
+  // 模式专属面板只在对应页面已挂载时出现(页面负责通过 portal 填充内容)
+  const pageMounted = page === "main" && online && loaded && !!active;
+  const slotTab = (id: PanelId, label: string, icon: InspectorTab<InspectorTabId>["icon"]): InspectorTab<InspectorTabId> => ({
+    id,
+    label,
+    icon,
+    badge: badges[id],
+    flush: true,
+    content: <div ref={slotRef[id]} className="h-full" />,
+  });
+  const modeTabs: Array<InspectorTab<InspectorTabId>> = !pageMounted
+    ? []
+    : mode === "code"
+      ? [slotTab("changes", "变更", GitCompareArrows), slotTab("terminal", "终端", SquareTerminal)]
+      : mode === "work"
+        ? [slotTab("docs", "资料", Library), slotTab("todos", "待办", SquareCheckBig)]
+        : [];
 
   const inspectorTabs: Array<InspectorTab<InspectorTabId>> = [
     {
       id: "preview",
       label: "预览",
       icon: Eye,
-      content: (
-        <div className="legacy">
-          <PreviewPanel preview={preview} />
-        </div>
-      ),
+      flush: true,
+      content: <PreviewPanel preview={preview} onPreview={showPreview} />,
     },
+    ...modeTabs,
     {
       id: "tasks",
       label: "子任务",
@@ -318,7 +360,21 @@ export function App() {
     },
   ];
 
+  const bridge: InspectorBridge = {
+    slots,
+    open: inspectorOpen,
+    active: inspectorTab,
+    openPanel: openInspector,
+    togglePanel: (id) => {
+      if (inspectorOpen && inspectorTab === id) setInspectorOpen(false);
+      else openInspector(id);
+    },
+    setBadge,
+    showPreview,
+  };
+
   return (
+    <InspectorBridgeProvider value={bridge}>
     <Workbench
       rail={
         <SideRail
@@ -397,11 +453,12 @@ export function App() {
       <StreamHeader
         title={headerTitle}
         badge={page === "main" && active ? meta.label : undefined}
-        workspace={page === "main" ? active?.workspace : undefined}
+        workspace={page === "main" && mode === "chat" ? active?.workspace : undefined}
         inspectorOpen={inspectorOpen}
         onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
       />
       {mainContent}
     </Workbench>
+    </InspectorBridgeProvider>
   );
 }

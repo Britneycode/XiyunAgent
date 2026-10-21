@@ -29,7 +29,7 @@ export function UsageBadge({ usage }: { usage: TokenUsage }) {
 
   const show = () => {
     const el = ref.current;
-    const scroller = el?.closest(".chat-messages");
+    const scroller = el?.closest("[data-scroller]");
     if (el && scroller) {
       setBelow(el.getBoundingClientRect().top - scroller.getBoundingClientRect().top < POPOVER_SPACE);
     }

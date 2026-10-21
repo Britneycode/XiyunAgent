@@ -1,167 +1,202 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Eye, FileCode2, GitCompareArrows, RefreshCw, SquareTerminal, Wrench, WrapText } from "lucide-react";
 import type { ShellResult } from "@xiyun/shared";
 import { api } from "../api.ts";
-import { renderMarkdown, splitLines } from "./markdown.ts";
-import type { Preview } from "./blocks.tsx";
+import { errorMessage } from "../ui/format.ts";
+import { Notice, PanelEmpty, PanelHeader, SectionLabel } from "../ui/panel.tsx";
+import { Badge, Button, IconButton, Skeleton } from "../ui/primitives.tsx";
+import { CopyButton, type Preview } from "./blocks.tsx";
+import { CodeView } from "./CodeView.tsx";
+import { DiffFileCard, DiffStat, useDiffTotals } from "./DiffView.tsx";
+import { normalizePath, parseUnifiedDiff, pickDiff } from "./gitDiff.ts";
+import { StreamingMarkdown } from "./StreamingMarkdown.tsx";
 
 const MAX_DIFF = 200 * 1024;
 
-// git 头里的路径有两种形态:普通文本,或 core.quotepath(默认开启)下的双引号包裹 +
-// 八进制转义(非 ASCII、控制字符、引号、反斜杠)。只认普通文本会把中文文件名等误判为
-// "无改动",所以按目标路径生成两种候选形态逐一比对。
-// 引号内:引号/反斜杠等按 C 风格转义,其余不可打印字节按 UTF-8 字节做八进制转义。
-const GIT_C_ESCAPES: Record<number, string> = {
-  0x07: "\\a", 0x08: "\\b", 0x09: "\\t", 0x0a: "\\n",
-  0x0b: "\\v", 0x0c: "\\f", 0x0d: "\\r", 0x22: '\\"', 0x5c: "\\\\",
+type ToolPreview = Extract<NonNullable<Preview>, { kind: "tool" }>;
+type DiffPreview = Extract<NonNullable<Preview>, { kind: "diff" }>;
+
+const TOOL_STATUS: Record<ToolPreview["block"]["status"], { label: string; tone: "neutral" | "ok" | "err" }> = {
+  pending: { label: "待执行", tone: "neutral" },
+  success: { label: "成功", tone: "ok" },
+  error: { label: "错误", tone: "err" },
 };
 
-// 引号内的转义内容(不含外层引号):目录前缀匹配需要它,以便拼出 "a/<dir>/ 这样的前缀
-function gitQuoteBody(p: string): string {
-  let out = "";
-  for (const b of new TextEncoder().encode(p)) {
-    const esc = GIT_C_ESCAPES[b];
-    if (esc) out += esc;
-    else if (b >= 0x20 && b < 0x7f) out += String.fromCharCode(b);
-    else out += `\\${b.toString(8).padStart(3, "0")}`;
-  }
-  return out;
+function ToolDetail({ preview, onPreview }: { preview: ToolPreview; onPreview?: (p: Preview) => void }) {
+  const b = preview.block;
+  const status = TOOL_STATUS[b.status];
+  const parsed = b.args !== undefined;
+  const text = parsed ? JSON.stringify(b.args, null, 2) : b.rawArgs;
+  const target = b.target;
+  return (
+    <>
+      <PanelHeader
+        icon={Wrench}
+        title={<span className="font-mono">{b.name}</span>}
+        meta={<Badge tone={status.tone}>{b.note || status.label}</Badge>}
+      />
+      <div className="flex flex-col gap-4 p-3">
+        <section className="flex flex-col gap-1.5">
+          <SectionLabel>{parsed ? "参数" : "原始参数"}</SectionLabel>
+          {text ? <CodeView code={text} lang={parsed ? "json" : "text"} /> : <p className="text-xs text-subtle">(无参数)</p>}
+        </section>
+        {b.argsError && <Notice tone="err">参数解析失败:{b.argsError}</Notice>}
+        {target?.workspace && (
+          <section className="flex flex-col gap-1.5">
+            <SectionLabel>目标</SectionLabel>
+            <div className="rounded-md border border-line bg-canvas px-3 py-2 font-mono text-xs">
+              <p className="break-all text-muted">{target.workspace}</p>
+              {target.path && <p className="mt-0.5 break-all text-fg">{target.path}</p>}
+            </div>
+            {onPreview && (
+              <Button
+                size="sm"
+                className="self-start"
+                onClick={() =>
+                  onPreview({ kind: "diff", title: target.path ?? "工作区 Diff", workspace: target.workspace!, path: target.path })
+                }
+              >
+                <GitCompareArrows size={13} strokeWidth={1.75} />
+                查看 Diff
+              </Button>
+            )}
+          </section>
+        )}
+        {b.status === "pending" && <Notice>模型请求调用该工具;当前版本不会自动执行。</Notice>}
+      </div>
+    </>
+  );
 }
 
-function gitQuoted(p: string): string {
-  return `"${gitQuoteBody(p)}"`;
-}
-
-// 目标路径在 diff 头里的候选形态:
-// - heads:本路径作为源文件出现在头行开头(普通/引号两种);后两条带尾空格,兼容 rename 段
-//   "a/旧路径 b/新路径" 的旧路径侧。已知残余:文件名自身含 " b" 的极端情况可能靠尾空格
-//   误命中,概率极低,不处理。
-// - tails:本路径作为目标文件出现在头行末尾(rename 的新路径侧)。
-function gitPathVariants(p: string): { heads: string[]; tails: string[] } {
-  return {
-    heads: [
-      `diff --git a/${p} b/${p}`,
-      `diff --git ${gitQuoted(`a/${p}`)} ${gitQuoted(`b/${p}`)}`,
-      `diff --git a/${p} `,
-      `diff --git ${gitQuoted(`a/${p}`)} `,
-    ],
-    tails: [` b/${p}`, ` ${gitQuoted(`b/${p}`)}`],
-  };
-}
-
-// 目录在头行里的前缀:未加引号 a/<dir>/ 与加引号 "a/<dir>/。
-// 引号形态不补收尾引号——头行是 "a/<dir>/file",目录前缀的 "/" 后面还有文件名。
-// 前缀带 "/",避免目录 src 误命中 src2/x。
-function dirPrefixes(p: string): string[] {
-  return [`diff --git a/${p}/`, `diff --git "a/${gitQuoteBody(`${p}/`)}`];
-}
-
-// 归一化为 git 头风格的相对路径:反斜杠转正斜杠,工作区内绝对路径只保留相对部分,
-// 去掉 ./ 与前导 /。前端不能引 node:path,这里只做字符串处理。
-function normalizePath(p: string, workspace: string): string {
-  let s = p.replace(/\\/g, "/");
-  const ws = workspace.replace(/\\/g, "/").replace(/\/+$/, "");
-  // 与工作区根仅大小写差异地相等时归一化为空串(工作区根,按目录处理)
-  if (ws && s.length === ws.length && s.toLowerCase() === ws.toLowerCase()) return "";
-  // 按前缀长度切片而非用 lowercase 后的字符串切,避免非 ASCII 大小写折叠改变长度
-  if (ws && s.slice(0, ws.length).toLowerCase() === ws.toLowerCase() && s[ws.length] === "/") {
-    s = s.slice(ws.length + 1);
-  }
-  return s.replace(/^(\.\/)+/, "").replace(/^\/+/, "");
-}
-
-// 按 "diff --git " 切段,找头行指向目标路径的段。
-// 单文件未命中时,再判断该路径是否是没有尾斜杠的目录(files.list 常给 "src" 这类裸目录名):
-// 任一段头行以该目录前缀开头即视为目录,返回 dirFallback,由调用方显示完整 diff。
-function pickDiff(text: string, p: string): { segment: string; dirFallback: boolean } {
-  const { heads, tails } = gitPathVariants(p);
-  const dirs = dirPrefixes(p);
-  let dirFallback = false;
-  for (const seg of text.split(/^(?=diff --git )/m)) {
-    const nl = seg.indexOf("\n");
-    const head = nl < 0 ? seg : seg.slice(0, nl);
-    if (heads.some((h) => head.startsWith(h)) || tails.some((t) => head.endsWith(t))) {
-      return { segment: seg, dirFallback: false };
-    }
-    if (!dirFallback && dirs.some((h) => head.startsWith(h))) dirFallback = true;
-  }
-  return { segment: "", dirFallback };
-}
-
-export function PreviewPanel({ preview }: { preview: Preview }) {
+function DiffDetail({ preview }: { preview: DiffPreview }) {
   const [diff, setDiff] = useState<ShellResult | null>(null);
   const [err, setErr] = useState("");
+  const [wrap, setWrap] = useState(false);
+  const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
+    let alive = true;
     setDiff(null);
     setErr("");
-    if (preview?.kind !== "diff") return;
-    void api.gitDiff(preview.workspace)
-      .then((r) => setDiff(r))
-      .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
-  }, [preview]);
+    void api
+      .gitDiff(preview.workspace)
+      .then((r) => alive && setDiff(r))
+      .catch((e) => alive && setErr(errorMessage(e)));
+    return () => {
+      alive = false;
+    };
+  }, [preview, nonce]);
 
-  if (!preview) {
-    return <div className="preview-empty">点击工具卡片或代码块查看详情</div>;
-  }
-
-  if (preview.kind === "tool") {
-    const b = preview.block;
-    return (
-      <div className="preview-body">
-        <div className="preview-title mono">{b.name}</div>
-        <div className="preview-sub mono">{b.status}{b.note ? ` · ${b.note}` : ""}</div>
-        <pre className="mono">{b.args !== undefined ? JSON.stringify(b.args, null, 2) : b.rawArgs}</pre>
-        {b.argsError && <div className="msg-error mono">{b.argsError}</div>}
-        {b.target?.workspace && <div className="preview-sub mono">{b.target.workspace}{b.target.path ? ` / ${b.target.path}` : ""}</div>}
-      </div>
-    );
-  }
-
-  if (preview.kind === "terminal") {
-    return <div className="preview-body"><pre className="preview-diff mono">{preview.body}</pre></div>;
-  }
-
-  if (preview.kind === "artifact") {
-    return (
-      <div className="preview-body">
-        <div className="preview-title">{preview.title}</div>
-        <div dangerouslySetInnerHTML={{ __html: renderMarkdown(preview.body) }} />
-      </div>
-    );
-  }
-
-  // diff
-  if (err) return <div className="preview-body"><div className="msg-error mono">{err}</div></div>;
-  if (!diff) return <div className="preview-empty">读取中…</div>;
-  if (diff.exitCode !== 0) {
-    return <div className="preview-body"><div className="msg-error mono">{diff.stderr || "git diff 失败"}</div></div>;
-  }
-  let text = diff.stdout || "";
-  const rel = preview.path ? normalizePath(preview.path, preview.workspace) : "";
   // 工具给的 path 可能是目录(如 files.list 的 "src/" 或 "."):按单文件过滤必然找不到,
   // 此时不过滤,直接显示工作区完整 diff 并说明原因。
   // 无尾斜杠的裸目录名("src")先按单文件试,未命中再看是否作为目录前缀出现在头行。
-  let isDir = rel === "" || rel === "." || rel.endsWith("/");
-  if (preview.path && !isDir) {
-    const hit = pickDiff(text, rel);
-    if (hit.segment) text = hit.segment;
-    else if (hit.dirFallback) isDir = true;
-    else return <div className="preview-body"><div className="preview-sub mono">未在该工作区的 git diff 中找到此路径的改动（未跟踪文件不在 git diff HEAD 中）</div></div>;
-  }
-  const truncated = text.length >= MAX_DIFF;
-  if (truncated) text = text.slice(0, MAX_DIFF);
-  const highlighted = text
-    ? typeof hljs !== "undefined" && hljs.getLanguage("diff")
-      ? hljs.highlight(text, { language: "diff" }).value
-      : text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    : "";
-  const body = splitLines(highlighted).map((l) => `<span class="line">${l}\n</span>`).join("");
+  const view = useMemo(() => {
+    if (!diff || diff.exitCode !== 0) return null;
+    let text = diff.stdout || "";
+    const rel = preview.path ? normalizePath(preview.path, preview.workspace) : "";
+    let isDir = rel === "" || rel === "." || rel.endsWith("/");
+    if (preview.path && !isDir) {
+      const hit = pickDiff(text, rel);
+      if (hit.segment) text = hit.segment;
+      else if (hit.dirFallback) isDir = true;
+      else return { missing: true as const };
+    }
+    const truncated = text.length >= MAX_DIFF;
+    if (truncated) text = text.slice(0, MAX_DIFF);
+    return { missing: false as const, files: parseUnifiedDiff(text), truncated, isDir };
+  }, [diff, preview]);
+
+  const files = view && !view.missing ? view.files : [];
+  const totals = useDiffTotals(files);
+
   return (
-    <div className="preview-body">
-      <div className="preview-title mono">{preview.title}</div>
-      {preview.path && isDir && <div className="preview-sub mono">目录,显示工作区完整 diff</div>}
-      {truncated && <div className="preview-sub mono">输出已截断</div>}
-      <div className="code-block"><pre className="mono"><code className="hljs" dangerouslySetInnerHTML={{ __html: body }} /></pre></div>
-    </div>
+    <>
+      <PanelHeader
+        icon={GitCompareArrows}
+        title={<span className="font-mono">{preview.title}</span>}
+        meta={files.length > 0 && <DiffStat adds={totals.adds} dels={totals.dels} />}
+        actions={
+          <>
+            <IconButton label="自动换行" size="xs" active={wrap} onClick={() => setWrap(!wrap)}>
+              <WrapText size={13} strokeWidth={1.75} />
+            </IconButton>
+            <IconButton label="刷新" size="xs" onClick={() => setNonce((n) => n + 1)}>
+              <RefreshCw size={13} strokeWidth={1.75} />
+            </IconButton>
+          </>
+        }
+      />
+      <div className="flex flex-col gap-2 p-3">
+        {err ? (
+          <Notice tone="err">{err}</Notice>
+        ) : !diff ? (
+          <div className="flex flex-col gap-2" aria-label="读取中">
+            <Skeleton className="h-9" />
+            <Skeleton className="h-40" />
+          </div>
+        ) : diff.exitCode !== 0 ? (
+          <Notice tone="err">{diff.stderr || "git diff 失败"}</Notice>
+        ) : view?.missing ? (
+          <Notice>未在该工作区的 git diff 中找到此路径的改动(未跟踪文件不在 git diff HEAD 中)。</Notice>
+        ) : (
+          <>
+            {preview.path && view?.isDir && <Notice>目录路径,显示工作区完整 diff。</Notice>}
+            {view?.truncated && <Notice tone="warn">输出超过 200 KB,已截断。</Notice>}
+            {files.length === 0 ? (
+              <PanelEmpty icon={GitCompareArrows} title="没有未提交的改动" description={preview.workspace} />
+            ) : (
+              files.map((f, i) => <DiffFileCard key={`${f.path}-${i}`} file={f} wrap={wrap} defaultOpen={files.length <= 8} />)
+            )}
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+// 检查器"预览"页:工具调用详情、代码 / 文档、终端输出与 Git Diff
+export function PreviewPanel({ preview, onPreview }: { preview: Preview; onPreview?: (p: Preview) => void }) {
+  if (!preview) {
+    return (
+      <PanelEmpty
+        icon={Eye}
+        title="暂无预览"
+        description="点击工具卡片的「在预览中查看」或代码块的「在预览中打开」,内容会显示在这里。"
+        className="py-16"
+      />
+    );
+  }
+
+  if (preview.kind === "tool") return <ToolDetail preview={preview} onPreview={onPreview} />;
+
+  if (preview.kind === "diff") return <DiffDetail key={`${preview.workspace}|${preview.path ?? ""}`} preview={preview} />;
+
+  if (preview.kind === "terminal") {
+    return (
+      <>
+        <PanelHeader icon={SquareTerminal} title={preview.title} actions={<CopyButton text={preview.body} label="复制输出" />} />
+        <pre className="m-3 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-line bg-code p-3 font-mono text-xs leading-relaxed text-code-fg">
+          {preview.body}
+        </pre>
+      </>
+    );
+  }
+
+  // artifact:带语言的按代码查看,否则按 Markdown 文档渲染
+  return (
+    <>
+      <PanelHeader
+        icon={FileCode2}
+        title={<span className={preview.lang ? "font-mono" : undefined}>{preview.title}</span>}
+        actions={!preview.lang ? <CopyButton text={preview.body} /> : undefined}
+      />
+      <div className="p-3">
+        {preview.lang ? (
+          <CodeView code={preview.body} lang={preview.lang} />
+        ) : (
+          <StreamingMarkdown text={preview.body} className="font-reading" />
+        )}
+      </div>
+    </>
   );
 }

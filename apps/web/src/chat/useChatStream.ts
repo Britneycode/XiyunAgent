@@ -32,6 +32,38 @@ function applyEvent(blocks: ChatBlock[], ev: StreamEvent): ChatBlock[] {
   return blocks;
 }
 
+// 把一批流式事件合并进正在生成的 assistant 消息。纯函数:StrictMode 下更新函数会执行两次,
+// 任何原地修改都会让增量重复。
+export function applyQueue(msg: UIMessage, queue: StreamEvent[]): UIMessage {
+  let blocks = msg.blocks ? [...msg.blocks] : [];
+  let content = msg.content;
+  let usage = msg.usage;
+  for (const ev of queue) {
+    // 带 type 的块事件优先:block_delta 同样带 delta 字段,不能落入下面的正文分支,
+    // 否则思考 / 工具参数增量会被拼进正文
+    if ("type" in ev) {
+      if (ev.type === "usage") usage = ev.usage;
+      else blocks = applyEvent(blocks, ev);
+    } else if ("delta" in ev && typeof ev.delta === "string") {
+      content += ev.delta;
+      // 正文增量写入 id 对应的文本块,缺省为最后一个文本块
+      let idx = ev.id ? blocks.findIndex((b) => b.id === ev.id) : -1;
+      if (idx < 0 || blocks[idx]?.kind !== "text") {
+        idx = -1;
+        for (let i = blocks.length - 1; i >= 0; i--) {
+          if (blocks[i]!.kind === "text") {
+            idx = i;
+            break;
+          }
+        }
+      }
+      const target = blocks[idx];
+      if (target?.kind === "text") blocks[idx] = { ...target, text: target.text + ev.delta };
+    }
+  }
+  return { ...msg, content, blocks: blocks.length ? blocks : undefined, usage };
+}
+
 export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void }) {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -55,28 +87,10 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
     pendingRef.current = [];
     if (!queue.length) return;
     setMessages((ms) => {
-      const copy = [...ms];
-      let last = copy[copy.length - 1];
+      const last = ms[ms.length - 1];
       if (!last || last.role !== "assistant") return ms;
-      let blocks = last.blocks ? [...last.blocks] : [];
-      let content = last.content;
-      let usage = last.usage;
-      for (const ev of queue) {
-        if ("type" in ev && ev.type === "usage") {
-          usage = ev.usage;
-        } else if ("delta" in ev && typeof ev.delta === "string") {
-          content += ev.delta;
-          if (!blocks.length) blocks = [];
-          else {
-            const lastText = [...blocks].reverse().find((b) => b.kind === "text");
-            if (lastText && lastText.kind === "text") lastText.text += ev.delta;
-          }
-        } else if ("type" in ev) {
-          blocks = applyEvent(blocks, ev);
-        }
-      }
-      last = { ...last, content, blocks: blocks.length ? blocks : undefined, usage };
-      copy[copy.length - 1] = last;
+      const copy = [...ms];
+      copy[copy.length - 1] = applyQueue(last, queue);
       return copy;
     });
   }, []);

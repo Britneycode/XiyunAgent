@@ -63,3 +63,8 @@ Composer 的 @ 引用(文件/文档)内容只注入当次 /chat 请求的 contex
 ## D-016:Token 用量以模型实测为准,估算只做增量(2026-10-21)
 
 /chat 请求默认携带 `stream_options.include_usage`,模型在流末返回的 usage 归一化为 `TokenUsage`(输入/输出/合计,可选缓存命中与推理),经 SSE `{type:"usage"}` 事件在 `done` 之前下发,并随 assistant 消息落库(messages v6 迁移新增 `usage` 列;分支/导出/导入全链路携带)。网关以 400/422 拒绝该参数时去掉重试一次,成功后按 baseUrl+model 在进程内记住、不再携带。前端以最近一次实测为基线(输入 + 输出 − 推理,即下一轮会再次带入的部分),基线之后的新消息、引用与当前输入按本地经验比例估算叠加;会话中从未拿到实测时整体退回估算并以 "≈" 标注。取舍:实测值包含系统提示、记忆与引用,比纯估算准确;代价是严格网关首个请求多一次往返,且中断的回复通常拿不到用量(usage 在最后一个分片)。
+
+## D-017:工作台 UI 只改视图层,面板经 Portal 挂到右侧检查器(2026-10-21)
+
+Qoder 风格重构(feat/qoder-workbench-ui)只替换视图层:API、SSE 协议、`useChatStream` 对外接口与各页业务逻辑保持不变。Code/Work 页把"变更 / 终端 / 资料 / 待办"面板通过 `layout/inspectorBridge.tsx` 的 InspectorPortal 渲染进右侧检查器的对应 tab,状态仍归页面所有(切换 tab 不丢输入,未挂载时不请求 Diff)。流式 Markdown 按顶层块切分并逐块 memo(`chat/StreamingMarkdown.tsx`),只有尾块随增量重渲染;未闭合代码块与完成态共用同一外框和限高,闭合时不跳动。Markdown 代码块是静态 HTML,复制 / 换行 / 展开 / 送预览通过事件委托(`chat/codeActions.ts`)把状态写在 DOM 上。取舍:Portal 让面板与页面状态同生命周期,代价是检查器内容依赖页面挂载;代码块不走 React 组件,换来流式时零额外渲染,代价是按钮状态不进 React state。
+

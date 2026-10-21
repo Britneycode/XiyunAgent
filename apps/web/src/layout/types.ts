@@ -2,7 +2,9 @@ import { CodeXml, ListChecks, MessageCircle, type LucideIcon } from "lucide-reac
 
 export type Mode = "chat" | "work" | "code";
 export type Page = "main" | "memory" | "settings";
-export type InspectorTabId = "preview" | "tasks" | "candidates";
+// 检查器标签页:预览 / 子任务 / 候选为通用页;其余为模式专属面板,由对应页面通过 portal 填充
+export type PanelId = "changes" | "terminal" | "docs" | "todos";
+export type InspectorTabId = "preview" | PanelId | "tasks" | "candidates";
 
 export const MODES: Mode[] = ["chat", "work", "code"];
 

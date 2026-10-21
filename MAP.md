@@ -25,12 +25,16 @@
 apps/desktop/        Electron 主进程(main.mjs,探测 /health 后按需拉起 Server 子进程)
 apps/desktop/server.mjs  esbuild 打包的单文件 Server(打包态运行;构建产物,由 pnpm build:server 生成)
 apps/web/            React + Vite:App Shell(顶栏/模式切换/会话栏/右侧栏:候选 + 子任务 + 预览三标签)、Chat 页(块渲染 + 复合输入框)、Work 页、Code 页、记忆管理页、分类设置页
-apps/web/src/CodePage.tsx  Code 页(工作区绑定 + Chat + Diff/终端/提交抽屉 + 非白名单命令确认条)
-apps/web/src/WorkPage.tsx  Work 页(工作目录绑定 + 资料导入(文件/URL/粘贴)+ 文档查看(来源)+ 待办 + Chat)
+apps/web/src/CodePage.tsx  Code 页(上下文栏:工作区 + 分支 + 面板开关;Chat;变更/终端面板经 Portal 进右侧检查器,非白名单命令确认)
+apps/web/src/WorkPage.tsx  Work 页(工作目录绑定 + Chat;资料/待办面板经 Portal 进右侧检查器)
 apps/web/src/TasksPanel.tsx  子任务面板(派发单任务/并行/流水线预设,code 为 coder→tester→reviewer,work 为需求整理→讲解;waiting_for_user 应答框)
 apps/web/src/SettingsPage.tsx  分类设置页(Provider 配置含能力标签 capabilities + 连通性探测;Skill 管理;权限与安全:权限声明 + 审计日志)
 apps/web/src/theme.ts    主题系统(7 预设 + 自定义主题包导入导出 + token 微调,全部走 CSS 变量)
-apps/web/src/chat/   Chat 工作台组件(markdown.ts 安全渲染/行号/代码块;blocks.tsx 思考块/工具卡片/引用胶囊;useChatStream.ts SSE 块状态机 + rAF 合批;Composer.tsx @引用//命令/模型下拉;PreviewPanel.tsx 右侧预览:工具/终端/产物/Diff)
+apps/web/src/chat/   Chat 工作台组件(markdown.ts 安全渲染/代码块外框/行号/diff 着色;StreamingMarkdown.tsx 逐块 memo 流式渲染;codeActions.ts 代码块按钮事件委托;blocks.tsx 思考块/工具卡片/引用胶囊/消息体;gitDiff.ts + DiffView.tsx 统一 diff 解析与结构化展示;CodeView.tsx 预览区代码查看;useChatStream.ts SSE 块状态机(applyQueue 纯函数)+ rAF 合批;useStickToBottom.ts 贴底跟随;Composer.tsx @引用//命令/模型下拉;PreviewPanel.tsx 右侧预览:工具/终端/产物/Diff)
+apps/web/src/code/   Code 模式检查器面板(ChangesPanel.tsx 变更与提交;TerminalPanel.tsx 终端运行记录)
+apps/web/src/work/   Work 模式检查器面板(DocsPanel.tsx 资料导入与查看;TodosPanel.tsx 待办)
+apps/web/src/layout/inspectorBridge.tsx  页面 → 右侧检查器的 Portal 桥(面板挂载点、开关、角标);ContextBar.tsx 主区顶部上下文栏
+apps/web/src/ui/     基础组件(primitives/menu/panel:面板头、提示条、表单控件;format.ts 时长/错误文案/路径)
 apps/web/public/vendor/  本地前端库(katex、highlight.js,来自 YiyunAgent 旧项目),Chat 渲染用
 packages/server/     Hono Agent Server:会话、Chat SSE(结构化块协议:text/thinking/tool 块 + block_end 快照 + XIYUN_EXPOSE_TOOLS 工具定义门控)、usage 事件(模型实测 token 用量)、消息 blocks/aborted/usage 落库、记忆(事实 + 候选)、提取流水线、子智能体任务、工具 API(/tools/git/diff 失败 400)、Work 文档/待办、Skill、审计、Provider 配置、规则加载
 packages/server/src/extract.ts  异步记忆提取(memory 角色模型,低置信度只进候选,不阻塞 SSE)

@@ -9,6 +9,7 @@ export interface InspectorTab<T extends string> {
   label: string;
   icon: LucideIcon;
   badge?: number;
+  flush?: boolean; // 内容自行管理内边距与滚动(如带底部输入框的面板),占满内容区高度
   content: ReactNode;
 }
 
@@ -28,13 +29,15 @@ export function Inspector<T extends string>({
   return (
     <div className="flex h-full flex-col">
       <div className="flex h-12 shrink-0 items-stretch gap-1 border-b border-line pl-1 pr-1.5">
-        <Tabs
-          items={tabs.map(({ id, label, icon, badge }) => ({ id, label, icon, badge }))}
-          value={current.id}
-          onChange={onActiveChange}
-          layoutId="inspector-tab"
-        />
-        <span className="flex-1" />
+        <div className="min-w-0 flex-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <Tabs
+            items={tabs.map(({ id, label, icon, badge }) => ({ id, label, icon, badge }))}
+            value={current.id}
+            onChange={onActiveChange}
+            layoutId="inspector-tab"
+            className="w-max"
+          />
+        </div>
         <div className="flex items-center">
           <IconButton label="关闭面板" kbd="Ctrl+J" size="xs" onClick={onClose}>
             <X size={14} strokeWidth={1.75} />
@@ -50,7 +53,7 @@ export function Inspector<T extends string>({
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.12, ease: [0.16, 1, 0.3, 1] }}
-            className="p-3"
+            className={current.flush ? "h-full" : "p-3"}
           >
             {current.content}
           </motion.div>

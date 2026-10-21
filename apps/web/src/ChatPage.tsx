@@ -1,11 +1,19 @@
-import { useEffect, useRef, useState } from "react";
-import type { SessionMeta } from "@xiyun/shared";
+import { memo, useEffect, useRef, useState, type RefObject } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { ArrowDown, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
+import type { ChatBlock, SessionMeta } from "@xiyun/shared";
 import { api } from "./api.ts";
-import { MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
+import { CopyButton, MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
+import { handleCodeAction } from "./chat/codeActions.ts";
 import { Composer } from "./chat/Composer.tsx";
+import { StreamingMarkdown } from "./chat/StreamingMarkdown.tsx";
+import { formatTokens, messageTokens, MESSAGE_OVERHEAD } from "./chat/tokens.ts";
 import { UsageBadge } from "./chat/UsageBadge.tsx";
-import { useChatStream } from "./chat/useChatStream.ts";
-import { renderMarkdown as renderMarkdownSafe } from "./chat/markdown.ts";
+import { useChatStream, type UIMessage } from "./chat/useChatStream.ts";
+import { useStickToBottom } from "./chat/useStickToBottom.ts";
+import { MODE_META, type Mode } from "./layout/types.ts";
+import { cn } from "./ui/cn.ts";
+import { Button, IconButton } from "./ui/primitives.tsx";
 
 export interface ChatPageProps {
   session: SessionMeta;
@@ -15,32 +23,156 @@ export interface ChatPageProps {
   onCandidatesChanged?: () => void;
 }
 
+// 消息项的操作经由 ref 传入,保持引用稳定,让历史消息在流式过程中跳过重渲染
+interface ItemActions {
+  regenerate: () => void;
+  startEdit: (id: number, content: string) => void;
+  branch?: (id: number) => void;
+  preview?: (p: Preview) => void;
+}
+
+type RefBlock = Extract<ChatBlock, { kind: "ref" }>;
+
+function ChatEmpty({ mode }: { mode: string }) {
+  const meta = MODE_META[(mode in MODE_META ? mode : "chat") as Mode];
+  const Icon = meta.icon;
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-3 py-16 text-center">
+      <span className="flex size-10 items-center justify-center rounded-xl border border-line bg-surface text-muted shadow-pill">
+        <Icon size={18} strokeWidth={1.75} aria-hidden />
+      </span>
+      <div>
+        <p className="text-ui font-medium text-fg">开始新的对话</p>
+        <p className="mt-1 text-xs text-subtle">{meta.hint} · 输入 @ 引用上下文,/ 使用命令</p>
+      </div>
+    </div>
+  );
+}
+
+const MessageItem = memo(function MessageItem({
+  m,
+  isLast,
+  busy,
+  editing,
+  actions,
+}: {
+  m: UIMessage;
+  isLast: boolean;
+  busy: boolean;
+  editing: boolean;
+  actions: RefObject<ItemActions>;
+}) {
+  if (m.role === "user") {
+    const refs = (m.blocks ?? []).filter((b): b is RefBlock => b.kind === "ref");
+    const canEdit = m.id != null && !busy;
+    return (
+      <div className="group/msg relative flex flex-col items-end gap-1.5">
+        <RefChips refs={refs} />
+        <div
+          className={cn(
+            "max-w-[85%] rounded-2xl rounded-br-md border border-line bg-surface px-3.5 py-2 text-fg",
+            editing && "border-accent/50 ring-2 ring-accent/15",
+          )}
+        >
+          <StreamingMarkdown text={m.content} className="md-user" />
+        </div>
+        <div
+          className={cn(
+            // 浮在消息间距里,不额外占高;pt-1 让悬停区域与气泡相连
+            "absolute right-0 top-full flex h-7 items-center gap-0.5 pt-1 transition-opacity duration-150",
+            editing ? "opacity-100" : "opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100",
+          )}
+        >
+          {editing && <span className="mr-1 text-2xs text-accent">编辑中…</span>}
+          <CopyButton text={m.content} />
+          {canEdit && (
+            <IconButton label="编辑并重新生成" size="xs" onClick={() => actions.current?.startEdit(m.id!, m.content)}>
+              <Pencil size={13} strokeWidth={1.75} />
+            </IconButton>
+          )}
+          {m.id != null && actions.current?.branch && (
+            <IconButton label="分支到新会话" size="xs" onClick={() => actions.current?.branch?.(m.id!)}>
+              <GitBranch size={13} strokeWidth={1.75} />
+            </IconButton>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const done = !m.streaming;
+  // 经 ref 转发,始终调用最新的预览回调
+  const preview = actions.current?.preview ? (p: Preview) => actions.current?.preview?.(p) : undefined;
+  const hasBody = !!m.content || !!m.blocks?.length;
+  const estimate = done && !m.usage && hasBody ? Math.max(0, messageTokens(m) - MESSAGE_OVERHEAD) : 0;
+
+  return (
+    <div className="group/msg flex flex-col gap-2 font-reading">
+      <MessageBody content={m.content} blocks={m.blocks} streaming={m.streaming} onPreview={preview} />
+      {m.error && (
+        <div role="alert" className="flex items-start gap-2.5 rounded-lg border border-err/25 bg-err/5 px-3 py-2.5 font-sans">
+          <TriangleAlert size={15} strokeWidth={1.75} className="mt-0.5 shrink-0 text-err" aria-hidden />
+          <div className="min-w-0 flex-1">
+            <p className="text-ui font-medium text-err">生成失败</p>
+            <p className="mt-0.5 break-words font-mono text-xs text-muted">{m.error}</p>
+          </div>
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => actions.current?.regenerate()}>
+            <RotateCcw size={13} strokeWidth={1.75} />
+            重试
+          </Button>
+        </div>
+      )}
+      {done && (hasBody || m.aborted || m.usage) && (
+        <div className="-ml-1 flex h-6 items-center gap-0.5 font-sans">
+          {m.aborted && (
+            <span className="mr-1 inline-flex h-5 items-center gap-1 rounded border border-line bg-surface-2 px-1.5 text-2xs text-muted">
+              <Square size={8} strokeWidth={0} fill="currentColor" aria-hidden />
+              已中断
+            </span>
+          )}
+          <div
+            className={cn(
+              "flex items-center gap-0.5 transition-opacity duration-150",
+              !isLast && "opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100",
+            )}
+          >
+            {!!m.content && <CopyButton text={m.content} />}
+            {isLast && !busy && (
+              <IconButton label="重新生成" size="xs" onClick={() => actions.current?.regenerate()}>
+                <RotateCcw size={13} strokeWidth={1.75} />
+              </IconButton>
+            )}
+          </div>
+          {m.usage ? (
+            <UsageBadge usage={m.usage} />
+          ) : (
+            estimate > 0 && (
+              <span
+                className="ml-0.5 px-1 font-mono text-2xs tabular-nums text-subtle"
+                title="模型未返回用量,按字符数估算的输出 tokens"
+              >
+                ≈ {formatTokens(estimate)} tokens
+              </span>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
 export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandidatesChanged }: ChatPageProps) {
   const { messages, setMessages, send, stop, regenerate, busy } = useChatStream(session, {
     onDone: onCandidatesChanged,
   });
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
-  const scroller = useRef<HTMLDivElement>(null);
+  const { scrollRef, contentRef, atBottom, scrollToBottom } = useStickToBottom<HTMLDivElement, HTMLDivElement>();
 
-  // 仅在接近底部时自动滚动;瞬时定位避免 smooth 造成抖动
+  // 开始生成(发送 / 重新生成 / 编辑重发)时回到底部并恢复贴底
   useEffect(() => {
-    const el = scroller.current;
-    if (!el) return;
-    if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) el.scrollTop = el.scrollHeight;
-  }, [messages]);
-
-  // 代码块复制:事件委托
-  const onCopyClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-copy]");
-    if (!btn) return;
-    const code = btn.closest(".code-block")?.querySelector("code");
-    if (!code) return;
-    void navigator.clipboard.writeText(code.textContent ?? "").then(() => {
-      btn.textContent = "已复制";
-      setTimeout(() => (btn.textContent = "复制"), 1200);
-    });
-  };
+    if (busy) scrollToBottom();
+  }, [busy, scrollToBottom]);
 
   const startEdit = (id: number, content: string) => {
     if (busy) return;
@@ -61,6 +193,9 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
     if (text) void send(text);
   };
 
+  const actions = useRef<ItemActions>({ regenerate, startEdit });
+  actions.current = { regenerate, startEdit, branch: onBranch, preview: onPreview };
+
   // Esc 停止生成
   useEffect(() => {
     if (!busy) return;
@@ -70,55 +205,54 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
   }, [busy, stop]);
 
   return (
-    <>
-      <div className="chat-messages" ref={scroller} onClick={onCopyClick}>
-        {messages.length === 0 && <div className="empty">这个会话还没有消息。</div>}
-        {messages.map((m, i) => (
-          <div className={`msg ${m.role}`} key={m.id ?? `tmp-${i}`}>
-            {m.role === "user" && m.blocks?.some((b) => b.kind === "ref") && (
-              <RefChips refs={m.blocks.filter((b) => b.kind === "ref") as never} />
-            )}
-            {m.role === "user" ? (
-              <div className="msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdownSafe(m.content) }} />
+    <div data-ui className="flex min-h-0 flex-1 flex-col">
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div
+          ref={scrollRef}
+          data-scroller
+          className="min-h-0 flex-1 overflow-y-auto"
+          onClick={(e) => handleCodeAction(e.target, onPreview)}
+        >
+          <div
+            ref={contentRef}
+            data-no-preview={onPreview ? undefined : ""}
+            className="mx-auto flex min-h-full w-full max-w-[792px] flex-col gap-7 px-4 pb-8 pt-6"
+          >
+            {messages.length === 0 ? (
+              <ChatEmpty mode={session.mode} />
             ) : (
-              <MessageBody
-                content={m.content}
-                blocks={m.blocks}
-                streaming={m.streaming}
-                onPreview={onPreview}
-              />
-            )}
-            {m.aborted && <div className="msg-note mono">已中断</div>}
-            {m.error && (
-              <div className="msg-error mono">
-                {m.error}
-                <button type="button" onClick={regenerate}>重试</button>
-              </div>
-            )}
-            {((!busy && m.content) || (m.role === "assistant" && m.usage)) && (
-              <div className="msg-foot">
-                {m.role === "assistant" && m.usage && <UsageBadge usage={m.usage} />}
-                {!busy && m.content && (
-                  <div className="msg-actions">
-                    <button
-                      title="复制"
-                      onClick={() => void navigator.clipboard.writeText(m.content)}
-                    >⧉</button>
-                    {m.role === "assistant" && i === messages.length - 1 && (
-                      <button title="重新生成" onClick={regenerate}>↻</button>
-                    )}
-                    {m.role === "user" && m.id != null && (
-                      <>
-                        <button title="编辑并重新生成" onClick={() => startEdit(m.id!, m.content)}>✎</button>
-                        {onBranch && <button title="分支到新会话" onClick={() => onBranch(m.id!)}>⑂</button>}
-                      </>
-                    )}
-                  </div>
-                )}
-              </div>
+              messages.map((m, i) => (
+                <MessageItem
+                  key={m.id ?? `tmp-${i}`}
+                  m={m}
+                  isLast={i === messages.length - 1}
+                  busy={busy}
+                  editing={editingId != null && m.id === editingId}
+                  actions={actions}
+                />
+              ))
             )}
           </div>
-        ))}
+        </div>
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+          <AnimatePresence>
+            {!atBottom && messages.length > 0 && (
+              <motion.button
+                key="to-bottom"
+                type="button"
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 6 }}
+                transition={{ duration: 0.15 }}
+                onClick={() => scrollToBottom(true)}
+                className="pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-full border border-line bg-elevated px-3 text-xs text-muted shadow-pop transition-colors hover:text-fg"
+              >
+                <ArrowDown size={13} strokeWidth={1.75} aria-hidden />
+                {busy ? "跟随最新输出" : "回到底部"}
+              </motion.button>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
       <Composer
         session={session}
@@ -126,13 +260,16 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
         editingId={editingId}
         editText={editText}
         onEditText={setEditText}
-        onCancelEdit={() => { setEditingId(null); setEditText(""); }}
+        onCancelEdit={() => {
+          setEditingId(null);
+          setEditText("");
+        }}
         onSubmit={(text, o) => (editingId != null ? void submitEdit() : void send(text, o))}
         onStop={stop}
         onNewSession={onNewSession}
         onCandidatesChanged={onCandidatesChanged}
         messages={messages}
       />
-    </>
+    </div>
   );
 }
