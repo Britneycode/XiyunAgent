@@ -44,11 +44,30 @@ describe("上下文预算", () => {
       path.push(msg(i * 2 - 1, "user", `q${i}`, { refContext: `ctx${i}` }));
       path.push(msg(i * 2, "assistant", `a${i}`));
     }
-    const p = planHistory(path, 10_000, (m) => (m.id === path.at(-2)!.id ? ["x.ts"] : []));
+    const p = planHistory(path, 10_000, { changed: (m) => (m.id === path.at(-2)!.id ? ["x.ts"] : []) });
     const users = p.history.filter((m) => m.role === "user").map((m) => m.content);
     expect(users[0]).toBe("q1");
     expect(users[1]).toContain("# 引用上下文\nctx2");
     expect(users.at(-1)).toContain("x.ts 在引用之后已修改");
+  });
+
+  it("附件:最近几轮带图片与文本正文,更早的只留占位;模型不支持图片时图片换成占位", () => {
+    const img = { id: "a1", kind: "attachment" as const, attachmentId: "f".repeat(64), name: "图.png", mime: "image/png", size: 1, type: "image" as const };
+    const txt = { ...img, id: "a2", attachmentId: "e".repeat(64), name: "a.ts", mime: "text/plain", type: "text" as const };
+    const path: PathMessage[] = [msg(1, "user", "早先", { attachments: [txt] }), msg(2, "assistant", "ok")];
+    for (let i = 0; i < REF_TURNS; i++) {
+      path.push(msg(3 + i * 2, "user", i === 0 ? "" : `看图${i}`, { attachments: [img] }));
+      path.push(msg(4 + i * 2, "assistant", "ok"));
+    }
+    const p = planHistory(path, 100_000, { vision: true, attachmentText: (m) => (m.id === 1 ? "## 附件:a.ts\ncode" : "") });
+    expect(p.history[0]!.content).toBe("早先\n\n[附件:a.ts]");
+    // 只有图片、没有文字的消息也保留
+    expect(p.history[2]).toEqual({ role: "user", content: "", imageIds: ["f".repeat(64)] });
+    const noVision = planHistory(path, 100_000, { vision: false });
+    expect(noVision.history[2]!.content).toBe("[附件:图.png]");
+    expect(noVision.history.some((m) => m.imageIds)).toBe(false);
+    // 图片计入预算
+    expect(p.used - noVision.used).toBeGreaterThan(REF_TURNS * 1000);
   });
 
   it("摘要输入分批:超出上限时先处理最早的一段", () => {

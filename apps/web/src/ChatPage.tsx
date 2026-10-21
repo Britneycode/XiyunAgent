@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { ArrowDown, Check, ChevronLeft, ChevronRight, FoldVertical, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
 import type { ChatBlock, SessionMeta } from "@xiyun/shared";
 import type { RefPayload } from "./api.ts";
-import { CopyButton, MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
+import { AttachmentList, CopyButton, MessageBody, RefChips, type AttachmentBlockData, type Preview } from "./chat/blocks.tsx";
 import { handleCodeAction } from "./chat/codeActions.ts";
 import { Composer } from "./chat/Composer.tsx";
 import { StreamingMarkdown } from "./chat/StreamingMarkdown.tsx";
@@ -107,18 +107,24 @@ const MessageItem = memo(function MessageItem({
 }) {
   if (m.role === "user") {
     const refs = (m.blocks ?? []).filter((b): b is RefBlock => b.kind === "ref");
+    const atts = (m.blocks ?? []).filter((b): b is AttachmentBlockData => b.kind === "attachment");
     const canEdit = m.id != null && !busy;
+    // 只发了附件(没有文字)时不显示空气泡;编辑中仍显示,便于看到高亮
+    const showText = !!m.content.trim() || editing;
     return (
       <div data-mid={m.id ?? undefined} className="group/msg relative flex flex-col items-end gap-1.5">
         <RefChips refs={refs} />
-        <div
-          className={cn(
-            "max-w-[85%] rounded-2xl rounded-br-md border border-line bg-surface px-3.5 py-2 text-fg",
-            editing && "border-accent/50 ring-2 ring-accent/15",
-          )}
-        >
-          <StreamingMarkdown text={m.content} className="md-user" />
-        </div>
+        <AttachmentList items={atts} />
+        {showText && (
+          <div
+            className={cn(
+              "max-w-[85%] rounded-2xl rounded-br-md border border-line bg-surface px-3.5 py-2 text-fg",
+              editing && "border-accent/50 ring-2 ring-accent/15",
+            )}
+          >
+            <StreamingMarkdown text={m.content} className="md-user" />
+          </div>
+        )}
         {/* 浮在消息间距里,不额外占高;pt-1 让悬停区域与气泡相连。版本切换常显,其余操作悬停时出现 */}
         <div className="absolute right-0 top-full flex h-7 items-center gap-0.5 pt-1">
           <div

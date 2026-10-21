@@ -42,7 +42,19 @@ export function createAnthropicProvider(config: ProviderConfig, popts: ProviderO
     const budget = p.reasoningEffort ? EFFORT_BUDGET[p.reasoningEffort] : 0;
     // 开启思考时 max_tokens 必须大于思考预算,且不能指定 temperature
     const maxTokens = Math.max(p.maxTokens && p.maxTokens > 0 ? p.maxTokens : DEFAULT_MAX_TOKENS, budget ? budget + 4096 : 0);
-    const body: Record<string, unknown> = { model: config.model, max_tokens: maxTokens, messages: turns, stream: true };
+    // 带图片的轮次用内容块数组:图片在前、文字在后(Anthropic 推荐顺序)
+    const wire = turns.map((t) =>
+      t.images?.length
+        ? {
+            role: t.role,
+            content: [
+              ...t.images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.mime, data: i.data } })),
+              ...(t.content.trim() ? [{ type: "text", text: t.content }] : []),
+            ],
+          }
+        : { role: t.role, content: t.content },
+    );
+    const body: Record<string, unknown> = { model: config.model, max_tokens: maxTokens, messages: wire, stream: true };
     if (system) body.system = system;
     if (budget) body.thinking = { type: "enabled", budget_tokens: budget };
     else if (typeof p.temperature === "number") body.temperature = Math.min(1, Math.max(0, p.temperature));

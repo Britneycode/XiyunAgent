@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ModelRole, ProviderConfig, ProviderProtocol, SkillInfo } from "@xiyun/shared";
-import { api } from "./api.ts";
+import { api, type ExternalPreview } from "./api.ts";
+import { readExportFile } from "./settings/zip.ts";
 import {
   applyPreset, emptyForm, formFrom, mergeModelIds, PRESETS, PROTOCOL_OPTIONS, toConfig, type ProviderForm,
 } from "./settings/providerForm.ts";
@@ -368,7 +369,7 @@ function SecuritySection() {
 }
 
 // 数据迁移:导出/导入会话、资料、待办、记忆。导出包不含 API Key 与审计日志。
-function DataSection() {
+function DataSection({ onChanged }: { onChanged?: () => void }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [msg, setMsg] = useState("");
   const [preview, setPreview] = useState<Record<string, { total: number; duplicate?: number; added?: number }> | null>(null);
@@ -406,9 +407,12 @@ function DataSection() {
   const doImport = async () => {
     try {
       const r = await api.importData(pendingPack);
-      setMsg(`导入完成:新增会话 ${r.added.sessions}、消息 ${r.added.messages}、资料 ${r.added.docs}、待办 ${r.added.todos}、记忆 ${r.added.facts};跳过重复 ${r.skipped.sessions + r.skipped.docs + r.skipped.todos + r.skipped.facts} 条。`);
+      const att = r.attachments?.added ? `、附件 ${r.attachments.added}` : "";
+      const bad = r.attachments?.invalid ? `;${r.attachments.invalid} 个附件校验失败已跳过` : "";
+      setMsg(`导入完成:新增会话 ${r.added.sessions}、消息 ${r.added.messages}、资料 ${r.added.docs}、待办 ${r.added.todos}、记忆 ${r.added.facts}${att};跳过重复 ${r.skipped.sessions + r.skipped.docs + r.skipped.todos + r.skipped.facts} 条${bad}。`);
       setPreview(null);
       setPendingPack(null);
+      onChanged?.();
     } catch (e) {
       setMsg(`导入失败:${e instanceof Error ? e.message : e}`);
     }
@@ -427,9 +431,9 @@ function DataSection() {
         <div className="cand">
           <div><b>导入预览</b>(同 id 跳过,不覆盖)</div>
           <div className="reason">
-            {(["sessions", "docs", "todos", "facts"] as const).map((k) => preview[k] && (
+            {(["sessions", "docs", "todos", "facts", "attachments"] as const).map((k) => preview[k] && (
               <span key={k} style={{ marginRight: 10 }}>
-                {{ sessions: "会话", docs: "资料", todos: "待办", facts: "记忆" }[k]}:新增 {preview[k].added} / 重复 {preview[k].duplicate}
+                {{ sessions: "会话", docs: "资料", todos: "待办", facts: "记忆", attachments: "附件" }[k]}:新增 {preview[k].added} / 重复 {preview[k].duplicate}
               </span>
             ))}
             {preview.messages && <span>消息 {preview.messages.total} 条(随会话导入)</span>}
@@ -441,11 +445,102 @@ function DataSection() {
         </div>
       )}
       {msg && <p className="tool-out" style={{ whiteSpace: "pre-wrap" }}>{msg}</p>}
+      <ExternalImport onChanged={onChanged} />
     </>
   );
 }
 
-export function SettingsPage() {
+// M1:从 ChatGPT / Claude 的数据导出导入历史对话。选 ZIP 或 conversations.json,预览后确认
+const SOURCE_NAME = { chatgpt: "ChatGPT", claude: "Claude" } as const;
+function ExternalImport({ onChanged }: { onChanged?: () => void }) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [pending, setPending] = useState<{ raw: string; preview: ExternalPreview; file: string } | null>(null);
+  const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "?");
+
+  const onFile = async (f: File) => {
+    setMsg("");
+    setPending(null);
+    setBusy(true);
+    try {
+      const raw = await readExportFile(f);
+      setPending({ raw, preview: await api.externalPreview(raw), file: f.name });
+    } catch (e) {
+      setMsg(`无法读取:${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const doImport = async () => {
+    if (!pending) return;
+    setBusy(true);
+    try {
+      const r = await api.externalImport(pending.raw);
+      const skipped = [r.skipped.duplicate && `已导入过 ${r.skipped.duplicate} 个`, r.skipped.empty && `空对话 ${r.skipped.empty} 个`].filter(Boolean);
+      setMsg(
+        `导入完成:新增 ${r.added.sessions} 个会话、${r.added.messages} 条消息${skipped.length ? `;跳过${skipped.join("、")}` : ""}。导入的对话在 Chat 模式的会话列表里。`,
+      );
+      setPending(null);
+      onChanged?.();
+    } catch (e) {
+      setMsg(`导入失败:${errText(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const p = pending?.preview;
+  return (
+    <>
+      <h3 style={{ marginTop: 20 }}>从 ChatGPT / Claude 导入</h3>
+      <p style={{ color: "var(--muted)" }}>
+        在 ChatGPT(设置 → 数据管理 → 导出数据)或 Claude(设置 → 隐私 → 导出数据)申请导出,收到邮件后下载 ZIP,直接选择 ZIP 或其中的 conversations.json。
+        每个对话导入为一个 Chat 会话,保留编辑 / 重新生成的版本;只导入可见的文字,不含图片原图、工具调用与思考过程。重复导入会自动跳过。
+      </p>
+      <div className="row" style={{ display: "flex", gap: 6 }}>
+        <button disabled={busy} onClick={() => fileRef.current?.click()}>{busy && !pending ? "读取中…" : "选择导出文件…"}</button>
+        <input ref={fileRef} type="file" accept=".zip,.json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); e.target.value = ""; }} />
+      </div>
+      {p && (
+        <div className="cand">
+          <div><b>导入预览</b> · {SOURCE_NAME[p.source]} · {pending.file}</div>
+          <div className="reason">
+            <span style={{ marginRight: 10 }}>对话 {p.conversations} 个{p.duplicate ? `(其中 ${p.duplicate} 个已导入过,将跳过)` : ""}</span>
+            <span style={{ marginRight: 10 }}>消息 {p.messages} 条</span>
+            {p.conversations > 0 && <span style={{ marginRight: 10 }}>时间 {day(p.from)} ~ {day(p.to)}</span>}
+            {p.empty > 0 && <span>空对话 {p.empty} 个(跳过)</span>}
+          </div>
+          <div className="row">
+            <button className="primary" disabled={busy || p.conversations - p.duplicate <= 0} onClick={() => void doImport()}>
+              {busy ? "导入中…" : `导入 ${Math.max(0, p.conversations - p.duplicate)} 个对话`}
+            </button>
+            <button disabled={busy} onClick={() => setPending(null)}>取消</button>
+          </div>
+        </div>
+      )}
+      {msg && <p className="tool-out" style={{ whiteSpace: "pre-wrap" }}>{msg}</p>}
+    </>
+  );
+}
+
+// req() 的错误是 "400: {json}":取出服务端的 error 文案
+function errText(e: unknown): string {
+  const m = e instanceof Error ? e.message : String(e);
+  const json = /^\d{3}: (.*)$/s.exec(m)?.[1];
+  if (json) {
+    try {
+      const v = JSON.parse(json) as { error?: string };
+      if (v.error) return v.error;
+    } catch {
+      // 不是 JSON,原样返回
+    }
+  }
+  return m;
+}
+
+// onDataChanged:导入数据后通知外层刷新会话列表
+export function SettingsPage({ onDataChanged }: { onDataChanged?: () => void } = {}) {
   const [cat, setCat] = useState<Category>("外观");
 
   return (
@@ -463,7 +558,7 @@ export function SettingsPage() {
         {cat === "记忆" && <PlaceholderSection title="记忆" note="记忆事实与候选的筛选、确认、删除在顶栏「记忆」页。" />}
         {cat === "工作区" && <PlaceholderSection title="工作区" note="工作区在 Code/Work 页顶部绑定;文件与命令工具由 PathGuard 限制在工作区内。规则文件按序加载(后加载的优先级更高):全局 data/rules/global.md → 模式 data/rules/<mode>.md → 用户 ~/.claude/CLAUDE.md(仅 Code)→ 项目 AGENTS.md / CLAUDE.md / .cursorrules / .github/copilot-instructions.md → .cursor/rules/*.mdc 与 .github/instructions/*.instructions.md(alwaysApply 总是加载,globs / applyTo 在 @ 引用了匹配文件时加载)→ 被引用文件所在目录的 AGENTS.md / CLAUDE.md → CLAUDE.local.md。规则中的 @路径 会展开为对应文件内容(限工作区内)。" />}
         {cat === "权限与安全" && <SecuritySection />}
-        {cat === "数据" && <DataSection />}
+        {cat === "数据" && <DataSection onChanged={onDataChanged} />}
         {cat === "Skill" && <SkillsSection />}
         {cat === "插件" && <PlaceholderSection title="插件" note="可执行插件沙箱(Extension API)尚未实现;Skill 已支持声明式权限,见「Skill」与「权限与安全」页。插件执行能力在有真实需求后交付。" />}
         {cat === "关于" && <PlaceholderSection title="关于" note="XiyunAgent · 本地优先的个人 Agent 工作台。" />}

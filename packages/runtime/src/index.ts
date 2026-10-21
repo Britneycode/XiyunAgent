@@ -85,8 +85,19 @@ export interface ChatProvider {
 // Provider 实例按请求创建,所以缓存放在模块级。
 const usageUnsupported = new Set<string>();
 
-// 只发 role/content:blocks、id 等内部字段会让严格网关 400
-const wireMessages = (messages: ChatMessage[]) => messages.map((m) => ({ role: m.role, content: m.content }));
+// 只发 role/content:blocks、id 等内部字段会让严格网关 400。带图片的 user 消息改用 content 数组(B2)
+const wireMessages = (messages: ChatMessage[]) =>
+  messages.map((m) =>
+    m.role === "user" && m.images?.length
+      ? {
+          role: m.role,
+          content: [
+            ...(m.content.trim() ? [{ type: "text", text: m.content }] : []),
+            ...m.images.map((i) => ({ type: "image_url", image_url: { url: `data:${i.mime};base64,${i.data}` } })),
+          ],
+        }
+      : { role: m.role, content: m.content },
+  );
 
 export function createOpenAIProvider(config: ProviderConfig, popts: ProviderOptions = {}): ChatProvider {
   const usageKey = `${config.baseUrl.replace(/\/+$/, "")}|${config.model}`;

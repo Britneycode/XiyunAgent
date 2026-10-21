@@ -25,6 +25,7 @@ import type { ChatBlock } from "@xiyun/shared";
 import { cn } from "../ui/cn.ts";
 import { formatElapsed } from "../ui/format.ts";
 import { IconButton, StatusDot, type Tone } from "../ui/primitives.tsx";
+import { attachmentUrl } from "../api.ts";
 import { escapeHtml } from "./markdown.ts";
 import { StreamingMarkdown } from "./StreamingMarkdown.tsx";
 
@@ -375,6 +376,62 @@ export function RefChips({ refs }: { refs: RefBlockData[] }) {
   );
 }
 
+// ---------- 附件(B2):图片缩略图 + 文本文件标签,点击在新窗口打开原文件 ----------
+
+export type AttachmentBlockData = Extract<ChatBlock, { kind: "attachment" }>;
+
+export const formatSize = (n: number) =>
+  n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+
+export function AttachmentList({ items }: { items: AttachmentBlockData[] }) {
+  if (!items.length) return null;
+  const images = items.filter((a) => a.type === "image");
+  const files = items.filter((a) => a.type !== "image");
+  return (
+    <div className="flex max-w-[85%] flex-col items-end gap-1.5">
+      {images.length > 0 && (
+        <div className="flex flex-wrap justify-end gap-1.5">
+          {images.map((a) => (
+            <a
+              key={a.id}
+              href={attachmentUrl(a.attachmentId)}
+              target="_blank"
+              rel="noreferrer"
+              title={`${a.name} · ${formatSize(a.size)}`}
+              className="block overflow-hidden rounded-xl border border-line bg-surface shadow-pill transition-opacity hover:opacity-90"
+            >
+              <img
+                src={attachmentUrl(a.attachmentId)}
+                alt={a.name}
+                loading="lazy"
+                className={cn("block object-cover", images.length === 1 ? "max-h-60 max-w-[320px]" : "size-28")}
+              />
+            </a>
+          ))}
+        </div>
+      )}
+      {files.length > 0 && (
+        <div className="flex flex-wrap justify-end gap-1">
+          {files.map((a) => (
+            <a
+              key={a.id}
+              href={attachmentUrl(a.attachmentId)}
+              target="_blank"
+              rel="noreferrer"
+              title={a.name}
+              className="inline-flex h-7 max-w-[260px] items-center gap-1.5 rounded-lg border border-line bg-surface px-2 text-xs text-fg shadow-pill transition-colors hover:border-line-strong"
+            >
+              <FileText size={13} strokeWidth={1.75} className="shrink-0 text-subtle" aria-hidden />
+              <span className="truncate font-mono text-2xs">{a.name}</span>
+              <span className="shrink-0 text-2xs text-subtle">{formatSize(a.size)}</span>
+            </a>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------- 消息正文 ----------
 
 function PendingReply() {
@@ -398,7 +455,7 @@ export function MessageBody({
   onPreview?: (p: Preview) => void;
 }) {
   // ref 块只属于用户消息,在气泡上方单独渲染
-  const shown = (blocks ?? []).filter((b) => b.kind !== "ref");
+  const shown = (blocks ?? []).filter((b) => b.kind !== "ref" && b.kind !== "attachment");
   const live = !!streaming;
 
   if (!shown.length) {

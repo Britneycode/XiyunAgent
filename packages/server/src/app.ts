@@ -22,8 +22,11 @@ import { RunRegistry, type Run } from "./runs.ts";
 import { searchMessages } from "./search.ts";
 import { ancestors, ensureTree, loadTree, pathIds, setHeadId, siblingsOf, switchHead } from "./tree.ts";
 import {
-  contextBudget, fileHash, MESSAGE_OVERHEAD, planHistory, summarize, summaryBatch, withRefContext, type PathMessage,
+  contextBudget, fileHash, IMAGE_TOKENS, MESSAGE_OVERHEAD, planHistory, summarize, summaryBatch, withAttachments,
+  withRefContext, type PathMessage,
 } from "./context.ts";
+import { AttachmentError, AttachmentStore, MAX_PER_MESSAGE, TEXT_INJECT_CHARS } from "./attachments.ts";
+import { parseExternal, type ExternalConversation, type ExternalSource } from "./external.ts";
 
 const now = () => new Date().toISOString();
 
@@ -37,6 +40,7 @@ export function createApp(
     chatProvider?: () => ChatProvider;
     titleProvider?: () => ChatProvider | undefined;
     summaryProvider?: () => ChatProvider | undefined;
+    dataDir?: string; // 附件存放目录的上级(缺省 DATA_DIR;测试用临时目录)
   },
 ) {
   const app = new Hono();
@@ -46,6 +50,13 @@ export function createApp(
   app.use("*", cors({ origin: (o) => (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(o) ? o : undefined) }));
 
   const taskStore = new TaskStore(db);
+  // B2:附件。启动时清理一天前上传、但没有随任何消息发出的附件
+  const attachments = new AttachmentStore(db, opts?.dataDir ?? DATA_DIR);
+  try {
+    attachments.prune();
+  } catch {
+    // 清理失败不影响启动
+  }
   const work = new WorkStore(db);
   const skills = new SkillStore(db, DATA_DIR);
   const scheduler = new Scheduler({
@@ -239,8 +250,12 @@ export function createApp(
   app.delete("/sessions/:id", (c) => {
     const run = runs.active(c.req.param("id"));
     if (run) runs.cancel(run.id); // 删除会话时停止其后台生成
+    const used = (db.prepare("SELECT blocks FROM messages WHERE session_id = ? AND blocks LIKE '%\"attachmentId\"%'").all(c.req.param("id")) as Array<{ blocks: string }>)
+      .flatMap((r) => attachmentBlocksOf(r.blocks).map((a) => a.attachmentId));
     db.prepare("DELETE FROM sessions WHERE id = ?").run(c.req.param("id"));
     db.prepare("DELETE FROM messages WHERE session_id = ?").run(c.req.param("id"));
+    // 附件不再被其他会话引用时一并删除
+    if (used.length) attachments.prune({ ids: [...new Set(used)] });
     return c.json({ ok: true });
   });
   // 损坏的 blocks JSON 按纯文本降级为 undefined,不让整个接口 500
@@ -296,12 +311,40 @@ export function createApp(
   };
   const refBlocksOf = (raw: string | null) =>
     (parseBlocks(raw) ?? []).filter((b): b is Extract<ChatBlock, { kind: "ref" }> => b.kind === "ref");
+  const attachmentBlocksOf = (raw: string | null) =>
+    (parseBlocks(raw) ?? []).filter((b): b is Extract<ChatBlock, { kind: "attachment" }> => b.kind === "attachment");
+  // 文本附件的正文(带标题、单个截断);文件丢失时注明
+  const attachmentText = (list: Array<Extract<ChatBlock, { kind: "attachment" }>>) =>
+    list
+      .filter((a) => a.type === "text")
+      .map((a) => {
+        let text: string;
+        try {
+          const raw = attachments.text(a.attachmentId);
+          text = raw.length > TEXT_INJECT_CHARS ? `${raw.slice(0, TEXT_INJECT_CHARS)}\n…(已截断,原文 ${raw.length} 字)` : raw;
+        } catch {
+          text = "(附件文件已丢失)";
+        }
+        return `## 附件:${a.name}\n${text}`;
+      })
+      .join("\n\n");
+  const readImages = (ids: string[]) =>
+    ids.flatMap((id) => {
+      const meta = attachments.get(id);
+      if (!meta || meta.kind !== "image") return [];
+      try {
+        return [{ mime: meta.mime, data: attachments.read(id).toString("base64") }];
+      } catch {
+        return [];
+      }
+    });
   const toPathMessage = (r: MsgRow): PathMessage => ({
     id: r.id,
     role: r.role as PathMessage["role"],
     content: r.content,
     refContext: r.ref_context,
     refs: r.role === "user" ? refBlocksOf(r.blocks) : undefined,
+    attachments: r.role === "user" ? attachmentBlocksOf(r.blocks) : undefined,
     usage: parseUsage(r.usage),
   });
   // 当前分支的消息(会话展示用),带父消息与兄弟版本
@@ -378,6 +421,32 @@ export function createApp(
     });
   });
 
+  // ---- 附件(B2):multipart 字段 file;返回附件元信息,发送消息时把 id 放进 /chat 的 attachments ----
+  app.post("/attachments", async (c) => {
+    const form = await c.req.parseBody().catch(() => null);
+    const file = form?.file;
+    if (!file || typeof file === "string") return c.json({ error: "缺少文件(multipart 字段 file)" }, 400);
+    try {
+      return c.json(attachments.save(file.name, file.type, new Uint8Array(await file.arrayBuffer())));
+    } catch (e) {
+      if (e instanceof AttachmentError) return c.json({ error: e.message }, e.status);
+      throw e;
+    }
+  });
+  // 只按内容哈希取;文本一律按纯文本返回,图片按识别出的类型,禁止嗅探
+  app.get("/attachments/:id", (c) => {
+    const meta = attachments.get(c.req.param("id"));
+    if (!meta) return c.json({ error: "attachment not found" }, 404);
+    return new Response(new Uint8Array(attachments.read(meta.id)), {
+      headers: {
+        "Content-Type": meta.kind === "image" ? meta.mime : "text/plain; charset=utf-8",
+        "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(meta.name)}`,
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  });
+
   // ---- 消息全文搜索(M7):GET /search?q=&mode=&limit= ----
   app.get("/search", (c) =>
     c.json(
@@ -419,10 +488,16 @@ export function createApp(
       providerId?: string; // 本次请求临时指定模型(如"换个模型重新生成"),优先于会话设置
       model?: string;
       editOf?: number; // 编辑某条 user 消息:新消息作为它的兄弟版本(F6),原消息与其后的回复都保留
+      attachments?: string[]; // 已上传附件的 id(B2);只有附件时 message 可为空
     };
     const regenerate = body.regenerate === true;
-    if (!body.sessionId || (!regenerate && (typeof body.message !== "string" || !body.message.trim())))
+    const attachIds = Array.isArray(body.attachments)
+      ? [...new Set(body.attachments.filter((x): x is string => typeof x === "string"))]
+      : undefined;
+    const hasText = typeof body.message === "string" && !!body.message.trim();
+    if (!body.sessionId || (!regenerate && !hasText && !attachIds?.length))
       return c.json({ error: "缺少 sessionId/message" }, 400);
+    if (attachIds && attachIds.length > MAX_PER_MESSAGE) return c.json({ error: `一条消息最多 ${MAX_PER_MESSAGE} 个附件` }, 400);
     // 解构为常量,保证闭包内类型收窄不失效
     const sessionId = body.sessionId;
     // context 进入模型消息并随 user 消息落库(之后几轮继续带入,F4);refs 作为展示块落库(D5)
@@ -454,7 +529,10 @@ export function createApp(
     let regenUserId: number | null = null;
     // 被重新生成的旧回复;出错的旧回复会被新回复替换,不累积失败版本
     let prevReply: { id: number; error: string | null } | null = null;
-    let editBlocks: string | null = null;
+    // 编辑时沿用的原引用块(保留当时的文件指纹)
+    let keptRefBlocks: Array<Extract<ChatBlock, { kind: "ref" }>> | null = null;
+    // 本轮附件块:新发送按 attachIds 生成;regenerate / 编辑未带附件时沿用原消息的
+    let attBlocks: Array<Extract<ChatBlock, { kind: "attachment" }>> = [];
     if (regenerate) {
       const head = tree.head == null ? undefined : (db.prepare("SELECT id, role, error FROM messages WHERE id = ?").get(tree.head) as
         | { id: number; role: string; error: string | null } | undefined);
@@ -468,18 +546,34 @@ export function createApp(
       message = user.content;
       if (!context) context = user.ref_context ?? "";
       if (!refs.length) refs = refBlocksOf(user.blocks).map(({ refType, label, excerpt, path }) => ({ refType, label, excerpt, path }));
+      attBlocks = attachmentBlocksOf(user.blocks);
     } else if (typeof body.editOf === "number") {
       const orig = db.prepare("SELECT id, role, blocks, ref_context FROM messages WHERE id = ? AND session_id = ?").get(body.editOf, sessionId) as
         | { id: number; role: string; blocks: string | null; ref_context: string | null } | undefined;
       if (!orig || orig.role !== "user") return c.json({ error: "要编辑的消息不存在" }, 404);
       parentId = tree.parent.get(orig.id) ?? null;
-      // 编辑只改文字:没带新引用时沿用原消息的引用
+      // 编辑只改文字:没带新引用 / 附件时沿用原消息的
       if (!refs.length && !context) {
         context = orig.ref_context ?? "";
-        editBlocks = orig.blocks;
-        refs = refBlocksOf(orig.blocks).map(({ refType, label, excerpt, path }) => ({ refType, label, excerpt, path }));
+        keptRefBlocks = refBlocksOf(orig.blocks);
+        refs = keptRefBlocks.map(({ refType, label, excerpt, path }) => ({ refType, label, excerpt, path }));
+      }
+      if (attachIds === undefined) attBlocks = attachmentBlocksOf(orig.blocks);
+    }
+    if (!regenerate && attachIds?.length) {
+      attBlocks = [];
+      for (const [i, id] of attachIds.entries()) {
+        const meta = attachments.get(id);
+        if (!meta) return c.json({ error: "附件不存在或已过期,请重新上传" }, 400);
+        attBlocks.push({ id: `att${i + 1}`, kind: "attachment", attachmentId: meta.id, name: meta.name, mime: meta.mime, size: meta.size, type: meta.kind });
       }
     }
+    // 能力未声明时不拦(按 Provider 实际报错为准);声明了但没有 vision 时不发图片
+    const caps = provider.config.capabilities ?? [];
+    const vision = caps.length === 0 || caps.includes("vision");
+    const curImages = attBlocks.filter((a) => a.type === "image");
+    if (curImages.length && !vision)
+      return c.json({ error: "当前模型未声明图片能力(vision):请换用支持图片的模型,或在设置里为该模型加上 vision" }, 400);
 
     // 规则层:引用的文件参与匹配 .mdc globs 与目录级 AGENTS.md / CLAUDE.md(D-019)
     const refFiles = refs.flatMap((r) => (r.refType === "file" && typeof r.path === "string" ? [r.path] : []));
@@ -487,8 +581,8 @@ export function createApp(
     const skillText = skills.promptFor(session.mode, "main", message);
     const scopes = ["global", session.mode, session.workspace];
     // 记忆链路只用用户原话:引用上下文不参与记忆指令与检索(D5)
-    const memNote = await runMemoryTool({ provider, memory, message: message, scopes, scope: session.mode });
-    let facts = memory.search(message, 5, scopes);
+    const memNote = message.trim() ? await runMemoryTool({ provider, memory, message: message, scopes, scope: session.mode }) : "";
+    let facts = message.trim() ? memory.search(message, 5, scopes) : [];
     // 无主题词的泛化提问("我上次学到哪了")召回为空时,回退到最近的有效记忆。
     if (facts.length === 0) facts = memory.recent(5, scopes);
     const memories = facts.map((f) => `- ${f.content}`);
@@ -514,11 +608,14 @@ export function createApp(
       .join("\n\n");
 
     // F4:历史 = 从根到 parentId 的分支路径,按 token 预算从新到旧装入;装不下的早先消息用滚动摘要代替
-    const modelMessage = context ? withRefContext(message, context) : message;
+    // 本轮:原话 + 引用上下文 + 文本附件正文;图片单独随消息发送
+    const curText = attachmentText(attBlocks);
+    const withCtx = context ? withRefContext(message, context) : message;
+    const modelMessage = curText ? withAttachments(withCtx, curText) : withCtx;
     const path = parentId == null ? [] : rowsByIds(ancestors(tree, parentId)).map(toPathMessage);
     const budget =
       contextBudget({ contextLength: provider.config.contextLength, maxTokens: provider.config.params?.maxTokens }) -
-      estimateTokens(system) - estimateTokens(modelMessage) - 2 * MESSAGE_OVERHEAD;
+      estimateTokens(system) - estimateTokens(modelMessage) - curImages.length * IMAGE_TOKENS - 2 * MESSAGE_OVERHEAD;
     // 引用过的文件现在内容变了:带入历史时提示模型
     const staleFiles = (m: PathMessage) =>
       !session.workspace
@@ -526,20 +623,25 @@ export function createApp(
         : (m.refs ?? []).flatMap((r) =>
             r.refType === "file" && r.path && r.hash && fileHash(session.workspace, r.path) !== r.hash ? [r.label] : [],
           );
-    let plan = planHistory(path, budget, staleFiles);
+    const planOpts = { changed: staleFiles, vision, attachmentText: (m: PathMessage) => attachmentText(m.attachments ?? []) };
+    let plan = planHistory(path, budget, planOpts);
     const summaryValid =
       !!session.summary && session.summary_upto_id != null && path.some((m) => m.id === session.summary_upto_id);
     let systemText = system;
     if (plan.dropped.length && summaryValid) {
       const section = `# 早先对话摘要\n(更早的消息未逐字带入,以下为压缩摘要;与之后的消息冲突时以之后的为准)\n${session.summary}`;
       systemText = `${system}\n\n${section}`;
-      plan = planHistory(path, budget - estimateTokens(section) - 2, staleFiles);
+      plan = planHistory(path, budget - estimateTokens(section) - 2, planOpts);
     }
     const trim = plan.dropped.length ? { dropped: plan.dropped.length, summary: summaryValid } : null;
+    const curImageData = readImages(curImages.map((a) => a.attachmentId));
     const messages: ChatMessage[] = [
       { role: "system", content: systemText },
-      ...plan.history,
-      { role: "user", content: modelMessage },
+      ...plan.history.map(({ imageIds, ...m }) => {
+        const images = imageIds?.length ? readImages(imageIds) : [];
+        return images.length ? { ...m, images } : m;
+      }),
+      { role: "user", content: modelMessage, ...(curImageData.length ? { images: curImageData } : {}) },
     ];
 
     // 最后一个 await 之后再占位,与 user 落库之间没有让出事件循环,不会并发重复
@@ -552,16 +654,14 @@ export function createApp(
     let titlePending: Promise<string | null> | null = null;
     if (!regenerate) {
       // 文件引用记下当前内容指纹,之后带入历史时据此判断是否已变更
-      const blocks =
-        editBlocks ??
-        (refs.length
-          ? JSON.stringify(
-              refs.map((r2, i) => {
-                const hash = r2.refType === "file" && r2.path && session.workspace ? fileHash(session.workspace, r2.path) : undefined;
-                return { id: `ref${i + 1}`, kind: "ref", ...r2, ...(hash ? { hash } : {}) };
-              }),
-            )
-          : null);
+      const refBlocks: ChatBlock[] =
+        keptRefBlocks ??
+        refs.map((r2, i) => {
+          const hash = r2.refType === "file" && r2.path && session.workspace ? fileHash(session.workspace, r2.path) : undefined;
+          return { id: `ref${i + 1}`, kind: "ref" as const, ...r2, ...(hash ? { hash } : {}) };
+        });
+      const all = [...refBlocks, ...attBlocks];
+      const blocks = all.length ? JSON.stringify(all) : null;
       const r = db
         .prepare("INSERT INTO messages (session_id, role, content, blocks, parent_id, ref_context, created_at) VALUES (?, 'user', ?, ?, ?, ?, ?)")
         .run(sessionId, message, blocks, parentId, context || null, now());
@@ -570,7 +670,7 @@ export function createApp(
       touchSession(sessionId);
       // 自动命名:仍是默认标题时,先落启发式标题,较长的消息再异步请模型起短标题(只覆盖启发式标题,不动用户改过的)
       if (session.title === DEFAULT_TITLE) {
-        const quick = heuristicTitle(message);
+        const quick = heuristicTitle(message) || heuristicTitle(attBlocks[0]?.name ?? "");
         if (quick) {
           db.prepare("UPDATE sessions SET title = ? WHERE id = ? AND title = ?").run(quick, sessionId, DEFAULT_TITLE);
           const titler = opts?.titleProvider ? opts.titleProvider() : memoryProvider();
@@ -1244,9 +1344,10 @@ export function createApp(
     const docs = db.prepare("SELECT * FROM docs ORDER BY created_at").all();
     const todos = db.prepare("SELECT * FROM todos ORDER BY created_at").all();
     const facts = db.prepare("SELECT * FROM facts WHERE deleted_at IS NULL ORDER BY valid_from").all();
+    // 附件(B2)以 base64 随包导出,导入时按 sha256 校验
     return c.json({
       kind: EXPORT_KIND, version: EXPORT_VERSION, exportedAt: now(),
-      data: { sessions, messages, docs, todos, facts },
+      data: { sessions, messages, docs, todos, facts, attachments: attachments.exportAll() },
     });
   });
 
@@ -1273,6 +1374,7 @@ export function createApp(
       todos: count("todos", d.todos),
       facts: count("facts", d.facts),
       messages: { total: Array.isArray(d.messages) ? d.messages.length : 0 },
+      attachments: count("attachments", d.attachments),
     });
   });
 
@@ -1380,10 +1482,83 @@ export function createApp(
       db.exec("ROLLBACK");
       return c.json({ error: `导入失败,已回滚:${e instanceof Error ? e.message : String(e)}` }, 400);
     }
+    // 附件在主事务提交后写入(文件不在事务里);校验失败的单个附件跳过,不影响其余数据
+    const att = { added: 0, skipped: 0, invalid: 0 };
+    for (const r of (Array.isArray(d.attachments) ? d.attachments : []) as Array<Record<string, unknown>>) {
+      try {
+        if (attachments.restore(r)) att.added++;
+        else att.skipped++;
+      } catch {
+        att.invalid++;
+      }
+    }
     db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('data.import', ?, ?)").run(
-      JSON.stringify({ added: add, skipped: skip }), now(),
+      JSON.stringify({ added: add, skipped: skip, attachments: att }), now(),
     );
-    return c.json({ ok: true, added: add, skipped: skip });
+    return c.json({ ok: true, added: add, skipped: skip, attachments: att });
+  });
+
+  // ---- 从 ChatGPT / Claude 导入历史对话(M1):body 为 conversations.json 原文(ZIP 由前端解开)----
+  // 每个对话成为一个 Chat 会话,保留原分支;按 (来源, 原对话 id) 去重,重复导入跳过
+  const readExternal = async (c: Context): Promise<{ source: ExternalSource; conversations: ExternalConversation[] } | Response> => {
+    try {
+      return parseExternal(await c.req.json().catch(() => null));
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  };
+  const hasExternal = db.prepare("SELECT 1 FROM sessions WHERE external_source = ? AND external_id = ?");
+  app.post("/admin/import/external/preview", async (c) => {
+    const parsed = await readExternal(c);
+    if (parsed instanceof Response) return parsed;
+    const convs = parsed.conversations.filter((x) => x.messages.length);
+    const dates = convs.map((x) => x.createdAt).sort();
+    return c.json({
+      source: parsed.source,
+      conversations: convs.length,
+      messages: convs.reduce((n, x) => n + x.messages.length, 0),
+      duplicate: convs.filter((x) => hasExternal.get(parsed.source, x.externalId)).length,
+      empty: parsed.conversations.length - convs.length,
+      from: dates[0] ?? null,
+      to: dates[dates.length - 1] ?? null,
+    });
+  });
+  app.post("/admin/import/external", async (c) => {
+    const parsed = await readExternal(c);
+    if (parsed instanceof Response) return parsed;
+    const added = { sessions: 0, messages: 0 };
+    const skipped = { duplicate: 0, empty: 0 };
+    try {
+      db.exec("BEGIN");
+      const insSession = db.prepare(
+        "INSERT INTO sessions (id, title, mode, workspace, created_at, updated_at, external_source, external_id) VALUES (?, ?, 'chat', ?, ?, ?, ?, ?)",
+      );
+      const insMsg = db.prepare("INSERT INTO messages (session_id, role, content, parent_id, created_at) VALUES (?, ?, ?, ?, ?)");
+      const setHead = db.prepare("UPDATE sessions SET head_id = ? WHERE id = ?");
+      for (const conv of parsed.conversations) {
+        if (!conv.messages.length) { skipped.empty++; continue; }
+        if (hasExternal.get(parsed.source, conv.externalId)) { skipped.duplicate++; continue; }
+        const sid = randomUUID();
+        const lastAt = conv.messages.reduce((m, x) => (x.createdAt > m ? x.createdAt : m), conv.updatedAt);
+        insSession.run(sid, conv.title.slice(0, 80), process.cwd(), conv.createdAt, lastAt, parsed.source, conv.externalId.slice(0, 200));
+        const idOf = new Map<string, number>();
+        for (const m of conv.messages) {
+          const parent = m.parentKey == null ? null : (idOf.get(m.parentKey) ?? null);
+          idOf.set(m.key, Number(insMsg.run(sid, m.role, m.content, parent, m.createdAt).lastInsertRowid));
+          added.messages++;
+        }
+        setHead.run(conv.headKey == null ? null : (idOf.get(conv.headKey) ?? null), sid);
+        added.sessions++;
+      }
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      return c.json({ error: `导入失败,已回滚:${e instanceof Error ? e.message : String(e)}` }, 400);
+    }
+    db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('data.import.external', ?, ?)").run(
+      JSON.stringify({ source: parsed.source, added, skipped }), now(),
+    );
+    return c.json({ ok: true, source: parsed.source, added, skipped });
   });
 
   return app;

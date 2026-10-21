@@ -6,11 +6,15 @@ import {
   Download,
   FileCode2,
   FileText,
+  ImageIcon,
+  LoaderCircle,
   MessageSquareText,
+  Paperclip,
   PenLine,
   Plus,
   Slash,
   Square,
+  TriangleAlert,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -21,11 +25,14 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent,
+  type DragEvent,
   type KeyboardEvent,
 } from "react";
-import type { SessionMeta, WorkDoc } from "@xiyun/shared";
+import type { AttachmentMeta, SessionMeta, WorkDoc } from "@xiyun/shared";
 import { api, type RefPayload } from "../api.ts";
 import { useHotkey } from "../ui/hooks.ts";
+import { formatSize } from "./blocks.tsx";
 import { loadDraft, saveDraft } from "./drafts.ts";
 import { cn } from "../ui/cn.ts";
 import { Highlight, MenuGroupLabel, MenuItem, MenuList, PopoverSurface, useActiveIndex } from "../ui/menu.tsx";
@@ -73,6 +80,24 @@ const REF_GROUP_LABEL: Record<RefItem["refType"], string> = {
   doc: "文档",
 };
 
+// 附件(B2):与服务端同口径的前置检查,超限直接提示,不必等上传失败
+const MAX_ATTACHMENTS = 8;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_TEXT_BYTES = 1024 * 1024;
+const IMAGE_TOKENS = 1200; // 每张图片按约 1200 token 估算(与服务端一致)
+
+type PendingAttachment = {
+  key: string;
+  name: string;
+  size: number;
+  image: boolean;
+  preview?: string; // 图片的本地预览(object URL)
+  status: "uploading" | "ready" | "error";
+  meta?: AttachmentMeta;
+  error?: string;
+};
+let attSeq = 0;
+
 const MAX_CONTEXT = 8000;
 const MAX_TEXTAREA_HEIGHT = 280;
 const NOTE_TTL = 4000;
@@ -115,7 +140,7 @@ export function Composer(props: {
   editText: string;
   onEditText: (v: string) => void;
   onCancelEdit: () => void;
-  onSubmit: (text: string, o?: { context?: string; refs?: RefPayload[] }) => void;
+  onSubmit: (text: string, o?: { context?: string; refs?: RefPayload[]; attachments?: AttachmentMeta[] }) => void;
   onStop: () => void;
   onNewSession?: () => void;
   onCandidatesChanged?: () => void;
@@ -137,6 +162,10 @@ export function Composer(props: {
   const [sel, setSel] = useState({ providerId: props.session.providerId ?? null, model: props.session.model ?? null });
   const [note, setNote] = useState<{ text: string; tone: "info" | "err" } | null>(null);
   const [focused, setFocused] = useState(false);
+  const [atts, setAtts] = useState<PendingAttachment[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const previewsRef = useRef(new Set<string>());
 
   const taRef = useRef<HTMLTextAreaElement>(null);
   const pendingCaret = useRef<number | null>(null);
@@ -163,6 +192,80 @@ export function Composer(props: {
     return () => clearTimeout(t);
   }, [note]);
   const flash = (msg: string, tone: "info" | "err" = "info") => setNote({ text: msg, tone });
+
+  // ---- 附件:按钮选择 / 粘贴 / 拖放,选中即上传;发送时只带上传成功的 ----
+  useEffect(() => {
+    const urls = previewsRef.current;
+    return () => urls.forEach((u) => URL.revokeObjectURL(u));
+  }, []);
+  const dropPreview = (a: PendingAttachment) => {
+    if (a.preview) {
+      URL.revokeObjectURL(a.preview);
+      previewsRef.current.delete(a.preview);
+    }
+  };
+  const addFiles = (list: File[]) => {
+    if (!list.length) return;
+    if (editing) {
+      flash("编辑消息时不能更换附件,附件沿用原消息", "err");
+      return;
+    }
+    const room = MAX_ATTACHMENTS - atts.length;
+    if (room <= 0) {
+      flash(`一条消息最多 ${MAX_ATTACHMENTS} 个附件`, "err");
+      return;
+    }
+    if (list.length > room) flash(`一条消息最多 ${MAX_ATTACHMENTS} 个附件,多出的已忽略`, "err");
+    const next = list.slice(0, room).map((file) => {
+      const image = file.type.startsWith("image/");
+      const limit = image ? MAX_IMAGE_BYTES : MAX_TEXT_BYTES;
+      const tooBig = file.size > limit;
+      const preview = image && !tooBig ? URL.createObjectURL(file) : undefined;
+      if (preview) previewsRef.current.add(preview);
+      const item: PendingAttachment = {
+        key: `att-${++attSeq}`, name: file.name || "粘贴的图片.png", size: file.size, image, preview,
+        status: tooBig ? "error" : "uploading",
+        error: tooBig ? `${image ? "图片" : "文本文件"}超过 ${formatSize(limit)}` : undefined,
+      };
+      if (!tooBig) {
+        void api.uploadAttachment(file).then(
+          (meta) => setAtts((xs) => xs.map((x) => (x.key === item.key ? { ...x, status: "ready", meta, image: meta.kind === "image" } : x))),
+          (e: unknown) =>
+            setAtts((xs) => xs.map((x) => (x.key === item.key ? { ...x, status: "error", error: e instanceof Error ? e.message : String(e) } : x))),
+        );
+      }
+      return item;
+    });
+    setAtts((xs) => [...xs, ...next]);
+  };
+  const removeAtt = (key: string) =>
+    setAtts((xs) => {
+      const hit = xs.find((x) => x.key === key);
+      if (hit) dropPreview(hit);
+      return xs.filter((x) => x.key !== key);
+    });
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(e.clipboardData.files);
+    if (!files.length) return;
+    e.preventDefault();
+    addFiles(files);
+  };
+  const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer.types).includes("Files");
+  const onDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = editing ? "none" : "copy";
+    if (!dragging) setDragging(true);
+  };
+  const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false);
+  };
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    setDragging(false);
+    addFiles(Array.from(e.dataTransfer.files));
+  };
 
   // ---- 自适应高度:内容增长到上限后出现滚动条 ----
   useLayoutEffect(() => {
@@ -196,6 +299,10 @@ export function Composer(props: {
   const { options, globalId } = props.models;
   const resolved = resolveOption(options, globalId, sel);
   const globalOption = resolveOption(options, globalId, {}).option;
+  // 模型声明了能力但没有 vision 时,图片会被服务端拒绝:提前提示(未声明能力时不拦)
+  const caps = resolved.option?.capabilities ?? [];
+  const noVision = caps.length > 0 && !caps.includes("vision");
+  const visionBlocked = noVision && atts.some((a) => a.image && a.status !== "error");
   const switchModel = async (o: ModelOption | null) => {
     const next = o ? { providerId: o.providerId, model: o.model } : { providerId: null, model: null };
     setSel(next);
@@ -394,10 +501,19 @@ export function Composer(props: {
 
   const submit = async () => {
     const trimmed = value.trim();
-    if (!trimmed || props.busy || submittingRef.current) return;
-    // `/` 命令:只在开头且无引用时生效
+    const ready = editing ? [] : atts.flatMap((a) => (a.status === "ready" && a.meta ? [a.meta] : []));
+    if ((!trimmed && !ready.length) || props.busy || submittingRef.current) return;
+    if (!editing && atts.some((a) => a.status === "uploading")) {
+      flash("附件还在上传,请稍候");
+      return;
+    }
+    if (!editing && visionBlocked) {
+      flash("当前模型不支持图片:请换用支持图片的模型,或移除图片", "err");
+      return;
+    }
+    // `/` 命令:只在开头且无引用 / 附件时生效
     const cmd = /^\/(\w+)\s*$/.exec(trimmed);
-    if (cmd && !editing && runCommand(cmd[1])) {
+    if (cmd && !editing && !ready.length && runCommand(cmd[1])) {
       setTrigger(null);
       return;
     }
@@ -407,7 +523,15 @@ export function Composer(props: {
       setText("");
       setRefs([]);
       setTrigger(null);
-      props.onSubmit(trimmed, refs.length ? { context: built.context, refs: built.refs } : undefined);
+      if (!editing) {
+        atts.forEach(dropPreview);
+        setAtts([]);
+      }
+      const o = {
+        ...(refs.length ? { context: built.context, refs: built.refs } : {}),
+        ...(ready.length ? { attachments: ready } : {}),
+      };
+      props.onSubmit(trimmed, Object.keys(o).length ? o : undefined);
     } finally {
       submittingRef.current = false;
     }
@@ -481,7 +605,7 @@ export function Composer(props: {
     // 输入框为空时 ↑ 编辑上一条消息(与终端 / 聊天应用一致)
     if (
       e.key === "ArrowUp" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey &&
-      !editing && !value && refs.length === 0 && !props.busy && props.onEditLast
+      !editing && !value && refs.length === 0 && atts.length === 0 && !props.busy && props.onEditLast
     ) {
       e.preventDefault();
       props.onEditLast();
@@ -509,10 +633,13 @@ export function Composer(props: {
   // ---- Token 计数:实测基线 + 估算增量 ----
   const baseline = useMemo(() => contextBaseline(props.messages), [props.messages]);
   const refsEstimate = useMemo(() => refs.reduce((n, r) => n + estimateTokens(r.excerpt), 0), [refs]);
+  const attEstimate = atts.reduce((n, a) => n + (a.status === "error" ? 0 : a.image ? IMAGE_TOKENS : Math.ceil(a.size / 3)), 0);
   const draftEstimate = estimateTokens(value);
   const contextLength = resolved.option?.contextLength;
 
-  const canSend = value.trim().length > 0;
+  const uploading = atts.some((a) => a.status === "uploading");
+  const readyCount = atts.filter((a) => a.status === "ready").length;
+  const canSend = (value.trim().length > 0 || (!editing && readyCount > 0)) && (editing || (!uploading && !visionBlocked));
   const activeOptionId = menu && nav.index >= 0 ? `${menuId}-${nav.index}` : undefined;
 
   let flatIndex = -1;
@@ -617,12 +744,24 @@ export function Composer(props: {
       </AnimatePresence>
 
       <div
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
         className={cn(
           "relative flex flex-col rounded-2xl border bg-elevated shadow-composer transition-[border-color,box-shadow] duration-150",
           focused ? "border-line-strong" : "border-line",
           editing && "border-accent/50",
+          dragging && !editing && "border-accent ring-2 ring-accent/15",
         )}
       >
+        {dragging && !editing && (
+          <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-2xl bg-elevated/85 text-xs text-accent">
+            <span className="inline-flex items-center gap-1.5">
+              <Paperclip size={14} strokeWidth={1.75} aria-hidden />
+              松开以添加附件(图片 / 文本文件)
+            </span>
+          </div>
+        )}
         <AnimatePresence initial={false}>
           {editing && (
             <motion.div
@@ -635,7 +774,7 @@ export function Composer(props: {
             >
               <div className="flex items-center gap-2 border-b border-line px-3.5 py-1.5 text-xs text-muted">
                 <PenLine size={13} strokeWidth={1.75} className="shrink-0 text-accent" aria-hidden />
-                <span className="min-w-0 flex-1 truncate">正在编辑消息 · 发送后作为新版本,原版本可用 ‹ › 切回</span>
+                <span className="min-w-0 flex-1 truncate">正在编辑消息 · 发送后作为新版本(附件沿用原消息),原版本可用 ‹ › 切回</span>
                 <Button variant="ghost" size="xs" onClick={props.onCancelEdit}>
                   取消
                   <Kbd>Esc</Kbd>
@@ -644,6 +783,66 @@ export function Composer(props: {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {!editing && atts.length > 0 && (
+          <div className="flex flex-wrap items-end gap-1.5 px-3 pt-2.5" aria-label="附件">
+            <AnimatePresence initial={false} mode="popLayout">
+              {atts.map((a) => (
+                <motion.div
+                  key={a.key}
+                  layout
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.9 }}
+                  transition={{ duration: 0.14 }}
+                  title={a.error ? `${a.name}:${a.error}` : `${a.name} · ${formatSize(a.size)}`}
+                  className={cn(
+                    "group/att relative flex h-12 max-w-[220px] items-center gap-2 rounded-lg border bg-surface pr-6 text-xs",
+                    a.status === "error" ? "border-err/40" : "border-line",
+                    a.preview ? "pl-1" : "pl-2",
+                  )}
+                >
+                  {a.preview ? (
+                    <img src={a.preview} alt="" className={cn("size-10 shrink-0 rounded-md object-cover", a.status === "uploading" && "opacity-50")} />
+                  ) : (
+                    <span className="grid size-8 shrink-0 place-items-center rounded-md bg-surface-2 text-subtle">
+                      {a.image ? <ImageIcon size={15} strokeWidth={1.75} /> : <FileText size={15} strokeWidth={1.75} />}
+                    </span>
+                  )}
+                  <span className="flex min-w-0 flex-col leading-4">
+                    <span className="truncate text-fg">{a.name}</span>
+                    <span className={cn("truncate text-2xs", a.status === "error" ? "text-err" : "text-subtle")}>
+                      {a.status === "uploading" ? (
+                        <span className="inline-flex items-center gap-1">
+                          <LoaderCircle size={10} className="animate-spin" aria-hidden />
+                          上传中
+                        </span>
+                      ) : a.status === "error" ? (
+                        a.error
+                      ) : (
+                        formatSize(a.size)
+                      )}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    aria-label={`移除附件 ${a.name}`}
+                    onClick={() => removeAtt(a.key)}
+                    className="absolute right-1 top-1 grid size-4 place-items-center rounded text-subtle transition-colors hover:bg-surface-3 hover:text-fg"
+                  >
+                    <X size={11} strokeWidth={2} />
+                  </button>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </div>
+        )}
+        {!editing && visionBlocked && (
+          <div className="mx-3 mt-2 flex items-center gap-1.5 rounded-md bg-warn/10 px-2 py-1 text-2xs text-warn" role="alert">
+            <TriangleAlert size={12} strokeWidth={1.75} className="shrink-0" aria-hidden />
+            当前模型({resolved.option?.model})未声明图片能力,发送会被拒绝:换用支持图片的模型或移除图片
+          </div>
+        )}
 
         {refs.length > 0 && (
           <div className="flex flex-wrap gap-1.5 px-3 pt-2.5" aria-label="已引用的上下文">
@@ -698,6 +897,7 @@ export function Composer(props: {
             if (el.selectionStart === el.selectionEnd) refreshTrigger(el.value, el.selectionStart);
           }}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           onFocus={() => setFocused(true)}
           onBlur={() => {
             setFocused(false);
@@ -709,7 +909,7 @@ export function Composer(props: {
               ? "编辑消息,Enter 发送新版本"
               : props.busy
                 ? "正在生成… 可以继续输入下一条"
-                : "输入消息,@ 引用上下文,/ 使用命令"
+                : "输入消息,@ 引用上下文,/ 使用命令,可粘贴或拖入图片 / 文件"
           }
           className="block min-h-[44px] w-full resize-none bg-transparent px-3.5 pb-1 pt-3 leading-6 text-fg outline-none placeholder:text-subtle"
         />
@@ -725,6 +925,28 @@ export function Composer(props: {
           >
             <AtSign size={15} strokeWidth={1.75} />
           </IconButton>
+          {!editing && (
+            <>
+              <IconButton
+                label="添加附件(图片 / 文本文件)"
+                size="sm"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => fileRef.current?.click()}
+              >
+                <Paperclip size={15} strokeWidth={1.75} />
+              </IconButton>
+              <input
+                ref={fileRef}
+                type="file"
+                multiple
+                hidden
+                onChange={(e) => {
+                  addFiles(Array.from(e.target.files ?? []));
+                  e.target.value = "";
+                }}
+              />
+            </>
+          )}
           {!editing && (
             <IconButton
               label="命令"
@@ -748,7 +970,7 @@ export function Composer(props: {
           <span className="flex-1" />
           <TokenMeter
             baseline={baseline}
-            refs={refsEstimate}
+            refs={refsEstimate + (editing ? 0 : attEstimate)}
             draft={draftEstimate}
             contextLength={contextLength}
           />
@@ -861,6 +1083,7 @@ function toMarkdown(title: string, messages: UIMessage[]): string {
     for (const b of blocks) {
       if (b.kind === "text") out.push(b.text, "");
       else if (b.kind === "ref") out.push(`> @${b.label}`, "");
+      else if (b.kind === "attachment") out.push(`> 附件:${b.name}`, "");
       else if (b.kind === "thinking") {
         out.push(`> 思考（${((b.durationMs ?? 0) / 1000).toFixed(1)}s）`);
         out.push(...b.text.split("\n").map((l) => `> ${l}`), "");

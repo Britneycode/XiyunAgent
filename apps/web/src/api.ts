@@ -1,4 +1,4 @@
-import type { AgentRole, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, WorkDoc } from "@xiyun/shared";
+import type { AgentRole, AttachmentMeta, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, WorkDoc } from "@xiyun/shared";
 
 // /chat SSE 事件:typed 块事件 + 旧版 plain delta/error/done
 export type StreamEvent =
@@ -46,6 +46,24 @@ export const api = {
     // 有 limit 时 server 返回 { list, total, hasMore },否则返回数组
     return req<SessionMeta[] | { list: SessionMeta[]; total: number; hasMore: boolean }>(`/sessions${q}`);
   },
+  // 附件(B2):multipart 上传,不能带 JSON Content-Type
+  uploadAttachment: async (file: File): Promise<AttachmentMeta> => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const res = await fetch(`${base}/attachments`, { method: "POST", body: form });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(body?.error ?? `上传失败(${res.status})`);
+    }
+    return res.json() as Promise<AttachmentMeta>;
+  },
+  // 从 ChatGPT / Claude 导入(M1):body 为 conversations.json 原文
+  externalPreview: (raw: string) =>
+    req<ExternalPreview>("/admin/import/external/preview", { method: "POST", body: raw }),
+  externalImport: (raw: string) =>
+    req<{ ok: boolean; source: string; added: { sessions: number; messages: number }; skipped: { duplicate: number; empty: number } }>(
+      "/admin/import/external", { method: "POST", body: raw },
+    ),
   createSession: (body?: Partial<SessionMeta>) => req<SessionMeta>("/sessions", { method: "POST", body: JSON.stringify(body ?? {}) }),
   deleteSession: (id: string) => req(`/sessions/${id}`, { method: "DELETE" }),
   // F6:切换到包含 messageId 的分支(兄弟版本 / 搜索命中),返回切换后的消息列表
@@ -142,7 +160,7 @@ export const api = {
   events: (limit = 50) => req<Array<{ type: string; payload: string; created_at: string }>>(`/events?limit=${limit}`),
   exportData: () => req<Record<string, unknown>>("/admin/export"),
   importPreview: (pack: unknown) => req<Record<string, { total: number; duplicate?: number; added?: number }>>("/admin/import/preview", { method: "POST", body: JSON.stringify(pack) }),
-  importData: (pack: unknown) => req<{ ok: boolean; added: Record<string, number>; skipped: Record<string, number> }>("/admin/import", { method: "POST", body: JSON.stringify(pack) }),
+  importData: (pack: unknown) => req<{ ok: boolean; added: Record<string, number>; skipped: Record<string, number>; attachments?: { added: number; skipped: number; invalid: number } }>("/admin/import", { method: "POST", body: JSON.stringify(pack) }),
 };
 
 export async function health(): Promise<boolean> {
@@ -262,6 +280,18 @@ export function subscribeRun(runId: string, onEvent: (ev: StreamEvent) => void, 
   return withResume(() => fetch(`${base}/runs/${runId}/events`, { signal: signal ?? null }), onEvent, signal, runId);
 }
 
+export const attachmentUrl = (id: string) => `${base}/attachments/${id}`;
+
+export type ExternalPreview = {
+  source: "chatgpt" | "claude";
+  conversations: number;
+  messages: number;
+  duplicate: number;
+  empty: number;
+  from: string | null;
+  to: string | null;
+};
+
 export async function streamChat(
   sessionId: string,
   message: string,
@@ -276,6 +306,7 @@ export async function streamChat(
     providerId?: string;
     model?: string;
     editOf?: number; // 编辑该 user 消息:作为它的新版本发送(F6)
+    attachments?: string[]; // 已上传附件 id(B2);编辑时缺省表示沿用原附件
   },
 ): Promise<void> {
   const post = () =>
@@ -290,6 +321,7 @@ export async function streamChat(
         providerId: opts?.providerId,
         model: opts?.model,
         editOf: opts?.editOf,
+        attachments: opts?.attachments,
       }),
       signal: signal ?? null,
     });

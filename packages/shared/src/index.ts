@@ -89,7 +89,20 @@ export type ChatBlock =
     }
   | { id: string; kind: "text"; text: string }
   // 仅 user 消息;文件引用带工作区相对路径与引用时内容的指纹(F4:之后文件变更时提示模型内容可能过时)
-  | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string; path?: string; hash?: string };
+  | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string; path?: string; hash?: string }
+  // 仅 user 消息:上传的附件(B2)。type = image 时作为图片发给支持视觉的模型,text 时正文并入引用上下文
+  | { id: string; kind: "attachment"; attachmentId: string; name: string; mime: string; size: number; type: AttachmentKind };
+
+export type AttachmentKind = "image" | "text";
+
+// 附件元信息:id = 内容 sha256(同内容只存一份),文件在数据目录 attachments/ 下
+export interface AttachmentMeta {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  kind: AttachmentKind;
+}
 
 // 模型返回的真实 token 用量(OpenAI 兼容 usage 字段归一化后的形态)。
 // promptTokens 含系统提示、记忆、历史与引用上下文;completionTokens 含推理部分。
@@ -116,6 +129,8 @@ export interface ChatMessage {
   siblings?: number[];
   // F4 仅 assistant:生成时因超出上下文预算未逐字带入的早先消息数,summary = 是否以摘要代替
   trim?: { dropped: number; summary: boolean };
+  // 只在发给模型的请求里出现(不落库、不下发前端):user 消息附带的图片,base64
+  images?: Array<{ mime: string; data: string }>;
 }
 
 // Token 估算(前后端共用):CJK 字符约 1 token/字,其余字符约 4 字符/token。

@@ -94,6 +94,16 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
       WHERE head_id IS NULL;
     `);
   },
+  // v12:附件表 attachments(B2,建表见下方 CREATE IF NOT EXISTS);外部导入的会话记来源与原 id(M1),
+  // (external_source, external_id) 唯一,重复导入同一份 ChatGPT / Claude 导出时跳过
+  (db) => {
+    const sc = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!sc.includes("external_source")) db.exec("ALTER TABLE sessions ADD COLUMN external_source TEXT");
+    if (!sc.includes("external_id")) db.exec("ALTER TABLE sessions ADD COLUMN external_id TEXT");
+    db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_external ON sessions(external_source, external_id) WHERE external_id IS NOT NULL",
+    );
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -225,6 +235,14 @@ export function openDb(file = join(DATA_DIR, "app.db")): DatabaseSync {
       created_at TEXT NOT NULL
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(id UNINDEXED, content, tokenize='trigram');
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      mime TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
   for (let v = version; v < SCHEMA_VERSION; v++) MIGRATIONS[v](db);
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);

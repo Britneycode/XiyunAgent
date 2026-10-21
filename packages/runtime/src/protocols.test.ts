@@ -246,3 +246,49 @@ describe("模型列表(modelsOf / withModel)", () => {
     expect(withModel(c, null).model).toBe("big");
   });
 });
+
+describe("图片输入(B2)", () => {
+  const img = { mime: "image/png", data: "iVBORw0KGgo=" };
+  const msgs = [
+    { role: "system" as const, content: "sys" },
+    { role: "user" as const, content: "看图", images: [img] },
+    { role: "assistant" as const, content: "好的" },
+    { role: "user" as const, content: "", images: [img] },
+  ];
+  const drain = async (config: ProviderConfig) => {
+    const p = createProvider(config);
+    for await (const _ of p.streamEvents!(msgs)) void _;
+  };
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("OpenAI:content 数组,图片为 data URL;无文字时只发图片", async () => {
+    const calls = mockFetch(() => sse([data({ choices: [{ delta: { content: "x" } }] }), "data: [DONE]\n\n"]));
+    await drain({ id: "o", name: "o", baseUrl: "http://x/v1", apiKey: "k", model: "m" });
+    const m = body(calls[0]!).messages as Array<{ role: string; content: unknown }>;
+    expect(m[1]!.content).toEqual([
+      { type: "text", text: "看图" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+    ]);
+    expect(m[2]!.content).toBe("好的");
+    expect(m[3]!.content).toEqual([{ type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } }]);
+  });
+
+  it("Anthropic:base64 图片块在文字前;只有图片的轮次不丢", async () => {
+    const calls = mockFetch(() => sse([evt("message_stop", {})]));
+    await drain({ id: "a", name: "a", protocol: "anthropic", baseUrl: "http://x", apiKey: "k", model: "m" });
+    const m = body(calls[0]!).messages as Array<{ role: string; content: unknown }>;
+    expect(m[0]!.content).toEqual([
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } },
+      { type: "text", text: "看图" },
+    ]);
+    expect(m[2]!.content).toEqual([{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } }]);
+  });
+
+  it("Gemini:inlineData", async () => {
+    const calls = mockFetch(() => sse([data({ candidates: [{ content: { parts: [{ text: "x" }] } }] })]));
+    await drain({ id: "g", name: "g", protocol: "gemini", baseUrl: "http://x", apiKey: "k", model: "m" });
+    const c = body(calls[0]!).contents as Array<{ role: string; parts: unknown[] }>;
+    expect(c[0]!.parts).toEqual([{ text: "看图" }, { inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }]);
+    expect(c[2]!.parts).toEqual([{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }]);
+  });
+});

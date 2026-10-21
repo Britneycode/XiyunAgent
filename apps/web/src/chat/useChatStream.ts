@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChatBlock, ChatMessage, SessionMeta } from "@xiyun/shared";
+import type { AttachmentMeta, ChatBlock, ChatMessage, SessionMeta } from "@xiyun/shared";
 import { api, streamChat, subscribeRun, type RefPayload, type StreamEvent } from "../api.ts";
 
 export interface UIMessage extends ChatMessage {
@@ -271,21 +271,33 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
         providerId?: string;
         model?: string;
         editOf?: number; // 编辑该 user 消息:它之后的内容从界面移走(服务端作为旧版本保留)
+        attachments?: AttachmentMeta[]; // 已上传的附件(B2);编辑时缺省沿用原消息的附件
       },
     ) => {
-      if (!text || busy) return;
+      if (busy) return;
+      // 重新生成沿用库里的原话,可以为空(只发了附件的消息);新发送需要文字或附件
+      if (!o?.regenerate && !text && !o?.attachments?.length) return;
       if (!o?.regenerate) {
         // 引用即时显示为气泡上方的标签,不必等刷新
         const refBlocks: ChatBlock[] | undefined = o?.refs?.length
           ? o.refs.map((r, i) => ({ id: `ref${i + 1}`, kind: "ref", refType: r.refType, label: r.label, excerpt: r.excerpt }))
           : undefined;
+        const attBlocks: ChatBlock[] | undefined = o?.attachments?.length
+          ? o.attachments.map((a, i) => ({
+              id: `att${i + 1}`, kind: "attachment", attachmentId: a.id, name: a.name, mime: a.mime, size: a.size, type: a.kind,
+            }))
+          : undefined;
         setMessages((ms) => {
           const idx = o?.editOf != null ? ms.findIndex((m) => m.id === o.editOf) : -1;
-          // 编辑时没带新引用:沿用原消息的引用(与服务端一致)
-          const blocks = refBlocks ?? (idx >= 0 ? ms[idx]!.blocks?.filter((b) => b.kind === "ref") : undefined);
+          // 编辑时没带新引用 / 附件:沿用原消息的(与服务端一致)
+          const orig = idx >= 0 ? (ms[idx]!.blocks ?? []) : [];
+          const blocks = [
+            ...(refBlocks ?? orig.filter((b) => b.kind === "ref")),
+            ...(attBlocks ?? orig.filter((b) => b.kind === "attachment")),
+          ];
           return [
             ...(idx >= 0 ? ms.slice(0, idx) : ms),
-            { role: "user", content: text, blocks: blocks?.length ? blocks : undefined, localKey: nextKey() },
+            { role: "user", content: text, blocks: blocks.length ? blocks : undefined, localKey: nextKey() },
             { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() },
           ];
         });
@@ -303,6 +315,7 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
           providerId: o?.providerId,
           model: o?.model,
           editOf: o?.editOf,
+          attachments: o?.attachments?.map((a) => a.id),
         }),
       );
     },

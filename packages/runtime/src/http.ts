@@ -269,16 +269,24 @@ export function textOnly(
   };
 }
 
-// 非 OpenAI 协议的消息整理:system 合并为一段;其余按 user / assistant 交替(相邻同角色合并),
+// 非 OpenAI 协议的消息整理:system 合并为一段;其余按 user / assistant 交替(相邻同角色合并,图片一并合并),
 // 首条必须是 user;空内容去掉(anthropic / gemini 都拒绝空消息)
-export function splitSystem(messages: ChatMessage[]): { system: string; turns: Array<{ role: "user" | "assistant"; content: string }> } {
+export interface Turn {
+  role: "user" | "assistant";
+  content: string;
+  images?: Array<{ mime: string; data: string }>;
+}
+export function splitSystem(messages: ChatMessage[]): { system: string; turns: Turn[] } {
   const system = messages.filter((m) => m.role === "system" && m.content.trim()).map((m) => m.content).join("\n\n");
-  const turns: Array<{ role: "user" | "assistant"; content: string }> = [];
+  const turns: Turn[] = [];
   for (const m of messages) {
-    if (m.role === "system" || !m.content.trim()) continue;
+    const images = m.role === "user" && m.images?.length ? m.images : undefined;
+    if (m.role === "system" || (!m.content.trim() && !images)) continue;
     const last = turns[turns.length - 1];
-    if (last && last.role === m.role) last.content += `\n\n${m.content}`;
-    else turns.push({ role: m.role, content: m.content });
+    if (last && last.role === m.role) {
+      if (m.content.trim()) last.content = last.content ? `${last.content}\n\n${m.content}` : m.content;
+      if (images) last.images = [...(last.images ?? []), ...images];
+    } else turns.push({ role: m.role, content: m.content, ...(images ? { images } : {}) });
   }
   if (turns[0]?.role === "assistant") turns.unshift({ role: "user", content: "(continue)" });
   return { system, turns };

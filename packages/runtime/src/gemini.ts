@@ -48,7 +48,13 @@ export function createGeminiProvider(config: ProviderConfig, popts: ProviderOpti
     const { system, turns } = splitSystem(messages);
     const p = config.params ?? {};
     const body: Record<string, unknown> = {
-      contents: turns.map((t) => ({ role: t.role === "assistant" ? "model" : "user", parts: [{ text: t.content }] })),
+      contents: turns.map((t) => ({
+        role: t.role === "assistant" ? "model" : "user",
+        parts: [
+          ...(t.content.trim() || !t.images?.length ? [{ text: t.content }] : []),
+          ...(t.images ?? []).map((i) => ({ inlineData: { mimeType: i.mime, data: i.data } })),
+        ],
+      })),
     };
     if (system) body.systemInstruction = { parts: [{ text: system }] };
     const gen: Record<string, unknown> = {};

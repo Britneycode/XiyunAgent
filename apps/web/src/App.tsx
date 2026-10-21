@@ -330,7 +330,7 @@ export function App() {
 
   const mainContent =
     page === "settings" ? (
-      legacy(<SettingsPage />)
+      legacy(<SettingsPage onDataChanged={() => void refresh()} />)
     ) : page === "memory" ? (
       legacy(<MemoryPage onChanged={refreshCandidates} />)
     ) : !online ? (
