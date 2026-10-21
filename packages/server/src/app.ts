@@ -4,7 +4,7 @@ import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { AgentRole, ChatBlock, ChatMessage, ProviderConfig, SessionMeta, TaskStatus } from "@xiyun/shared";
+import type { AgentRole, ChatBlock, ChatMessage, ProviderConfig, SessionMeta, TaskStatus, TokenUsage } from "@xiyun/shared";
 import type { ChatProvider, ProviderEvent, ToolDef } from "../../runtime/src/index.ts";
 import { MemoryStore } from "./memory.ts";
 import { ProviderStore } from "./providers.ts";
@@ -164,11 +164,24 @@ export function createApp(
     }
   };
 
+  // usage 同理:非对象或缺字段时视为未返回
+  const parseUsage = (raw: string | null): TokenUsage | undefined => {
+    if (!raw) return undefined;
+    try {
+      const v = JSON.parse(raw) as Partial<TokenUsage> | null;
+      return v && typeof v.promptTokens === "number" && typeof v.completionTokens === "number"
+        ? (v as TokenUsage)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   app.get("/sessions/:id/messages", (c) => {
     const rows = db
-      .prepare("SELECT id, role, content, blocks, aborted FROM messages WHERE session_id = ? ORDER BY id")
+      .prepare("SELECT id, role, content, blocks, aborted, usage FROM messages WHERE session_id = ? ORDER BY id")
       .all(c.req.param("id")) as unknown as Array<{
-      id: number; role: string; content: string; blocks: string | null; aborted: number;
+      id: number; role: string; content: string; blocks: string | null; aborted: number; usage: string | null;
     }>;
     return c.json(
       rows.map((r) => ({
@@ -177,6 +190,7 @@ export function createApp(
         content: r.content,
         blocks: parseBlocks(r.blocks),
         aborted: r.aborted ? true : undefined,
+        usage: parseUsage(r.usage),
       })),
     );
   });
@@ -202,9 +216,9 @@ export function createApp(
     if (!src) return c.json({ error: "session not found" }, 404);
     const maxId = typeof body.messageId === "number" ? body.messageId : Number.MAX_SAFE_INTEGER;
     const msgs = db
-      .prepare("SELECT role, content, blocks, aborted, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
+      .prepare("SELECT role, content, blocks, aborted, usage, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
       .all(sessionId, maxId) as unknown as Array<{
-      role: string; content: string; blocks: string | null; aborted: number; created_at: string;
+      role: string; content: string; blocks: string | null; aborted: number; usage: string | null; created_at: string;
     }>;
     const nid = randomUUID();
     const title = (body.title?.trim() || `${src.title}(分支)`).slice(0, 80);
@@ -213,9 +227,9 @@ export function createApp(
       nid, title, src.mode, src.workspace, ts,
     );
     const ins = db.prepare(
-      "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     );
-    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.created_at);
+    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.created_at);
     return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts });
   });
 
@@ -357,6 +371,8 @@ export function createApp(
       let open: { kind: "text" | "thinking" | "tool"; id: string; text: string; t0: number; idx: number } | null = null;
       let seq = 0;
       let finishReason: string | null = null;
+      // 模型返回的真实用量;中断时通常拿不到(usage 在最后一个分片)
+      let usage: TokenUsage | null = null;
 
       const closeOpen = () => {
         const b = open;
@@ -484,6 +500,9 @@ export function createApp(
             const b = toolBlocks.get(ev.id);
             if (b) b.rawArgs = ev.args;
             finishTool(ev.id);
+          } else if (ev.type === "usage") {
+            usage = ev.usage;
+            void send({ type: "usage", usage });
           } else if (ev.type === "finish") {
             finishReason = ev.reason;
           }
@@ -556,13 +575,14 @@ export function createApp(
           }
           const r = db
             .prepare(
-              "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, 'assistant', ?, ?, ?, ?)",
+              "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?)",
             )
             .run(
               sessionId,
               input.content,
               input.blocks.length ? JSON.stringify(input.blocks) : null,
               input.aborted ? 1 : 0,
+              usage ? JSON.stringify(usage) : null,
               now(),
             );
           db.exec("COMMIT");
@@ -922,7 +942,7 @@ export function createApp(
 
   app.get("/admin/export", (c) => {
     const sessions = db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>;
-    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, created_at FROM messages ORDER BY id").all();
+    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, usage, created_at FROM messages ORDER BY id").all();
     const docs = db.prepare("SELECT * FROM docs ORDER BY created_at").all();
     const todos = db.prepare("SELECT * FROM todos ORDER BY created_at").all();
     const facts = db.prepare("SELECT * FROM facts WHERE deleted_at IS NULL ORDER BY valid_from").all();
@@ -980,7 +1000,7 @@ export function createApp(
         add.sessions++;
       }
       const insMsg = db.prepare(
-        "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       );
       // 消息无稳定 id,重复导入同一导出包时按 (session_id, role, content, created_at) 去重,避免二次落库
       const hasMsg = db.prepare("SELECT 1 FROM messages WHERE session_id = ? AND role = ? AND content = ? AND created_at = ?");
@@ -998,7 +1018,9 @@ export function createApp(
             blocks = null;
           }
         }
-        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, created);
+        // usage 同样只接受可解析的 JSON;旧导出包没有该字段
+        const usageJson = typeof r.usage === "string" && parseUsage(r.usage) ? r.usage : null;
+        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, created);
         add.messages++;
       }
       const simple = (table: string, cols: string[], rows: unknown[] | undefined, key: keyof typeof skip) => {

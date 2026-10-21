@@ -85,6 +85,38 @@ describe("/chat 块协议", () => {
     expect(row.aborted).toBe(0);
   });
 
+  it("usage 事件经 SSE 下发并随 assistant 落库,GET messages 返回 usage", async () => {
+    const usage = { promptTokens: 1200, completionTokens: 80, totalTokens: 1280, cachedTokens: 1024 };
+    const { app, db } = setup(fakeProvider([
+      { type: "text", delta: "答" },
+      { type: "usage", usage },
+      { type: "finish", reason: "stop" },
+    ]));
+    const s = await session(app);
+    const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "hi" })).text());
+    const ev = evs.find((e) => e.type === "usage");
+    expect(ev?.usage).toEqual(usage);
+    // usage 在 done 之前到达,客户端收尾时已能显示
+    expect(evs.indexOf(ev!)).toBeLessThan(evs.findIndex((e) => e.done === true));
+
+    const row = db.prepare("SELECT usage FROM messages WHERE role = 'assistant'").get() as { usage: string };
+    expect(JSON.parse(row.usage)).toEqual(usage);
+    const list = (await (await app.request(`/sessions/${s.id}/messages`)).json()) as Array<{
+      role: string; usage?: unknown;
+    }>;
+    expect(list.find((m) => m.role === "assistant")?.usage).toEqual(usage);
+    expect(list.find((m) => m.role === "user")?.usage).toBeUndefined();
+  });
+
+  it("Provider 未返回 usage 时不发 usage 事件,落库为 NULL", async () => {
+    const { app, db } = setup(fakeProvider([{ type: "text", delta: "答" }, { type: "finish", reason: "stop" }]));
+    const s = await session(app);
+    const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "hi" })).text());
+    expect(evs.some((e) => e.type === "usage")).toBe(false);
+    const row = db.prepare("SELECT usage FROM messages WHERE role = 'assistant'").get() as { usage: string | null };
+    expect(row.usage).toBeNull();
+  });
+
   it("只有 streamChat 的 Provider 回退为纯文本", async () => {
     const { app } = setup(fakeProvider([{ type: "text", delta: "回退" }], { onlyText: true }));
     const s = await session(app);

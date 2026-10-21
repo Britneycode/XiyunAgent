@@ -1,10 +1,11 @@
-import type { AgentRole, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, WorkDoc } from "@xiyun/shared";
+import type { AgentRole, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, WorkDoc } from "@xiyun/shared";
 
 // /chat SSE 事件:typed 块事件 + 旧版 plain delta/error/done
 export type StreamEvent =
   | { type: "block"; id: string; block: { kind: "text" | "thinking" } | { kind: "tool"; name: string; status: string } }
   | { type: "block_delta"; id: string; delta: string }
   | { type: "block_end"; id: string; block: ChatBlock }
+  | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
   | { delta: string; id?: string }
   | { error: string }
   | { done: true; messageId?: number; userMessageId?: number };

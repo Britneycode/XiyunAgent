@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createOpenAIProvider, type ProviderEvent } from "./index.ts";
+import { createOpenAIProvider, normalizeUsage, type ProviderEvent } from "./index.ts";
 
 const config = {
   id: "p1", name: "test", baseUrl: "https://example.test/v1", apiKey: "k", model: "m",
@@ -125,5 +125,105 @@ describe("createOpenAIProvider.streamChat", () => {
     const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
     expect(body.tools).toBeUndefined();
     expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+  });
+});
+
+describe("token 用量(usage)", () => {
+  const bodyOf = (m: ReturnType<typeof vi.fn>, i: number) =>
+    JSON.parse((m.mock.calls[i] as unknown as [string, RequestInit])[1].body as string) as Record<string, unknown>;
+
+  it("请求携带 stream_options.include_usage,末尾分片的 usage 在 finish 前产出一次", async () => {
+    const fetchMock = vi.fn(async () => sse([
+      line({ choices: [{ delta: { content: "好" } }], usage: null }),
+      line({ choices: [{ delta: {}, finish_reason: "stop" }], usage: null }),
+      line({
+        choices: [],
+        usage: {
+          prompt_tokens: 120, completion_tokens: 30, total_tokens: 150,
+          prompt_tokens_details: { cached_tokens: 64 },
+          completion_tokens_details: { reasoning_tokens: 12 },
+        },
+      }),
+      "data: [DONE]\n\n",
+    ]));
+    vi.stubGlobal("fetch", fetchMock);
+    const p = createOpenAIProvider(config);
+    const out: ProviderEvent[] = [];
+    for await (const ev of p.streamEvents!([{ role: "user", content: "hi" }])) out.push(ev);
+    expect(bodyOf(fetchMock, 0).stream_options).toEqual({ include_usage: true });
+    expect(out).toEqual([
+      { type: "text", delta: "好" },
+      {
+        type: "usage",
+        usage: { promptTokens: 120, completionTokens: 30, totalTokens: 150, cachedTokens: 64, reasoningTokens: 12 },
+      },
+      { type: "finish", reason: "stop" },
+    ]);
+  });
+
+  it("没有 usage 的流不产出 usage 事件", async () => {
+    const out = await collect([line({ choices: [{ delta: { content: "a" } }] }), "data: [DONE]\n\n"]);
+    expect(out.some((e) => e.type === "usage")).toBe(false);
+  });
+
+  it("兼容 choice 内的 usage(Moonshot)与 DeepSeek 缓存字段", async () => {
+    const out = await collect([
+      line({
+        choices: [{
+          delta: {}, finish_reason: "stop",
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, prompt_cache_hit_tokens: 8 },
+        }],
+      }),
+      "data: [DONE]\n\n",
+    ]);
+    expect(out).toContainEqual({
+      type: "usage", usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15, cachedTokens: 8 },
+    });
+  });
+
+  it("网关拒绝 stream_options(400)时去掉重试,之后的请求(含新实例)不再携带", async () => {
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const b = JSON.parse(init.body as string) as Record<string, unknown>;
+      if (b.stream_options) return new Response("unknown field stream_options", { status: 400 });
+      return sse([line({ choices: [{ delta: { content: "ok" } }] }), "data: [DONE]\n\n"]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    // Server 每次请求都会新建 Provider 实例,缓存需跨实例生效
+    const strict = { ...config, baseUrl: "https://strict.test/v1/" };
+    const run = async () => {
+      const out: string[] = [];
+      for await (const d of createOpenAIProvider(strict).streamChat([{ role: "user", content: "hi" }])) out.push(d);
+      return out.join("");
+    };
+    expect(await run()).toBe("ok");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(bodyOf(fetchMock, 1).stream_options).toBeUndefined();
+    expect(await run()).toBe("ok");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(bodyOf(fetchMock, 2).stream_options).toBeUndefined();
+  });
+
+  it("重试后仍失败时抛出错误,且不误判为不支持 usage", async () => {
+    const fetchMock = vi.fn(async () => new Response("bad", { status: 400 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const p = createOpenAIProvider({ ...config, baseUrl: "https://down.test/v1" });
+    const drain = async () => {
+      for await (const _ of p.streamChat([{ role: "user", content: "hi" }])) void _;
+    };
+    await expect(drain()).rejects.toThrow("HTTP 400");
+    await expect(drain()).rejects.toThrow("HTTP 400");
+    // 两轮都会先带 stream_options 再重试
+    expect(bodyOf(fetchMock, 2).stream_options).toEqual({ include_usage: true });
+  });
+
+  it("normalizeUsage:缺字段补齐、非法值忽略", () => {
+    expect(normalizeUsage(null)).toBeNull();
+    expect(normalizeUsage({ total_tokens: 3 })).toBeNull();
+    expect(normalizeUsage({ input_tokens: 7, output_tokens: 2 })).toEqual({
+      promptTokens: 7, completionTokens: 2, totalTokens: 9,
+    });
+    expect(normalizeUsage({ prompt_tokens: 5, completion_tokens: -1 })).toEqual({
+      promptTokens: 5, completionTokens: 0, totalTokens: 5,
+    });
   });
 });

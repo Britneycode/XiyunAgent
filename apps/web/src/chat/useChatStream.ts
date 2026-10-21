@@ -60,8 +60,11 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
       if (!last || last.role !== "assistant") return ms;
       let blocks = last.blocks ? [...last.blocks] : [];
       let content = last.content;
+      let usage = last.usage;
       for (const ev of queue) {
-        if ("delta" in ev && typeof ev.delta === "string") {
+        if ("type" in ev && ev.type === "usage") {
+          usage = ev.usage;
+        } else if ("delta" in ev && typeof ev.delta === "string") {
           content += ev.delta;
           if (!blocks.length) blocks = [];
           else {
@@ -72,7 +75,7 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
           blocks = applyEvent(blocks, ev);
         }
       }
-      last = { ...last, content, blocks: blocks.length ? blocks : undefined };
+      last = { ...last, content, blocks: blocks.length ? blocks : undefined, usage };
       copy[copy.length - 1] = last;
       return copy;
     });

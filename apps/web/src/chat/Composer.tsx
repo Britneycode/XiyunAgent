@@ -30,7 +30,7 @@ import { Highlight, MenuGroupLabel, MenuItem, MenuList, PopoverSurface, useActiv
 import { Button, IconButton, Kbd, StatusDot } from "../ui/primitives.tsx";
 import { ModelPicker, type ProviderOption } from "./ModelPicker.tsx";
 import { TokenMeter } from "./TokenMeter.tsx";
-import { estimateTokens, historyTokens } from "./tokens.ts";
+import { contextBaseline, estimateTokens } from "./tokens.ts";
 import type { UIMessage } from "./useChatStream.ts";
 
 type RefItem = {
@@ -482,8 +482,8 @@ export function Composer(props: {
     }
   };
 
-  // ---- Token 估算 ----
-  const historyEstimate = useMemo(() => historyTokens(props.messages), [props.messages]);
+  // ---- Token 计数:实测基线 + 估算增量 ----
+  const baseline = useMemo(() => contextBaseline(props.messages), [props.messages]);
   const refsEstimate = useMemo(() => refs.reduce((n, r) => n + estimateTokens(r.excerpt), 0), [refs]);
   const draftEstimate = estimateTokens(value);
   const contextLength = providers.find((p) => p.id === activeId)?.contextLength;
@@ -722,7 +722,7 @@ export function Composer(props: {
           />
           <span className="flex-1" />
           <TokenMeter
-            history={historyEstimate}
+            baseline={baseline}
             refs={refsEstimate}
             draft={draftEstimate}
             contextLength={contextLength}

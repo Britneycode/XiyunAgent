@@ -28,6 +28,11 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
     if (!cols.includes("blocks")) db.exec("ALTER TABLE messages ADD COLUMN blocks TEXT");
     if (!cols.includes("aborted")) db.exec("ALTER TABLE messages ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0");
   },
+  // v6:messages.usage(模型返回的 token 用量 JSON,仅 assistant;未返回时为 NULL)
+  (db) => {
+    const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cols.includes("usage")) db.exec("ALTER TABLE messages ADD COLUMN usage TEXT");
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -67,6 +72,7 @@ export function openDb(file = join(DATA_DIR, "app.db")): DatabaseSync {
       content TEXT NOT NULL,
       blocks TEXT,
       aborted INTEGER NOT NULL DEFAULT 0,
+      usage TEXT,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS facts (

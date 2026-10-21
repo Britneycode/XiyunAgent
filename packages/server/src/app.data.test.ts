@@ -168,3 +168,39 @@ it("分支、导出、导入保留 blocks 与 aborted", async () => {
   expect(imported).toHaveLength(1);
   expect(JSON.parse(imported[0].blocks)).toEqual(JSON.parse(blocks));
 });
+
+it("分支、导出、导入保留 usage;坏 usage 读为缺省、导入时丢弃", async () => {
+  const { app, db } = setup();
+  const s = (await (await post(app, "/sessions", {})).json()) as { id: string };
+  const usage = JSON.stringify({ promptTokens: 10, completionTokens: 4, totalTokens: 14 });
+  db.prepare("INSERT INTO messages (session_id, role, content, usage, created_at) VALUES (?, 'assistant', 'u1', ?, 't1')")
+    .run(s.id, usage);
+  db.prepare("INSERT INTO messages (session_id, role, content, usage, created_at) VALUES (?, 'assistant', 'u2', '{bad', 't2')")
+    .run(s.id);
+
+  const list = (await (await app.request(`/sessions/${s.id}/messages`)).json()) as Array<{ content: string; usage?: unknown }>;
+  expect(list.find((m) => m.content === "u1")?.usage).toEqual(JSON.parse(usage));
+  expect(list.find((m) => m.content === "u2")?.usage).toBeUndefined();
+
+  const b = (await (await app.request(`/sessions/${s.id}/branch`, {
+    method: "POST", headers: json, body: JSON.stringify({}),
+  })).json()) as { id: string };
+  const copied = db.prepare("SELECT usage FROM messages WHERE session_id = ? AND content = 'u1'").get(b.id) as { usage: string };
+  expect(copied.usage).toBe(usage);
+
+  const exp = (await (await app.request("/admin/export")).json()) as {
+    data: Record<string, unknown[]> & { messages: Array<{ session_id: string; content: string; usage?: string | null }> };
+  };
+  expect(exp.data.messages.find((m) => m.content === "u1")?.usage).toBe(usage);
+
+  const fresh = setup();
+  const res = await fresh.app.request("/admin/import", {
+    method: "POST", headers: json, body: JSON.stringify({
+      kind: "xiyun-export", version: 1,
+      data: { ...exp.data, messages: exp.data.messages.filter((m) => m.session_id === s.id) },
+    }),
+  });
+  expect(res.status).toBe(200);
+  const rows = fresh.db.prepare("SELECT content, usage FROM messages ORDER BY id").all() as Array<{ content: string; usage: string | null }>;
+  expect(rows).toEqual([{ content: "u1", usage }, { content: "u2", usage: null }]);
+});

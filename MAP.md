@@ -32,7 +32,7 @@ apps/web/src/SettingsPage.tsx  分类设置页(Provider 配置含能力标签 ca
 apps/web/src/theme.ts    主题系统(7 预设 + 自定义主题包导入导出 + token 微调,全部走 CSS 变量)
 apps/web/src/chat/   Chat 工作台组件(markdown.ts 安全渲染/行号/代码块;blocks.tsx 思考块/工具卡片/引用胶囊;useChatStream.ts SSE 块状态机 + rAF 合批;Composer.tsx @引用//命令/模型下拉;PreviewPanel.tsx 右侧预览:工具/终端/产物/Diff)
 apps/web/public/vendor/  本地前端库(katex、highlight.js,来自 YiyunAgent 旧项目),Chat 渲染用
-packages/server/     Hono Agent Server:会话、Chat SSE(结构化块协议:text/thinking/tool 块 + block_end 快照 + XIYUN_EXPOSE_TOOLS 工具定义门控)、消息 blocks/aborted 落库、记忆(事实 + 候选)、提取流水线、子智能体任务、工具 API(/tools/git/diff 失败 400)、Work 文档/待办、Skill、审计、Provider 配置、规则加载
+packages/server/     Hono Agent Server:会话、Chat SSE(结构化块协议:text/thinking/tool 块 + block_end 快照 + XIYUN_EXPOSE_TOOLS 工具定义门控)、usage 事件(模型实测 token 用量)、消息 blocks/aborted/usage 落库、记忆(事实 + 候选)、提取流水线、子智能体任务、工具 API(/tools/git/diff 失败 400)、Work 文档/待办、Skill、审计、Provider 配置、规则加载
 packages/server/src/extract.ts  异步记忆提取(memory 角色模型,低置信度只进候选,不阻塞 SSE)
 packages/server/src/memchat.ts  自然语言记忆指令(意图词门槛 + JSON 解析,记住→写事实,忘掉→软删除)
 packages/server/src/docs.ts     阶段 5 WorkStore(文档导入/网页抓取/HTML 抽取/检索/待办)

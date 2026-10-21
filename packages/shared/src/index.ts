@@ -40,6 +40,16 @@ export type ChatBlock =
   | { id: string; kind: "text"; text: string }
   | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string }; // 仅 user 消息
 
+// 模型返回的真实 token 用量(OpenAI 兼容 usage 字段归一化后的形态)。
+// promptTokens 含系统提示、记忆、历史与引用上下文;completionTokens 含推理部分。
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedTokens?: number; // 输入中命中缓存的部分
+  reasoningTokens?: number; // 输出中的推理部分(不会随历史带入下一轮)
+}
+
 export interface ChatMessage {
   // id 仅持久化消息有(数据库自增主键);流式中的临时气泡没有
   id?: number;
@@ -47,6 +57,7 @@ export interface ChatMessage {
   content: string;
   blocks?: ChatBlock[];
   aborted?: boolean;
+  usage?: TokenUsage; // 仅 assistant;模型未返回 usage 时缺省
 }
 
 export interface Fact {

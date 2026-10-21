@@ -1,4 +1,4 @@
-import type { ChatMessage, ModelRole, ProviderConfig } from "@xiyun/shared";
+import type { ChatMessage, ModelRole, ProviderConfig, TokenUsage } from "@xiyun/shared";
 
 export interface ToolDef {
   name: string; // 必须匹配 ^[a-zA-Z0-9_-]{1,64}$
@@ -17,7 +17,36 @@ export type ProviderEvent =
   | { type: "tool_start"; id: string; index: number; name: string }
   | { type: "tool_args"; id: string; delta: string }
   | { type: "tool_end"; id: string; args: string }
+  | { type: "usage"; usage: TokenUsage } // 至多一次,紧挨 finish 之前
   | { type: "finish"; reason: string | null };
+
+const num = (v: unknown): number | undefined =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined;
+
+// 归一化各家 OpenAI 兼容网关的 usage:
+// - OpenAI / 通义 / 智谱:prompt_tokens_details.cached_tokens、completion_tokens_details.reasoning_tokens
+// - DeepSeek:prompt_cache_hit_tokens
+// - 少数网关:input_tokens / output_tokens
+// 输入、输出都拿不到时返回 null(例如 include_usage 开启后中间分片的 usage:null)。
+export function normalizeUsage(raw: unknown): TokenUsage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const u = raw as Record<string, unknown>;
+  const pd = (u.prompt_tokens_details ?? u.input_tokens_details) as Record<string, unknown> | null | undefined;
+  const cd = (u.completion_tokens_details ?? u.output_tokens_details) as Record<string, unknown> | null | undefined;
+  const prompt = num(u.prompt_tokens) ?? num(u.input_tokens);
+  const completion = num(u.completion_tokens) ?? num(u.output_tokens);
+  if (prompt === undefined && completion === undefined) return null;
+  const usage: TokenUsage = {
+    promptTokens: prompt ?? 0,
+    completionTokens: completion ?? 0,
+    totalTokens: num(u.total_tokens) ?? (prompt ?? 0) + (completion ?? 0),
+  };
+  const cached = num(pd?.cached_tokens) ?? num(u.prompt_cache_hit_tokens);
+  if (cached) usage.cachedTokens = cached;
+  const reasoning = num(cd?.reasoning_tokens);
+  if (reasoning) usage.reasoningTokens = reasoning;
+  return usage;
+}
 
 // ChatProvider 是模型接入的统一接口。
 // 决策 D-001 选定 Pi Runtime,但接入方式未定(见 NOW.md 待确认项);
@@ -31,7 +60,13 @@ export interface ChatProvider {
 
 type CallState = { id: string; name: string; args: string; started: boolean; ended: boolean };
 
+// 拒绝 stream_options(HTTP 400/422)的网关,按 baseUrl + model 记住,进程内后续请求不再携带。
+// Provider 实例按请求创建,所以缓存放在模块级。
+const usageUnsupported = new Set<string>();
+
 export function createOpenAIProvider(config: ProviderConfig): ChatProvider {
+  const usageKey = `${config.baseUrl.replace(/\/+$/, "")}|${config.model}`;
+
   const streamEvents = async function* (
     messages: ChatMessage[],
     opts?: ChatStreamOptions,
@@ -48,12 +83,22 @@ export function createOpenAIProvider(config: ProviderConfig): ChatProvider {
         function: { name: t.name, description: t.description, parameters: t.parameters },
       }));
     }
-    const res = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` },
-      body: JSON.stringify(body),
-      signal: opts?.signal ?? null,
-    });
+    const request = (payload: Record<string, unknown>) =>
+      fetch(`${config.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` },
+        body: JSON.stringify(payload),
+        signal: opts?.signal ?? null,
+      });
+    // 请求末尾分片附带 usage(OpenAI 兼容:choices 为空、usage 为整轮用量)
+    const askUsage = !usageUnsupported.has(usageKey);
+    let res = await request(askUsage ? { ...body, stream_options: { include_usage: true } } : body);
+    if (askUsage && (res.status === 400 || res.status === 422)) {
+      // 严格网关不认识 stream_options:去掉后重试一次;重试成功才判定为不支持
+      await res.body?.cancel().catch(() => {});
+      res = await request(body);
+      if (res.ok) usageUnsupported.add(usageKey);
+    }
     if (!res.ok || !res.body) throw new Error(`Provider error: HTTP ${res.status}`);
 
     const reader = res.body.getReader();
@@ -62,6 +107,7 @@ export function createOpenAIProvider(config: ProviderConfig): ChatProvider {
     let buf = "";
     let stop = false;
     let finishReason: string | null = null;
+    let usage: TokenUsage | null = null;
 
     const parseLine = function* (raw: string): Generator<ProviderEvent> {
       const t = raw.trim();
@@ -73,7 +119,9 @@ export function createOpenAIProvider(config: ProviderConfig): ChatProvider {
         return;
       }
       let obj: {
+        usage?: unknown;
         choices?: Array<{
+          usage?: unknown;
           delta?: {
             content?: unknown;
             reasoning_content?: unknown;
@@ -93,6 +141,9 @@ export function createOpenAIProvider(config: ProviderConfig): ChatProvider {
         return; // SSE 分片不完整,跳过
       }
       const choice = obj.choices?.[0];
+      // usage 可能在顶层(OpenAI / DeepSeek / 通义),也可能挂在 choice 上(Moonshot);以最后一次为准
+      const u = normalizeUsage(obj.usage ?? choice?.usage);
+      if (u) usage = u;
       if (!choice) return;
       const d = choice.delta ?? {};
       // 空串/null 忽略:reasoning 阶段常见 content:"",不能让 thinking 被切碎
@@ -159,6 +210,7 @@ export function createOpenAIProvider(config: ProviderConfig): ChatProvider {
         yield { type: "tool_end", id: c.id, args: c.args };
       }
     }
+    if (usage) yield { type: "usage", usage };
     yield { type: "finish", reason: finishReason };
   };
 

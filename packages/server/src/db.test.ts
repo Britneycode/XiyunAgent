@@ -85,7 +85,27 @@ describe("db 迁移与备份(阶段 7)", () => {
     const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(cols).toContain("blocks");
     expect(cols).toContain("aborted");
-    expect(Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)).toBe(5);
+    expect(Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)).toBe(SCHEMA_VERSION);
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("v5 老库升级到 v6 后 messages 具备 usage,旧行为 NULL", () => {
+    const dir = tmp();
+    const file = join(dir, "v5.db");
+    const old = new DatabaseSync(file);
+    old.exec(`
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'chat', workspace TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, blocks TEXT, aborted INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+      INSERT INTO messages (session_id, role, content, created_at) VALUES ('s', 'assistant', 'hi', 't');
+      PRAGMA user_version = 5;
+    `);
+    old.close();
+    const db = openDb(file);
+    const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toContain("usage");
+    expect((db.prepare("SELECT usage FROM messages").get() as { usage: string | null }).usage).toBeNull();
+    expect(Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)).toBe(SCHEMA_VERSION);
     db.close();
     rmSync(dir, { recursive: true, force: true });
   });

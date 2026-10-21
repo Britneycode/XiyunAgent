@@ -3,6 +3,7 @@ import type { SessionMeta } from "@xiyun/shared";
 import { api } from "./api.ts";
 import { MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
 import { Composer } from "./chat/Composer.tsx";
+import { UsageBadge } from "./chat/UsageBadge.tsx";
 import { useChatStream } from "./chat/useChatStream.ts";
 import { renderMarkdown as renderMarkdownSafe } from "./chat/markdown.ts";
 
@@ -94,20 +95,25 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
                 <button type="button" onClick={regenerate}>重试</button>
               </div>
             )}
-            {!busy && m.content && (
-              <div className="msg-actions">
-                <button
-                  title="复制"
-                  onClick={() => void navigator.clipboard.writeText(m.content)}
-                >⧉</button>
-                {m.role === "assistant" && i === messages.length - 1 && (
-                  <button title="重新生成" onClick={regenerate}>↻</button>
-                )}
-                {m.role === "user" && m.id != null && (
-                  <>
-                    <button title="编辑并重新生成" onClick={() => startEdit(m.id!, m.content)}>✎</button>
-                    {onBranch && <button title="分支到新会话" onClick={() => onBranch(m.id!)}>⑂</button>}
-                  </>
+            {((!busy && m.content) || (m.role === "assistant" && m.usage)) && (
+              <div className="msg-foot">
+                {m.role === "assistant" && m.usage && <UsageBadge usage={m.usage} />}
+                {!busy && m.content && (
+                  <div className="msg-actions">
+                    <button
+                      title="复制"
+                      onClick={() => void navigator.clipboard.writeText(m.content)}
+                    >⧉</button>
+                    {m.role === "assistant" && i === messages.length - 1 && (
+                      <button title="重新生成" onClick={regenerate}>↻</button>
+                    )}
+                    {m.role === "user" && m.id != null && (
+                      <>
+                        <button title="编辑并重新生成" onClick={() => startEdit(m.id!, m.content)}>✎</button>
+                        {onBranch && <button title="分支到新会话" onClick={() => onBranch(m.id!)}>⑂</button>}
+                      </>
+                    )}
+                  </div>
                 )}
               </div>
             )}
