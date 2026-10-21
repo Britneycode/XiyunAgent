@@ -81,3 +81,10 @@ Skill:目录或 ZIP 只有 `SKILL.md` 时,从 frontmatter 的 name / description
 会话:sessions v8 迁移加 `updated_at`,老会话回填为最后一条消息时间;user 消息与 assistant 回复落库时刷新,`GET /sessions` 按 `COALESCE(updated_at, created_at)` 倒序,返回 `updatedAt`,列表分组与时间按它显示;导入旧导出包时同样回填。重命名不算活动。标题仍为默认"新会话"时,首条消息落库即写入启发式标题(首行去 Markdown,30 字截断);消息较长(>20 字或多行)且配置了模型时,用记忆提取同一个模型异步起短标题(20s 超时),只在标题仍是该启发式标题时覆盖,流未关闭就推 `{type:"title"}`;回复结束后最多再等 1.5s,超时只落库,下次刷新列表可见。前端在 meta / title 事件时刷新会话列表。
 
 前端:未发送草稿(文本 + 引用)按会话存 localStorage `xiyun.drafts`,保留最近 30 个会话,随改随存,发送后删除;编辑旧消息的文本不进草稿。快捷键以 `apps/web/src/shortcuts.ts` 为清单(Ctrl+/ 面板据此渲染),新增 Ctrl+Shift+O / S / C / ;、Shift+Esc、空输入框 ↑;`useHotkey` 同时匹配 `e.code`,Shift 会改变符号键 `e.key` 的键用 code 名注册。取舍:网页版里 Ctrl+Shift+O 等可能被浏览器先占用,桌面版(Electron)不受影响。
+
+## D-020:生成与 HTTP 连接解耦(运行注册表),消息全文搜索(2026-10-21)
+
+生成:`/chat` 不再把生成绑定在这次 HTTP 请求上。服务端 `RunRegistry`(`runs.ts`)为每次生成建一个 Run,生成在后台执行,事件按序号缓存(上限 5 万条),SSE 响应只是订阅者:关窗、切会话、刷新页面、网络抖动都不会中止生成。停止只走 `POST /runs/:id/cancel`(会话被删除时也会取消)。同一会话同时只允许一个运行,再发返回 409。`GET /runs/:id/events?after=` 或 `Last-Event-ID` 从指定序号回放;前端断线后按 1s/2s/4s 自动续订最多 3 次,回到会话时用 `GET /sessions/:id/active-run` 查到运行中的生成并接着显示。运行结束后保留 5 分钟供补齐回放再回收。`GET /sessions` 返回 `running`,侧栏把该会话的时间换成转圈;有运行中的会话时前端每 2s 查一次 `GET /runs`,有会话结束就刷新列表。meta 事件带回 `runId`;取消时推 `{type:"cancelled"}`。取舍:运行只在内存里,服务重启时未完成的生成丢失(已落库的 user 消息保留);不做多端同时编辑同一会话的冲突处理。
+
+搜索:sessions v9 迁移建 `messages_fts`(FTS5,trigram 分词,中英文都按子串匹配),插入 / 更新 / 删除触发器同步,建表时回填已有消息。`GET /search?q=&mode=&limit=&archived=all` 只搜 user / assistant 消息,默认排除已归档会话;每个词都 ≥3 个字符时走 FTS(词加引号按短语、词间 AND,按 bm25 排序),有更短的词时退回 LIKE 子串匹配(按新到旧)。片段的命中词用 \u0001 / \u0002 包住,前端拆成 `<mark>`,不拼 HTML。命中带完整会话信息,所以不在已加载分页里的会话也能直接打开。侧栏搜索框输入 ≥2 个字符、停顿 250ms 后在会话标题结果下方列出"消息内容",点击打开对应会话并滚到该消息、短暂高亮。取舍:trigram 索引会让库文件变大(约为消息文本的 2~3 倍);两个字的中文词走 LIKE 全表扫描,本地单用户数据量下可接受。
+

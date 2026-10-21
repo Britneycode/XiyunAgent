@@ -9,6 +9,7 @@ import { Composer } from "./chat/Composer.tsx";
 import { StreamingMarkdown } from "./chat/StreamingMarkdown.tsx";
 import { formatTokens, messageTokens, MESSAGE_OVERHEAD } from "./chat/tokens.ts";
 import { UsageBadge } from "./chat/UsageBadge.tsx";
+import { useFocusRequest } from "./chat/focus.ts";
 import { useChatStream, type UIMessage } from "./chat/useChatStream.ts";
 import { useStickToBottom } from "./chat/useStickToBottom.ts";
 import { MODE_META, type Mode } from "./layout/types.ts";
@@ -69,7 +70,7 @@ const MessageItem = memo(function MessageItem({
     const refs = (m.blocks ?? []).filter((b): b is RefBlock => b.kind === "ref");
     const canEdit = m.id != null && !busy;
     return (
-      <div className="group/msg relative flex flex-col items-end gap-1.5">
+      <div data-mid={m.id ?? undefined} className="group/msg relative flex flex-col items-end gap-1.5">
         <RefChips refs={refs} />
         <div
           className={cn(
@@ -110,7 +111,7 @@ const MessageItem = memo(function MessageItem({
   const estimate = done && !m.usage && hasBody ? Math.max(0, messageTokens(m) - MESSAGE_OVERHEAD) : 0;
 
   return (
-    <div className="group/msg flex flex-col gap-2 font-reading">
+    <div data-mid={m.id ?? undefined} className="group/msg flex flex-col gap-2 font-reading">
       <MessageBody content={m.content} blocks={m.blocks} streaming={m.streaming} onPreview={preview} />
       {m.error && (
         <div role="alert" className="flex items-start gap-2.5 rounded-lg border border-err/25 bg-err/5 px-3 py-2.5 font-sans">
@@ -174,7 +175,24 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
   });
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
-  const { scrollRef, contentRef, atBottom, scrollToBottom } = useStickToBottom<HTMLDivElement, HTMLDivElement>();
+  const { scrollRef, contentRef, atBottom, scrollToBottom, release } = useStickToBottom<HTMLDivElement, HTMLDivElement>();
+
+  // M7:从搜索结果跳转。消息加载后定位到目标消息(视口上 1/3 处)并短暂高亮
+  const [focusReq, consumeFocus] = useFocusRequest(session.id);
+  useEffect(() => {
+    const scroller = scrollRef.current;
+    if (!focusReq || !scroller) return;
+    const el = contentRef.current?.querySelector<HTMLElement>(`[data-mid="${focusReq.messageId}"]`);
+    if (!el) return; // 消息还没加载,messages 变化后再试
+    release();
+    const top = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+    scroller.scrollTo({ top: Math.max(0, top - scroller.clientHeight / 3) });
+    el.classList.remove("msg-flash");
+    void el.offsetWidth; // 重新触发动画
+    el.classList.add("msg-flash");
+    setTimeout(() => el.classList.remove("msg-flash"), 2000);
+    consumeFocus();
+  }, [focusReq, messages, consumeFocus, release, scrollRef, contentRef]);
 
   // 开始生成(发送 / 重新生成 / 编辑重发)时回到底部并恢复贴底
   useEffect(() => {

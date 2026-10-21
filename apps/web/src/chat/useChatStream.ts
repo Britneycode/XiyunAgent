@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChatBlock, ChatMessage, SessionMeta } from "@xiyun/shared";
-import { api, streamChat, type RefPayload, type StreamEvent } from "../api.ts";
+import { api, streamChat, subscribeRun, type RefPayload, type StreamEvent } from "../api.ts";
 
 export interface UIMessage extends ChatMessage {
   streaming?: boolean;
@@ -79,6 +79,10 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   for (const ev of queue) {
     if ("type" in ev) {
       if (ev.type === "meta" && ev.userMessageId != null) userId = ev.userMessageId;
+      if (ev.type === "cancelled") {
+        if (ev.userMessageId != null) userId = ev.userMessageId;
+        if (ev.messageId != null) messageId = ev.messageId;
+      }
     } else if ("done" in ev || "error" in ev) {
       if (ev.userMessageId != null) userId = ev.userMessageId;
       if (ev.messageId != null) messageId = ev.messageId;
@@ -99,20 +103,37 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   return next;
 }
 
-// onSessionChanged:会话元信息可能变化(新消息改变排序、自动命名)时通知外层刷新列表
+// 重新进入会话时,若有运行中的后台生成:去掉该轮 user 之后已落库的消息(regenerate 时的旧回答、
+// 或在两次请求之间刚落库的新回答),由事件回放重建末条 assistant。纯函数。
+export function attachBase(ms: UIMessage[], userMessageId: number | null): UIMessage[] {
+  const base = userMessageId != null ? ms.filter((m) => m.id == null || m.id <= userMessageId) : ms;
+  return [...base, { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() }];
+}
+
+// 流结束时收尾末条 assistant:被停止的标记 aborted(全空则移除),否则只结束 streaming。纯函数。
+export function finalizeLast(ms: UIMessage[], o: { cancelled: boolean; error?: string }): UIMessage[] {
+  const last = ms[ms.length - 1];
+  if (!last || last.role !== "assistant") return ms;
+  const copy = [...ms];
+  if (o.cancelled) {
+    if (!last.content && !last.blocks?.length) return copy.slice(0, -1);
+    copy[copy.length - 1] = { ...last, streaming: false, aborted: true };
+  } else if (o.error) copy[copy.length - 1] = { ...last, streaming: false, error: o.error };
+  else copy[copy.length - 1] = { ...last, streaming: false };
+  return copy;
+}
+
+// onSessionChanged:会话元信息可能变化(新消息改变排序、自动命名、生成结束)时通知外层刷新列表
 export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void; onSessionChanged?: () => void }) {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const runIdRef = useRef<string | null>(null);
+  const stopRef = useRef(false); // 已请求停止:meta 晚到时补发 cancel
   const pendingRef = useRef<StreamEvent[]>([]);
   const rafRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    void api.messages(session.id).then((ms) => setMessages(ms.filter((m) => m.role !== "system")));
-  }, [session.id]);
-
-  // 卸载(切换会话导致 key 变化)时中断在途请求
-  useEffect(() => () => abortRef.current?.abort(), []);
+  const optsRef = useRef(opts);
+  optsRef.current = opts;
 
   const flush = useCallback(() => {
     if (rafRef.current !== null) {
@@ -137,11 +158,83 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
     [flush],
   );
 
+  // 请服务端中止;3s 内流还没结束就断开本地连接兜底
+  const requestCancel = useCallback((runId: string, ac: AbortController) => {
+    void api.cancelRun(runId).catch(() => {});
+    setTimeout(() => {
+      if (abortRef.current === ac) ac.abort();
+    }, 3000);
+  }, []);
+
+  // 消费一条事件流(新发送或续订后台生成),结束后收尾末条 assistant。
+  // 卸载 / 切换会话只断开本地连接(abortRef),后台生成继续;停止由 stop() 走 cancel。
+  const consume = useCallback(
+    async (start: (onEvent: (ev: StreamEvent) => void, signal: AbortSignal) => Promise<void>) => {
+      setBusy(true);
+      stopRef.current = false;
+      const ac = new AbortController();
+      abortRef.current = ac;
+      let cancelled = false;
+      const onEvent = (ev: StreamEvent) => {
+        enqueue(ev);
+        if (!("type" in ev)) return;
+        if (ev.type === "meta" && ev.runId) {
+          runIdRef.current = ev.runId;
+          if (stopRef.current) requestCancel(ev.runId, ac);
+        }
+        if (ev.type === "cancelled") cancelled = true;
+        if (ev.type === "meta" || ev.type === "title") optsRef.current?.onSessionChanged?.();
+      };
+      try {
+        await start(onEvent, ac.signal);
+        flush(); // 收尾必须同步 flush
+        setMessages((ms) => finalizeLast(ms, { cancelled }));
+        if (!cancelled) optsRef.current?.onDone?.();
+      } catch (e) {
+        flush();
+        // 本地断开(卸载或停止兜底)视为中断;其余是服务端 / 网络错误
+        const aborted = ac.signal.aborted;
+        setMessages((ms) =>
+          finalizeLast(ms, aborted ? { cancelled: true } : { cancelled, error: e instanceof Error ? e.message : String(e) }),
+        );
+      } finally {
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          runIdRef.current = null;
+          setBusy(false);
+        }
+        optsRef.current?.onSessionChanged?.();
+      }
+    },
+    [enqueue, flush, requestCancel],
+  );
+
+  // 进入会话:加载历史;有运行中的后台生成时续订并回放(F1)
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const run = await api.activeRun(session.id).catch(() => null);
+      const ms = (await api.messages(session.id)).filter((m) => m.role !== "system");
+      if (!alive) return;
+      if (run?.status !== "running") {
+        setMessages(ms);
+        return;
+      }
+      setMessages(attachBase(ms, run.userMessageId));
+      runIdRef.current = run.id;
+      void consume((onEvent, signal) => subscribeRun(run.id, onEvent, signal));
+    })().catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [session.id, consume]);
+
+  // 卸载(切换会话导致 key 变化)时只断开本地订阅,不停止后台生成
+  useEffect(() => () => abortRef.current?.abort(), []);
+
   const send = useCallback(
     async (text: string, o?: { regenerate?: boolean; context?: string; refs?: RefPayload[] }) => {
       if (!text || busy) return;
-      setBusy(true);
-      abortRef.current = new AbortController();
       if (!o?.regenerate) {
         setMessages((ms) => [
           ...ms,
@@ -154,49 +247,25 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
           return [...trimmed, { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() }];
         });
       }
-      try {
-        await streamChat(
-          session.id, text, () => {}, abortRef.current.signal, o?.regenerate === true,
-          {
-            onEvent: (ev) => {
-              enqueue(ev);
-              if ("type" in ev && (ev.type === "meta" || ev.type === "title")) opts?.onSessionChanged?.();
-            },
-            context: o?.context,
-            refs: o?.refs,
-          },
-        );
-        flush(); // 收尾必须同步 flush
-        setMessages((ms) => {
-          const copy = [...ms];
-          const last = copy[copy.length - 1];
-          if (last?.role === "assistant") copy[copy.length - 1] = { ...last, streaming: false };
-          return copy;
-        });
-        opts?.onDone?.();
-      } catch (e) {
-        flush();
-        const aborted = abortRef.current?.signal.aborted === true;
-        setMessages((ms) => {
-          const copy = [...ms];
-          const last = copy[copy.length - 1];
-          if (!last || last.role !== "assistant") return ms;
-          if (aborted) {
-            if (!last.content && !last.blocks?.length) return copy.slice(0, -1);
-            copy[copy.length - 1] = { ...last, streaming: false, aborted: true };
-          } else {
-            copy[copy.length - 1] = { ...last, streaming: false, error: e instanceof Error ? e.message : String(e) };
-          }
-          return copy;
-        });
-      } finally {
-        setBusy(false);
-      }
+      await consume((onEvent, signal) =>
+        streamChat(session.id, text, () => {}, signal, o?.regenerate === true, {
+          onEvent,
+          context: o?.context,
+          refs: o?.refs,
+        }),
+      );
     },
-    [busy, enqueue, flush, session.id, opts],
+    [busy, consume, session.id],
   );
 
-  const stop = useCallback(() => abortRef.current?.abort(), []);
+  // 停止:请服务端中止(半截落库后流自然结束);已发出 cancel 但 3s 内没结束,就断开本地连接兜底。
+  // 还没拿到 runId(服务端仍在准备上下文)时不断开,等 meta 到达后立即补发 cancel,避免后台继续生成
+  const stop = useCallback(() => {
+    const ac = abortRef.current;
+    if (!ac) return;
+    stopRef.current = true;
+    if (runIdRef.current) requestCancel(runIdRef.current, ac);
+  }, [requestCancel]);
 
   const regenerate = useCallback(() => {
     const lastUser = [...messages].reverse().find((m) => m.role === "user");

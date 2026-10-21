@@ -1,6 +1,6 @@
-import { Archive, ArchiveRestore, Pencil, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, LoaderCircle, Pencil, Trash2 } from "lucide-react";
 import { motion } from "motion/react";
-import { useMemo, type KeyboardEvent } from "react";
+import { useMemo, type KeyboardEvent, type ReactNode } from "react";
 import type { SessionMeta } from "@xiyun/shared";
 import { cn } from "../ui/cn.ts";
 import { Button, IconButton, Skeleton } from "../ui/primitives.tsx";
@@ -26,6 +26,7 @@ export interface SessionListProps {
   onArchive: (s: SessionMeta, archived: boolean) => void;
   onDelete: (s: SessionMeta) => void;
   onLoadMore: () => void;
+  footer?: ReactNode; // 列表末尾的附加分组(如搜索时的"消息内容")
 }
 
 const GROUPS = ["今天", "昨天", "近 7 天", "近 30 天", "更早"] as const;
@@ -113,7 +114,7 @@ export function SessionList(props: SessionListProps) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3" role="list" aria-label="会话列表">
       {groups.length === 0 ? (
-        <div className="px-3 pt-6 text-center text-xs leading-relaxed text-subtle">{props.emptyText}</div>
+        props.emptyText && <div className="px-3 pt-6 text-center text-xs leading-relaxed text-subtle">{props.emptyText}</div>
       ) : (
         groups.map(({ group, items }) => (
           <div key={group} role="presentation">
@@ -161,9 +162,16 @@ export function SessionList(props: SessionListProps) {
                     />
                   )}
                   <span className="relative min-w-0 flex-1 truncate">{s.title}</span>
-                  <span className="relative font-mono text-2xs tabular-nums text-subtle group-focus-within:hidden group-hover:hidden">
-                    {time}
-                  </span>
+                  {s.running ? (
+                    // 后台生成中(F1):切走后回来可接着看
+                    <span className="relative flex items-center text-accent group-focus-within:hidden group-hover:hidden" title="生成中">
+                      <LoaderCircle size={12} strokeWidth={2} className="animate-spin" aria-label="生成中" />
+                    </span>
+                  ) : (
+                    <span className="relative font-mono text-2xs tabular-nums text-subtle group-focus-within:hidden group-hover:hidden">
+                      {time}
+                    </span>
+                  )}
                   <span
                     className="relative hidden items-center group-focus-within:flex group-hover:flex"
                     onClick={(e) => e.stopPropagation()}
@@ -195,6 +203,7 @@ export function SessionList(props: SessionListProps) {
           加载更多
         </Button>
       )}
+      {props.footer}
     </div>
   );
 }

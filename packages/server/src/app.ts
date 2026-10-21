@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
@@ -18,6 +18,8 @@ import { MAX_GROUP_TASKS, Scheduler, TaskStore } from "./tasks.ts";
 import { detectShells, gitCommit, gitPreview, listTool, readTool, shellExec, writeTool } from "./tools.ts";
 import { DATA_DIR, backupDb } from "./db.ts";
 import { DEFAULT_TITLE, generateTitle, heuristicTitle } from "./title.ts";
+import { RunRegistry, type Run } from "./runs.ts";
+import { searchMessages } from "./search.ts";
 
 const now = () => new Date().toISOString();
 
@@ -54,6 +56,31 @@ export function createApp(
     db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('task.recovered', ?, ?)").run(
       JSON.stringify({ count: recovered }), now(),
     );
+
+  // F1:生成运行注册表。生成在后台执行,HTTP 连接只是订阅者
+  const runs = new RunRegistry();
+  // 把 Run 的事件写给当前连接:先回放 after 之后的事件再实时推送,Run 结束即关闭;连接断开只取消订阅。
+  // SSE 写按序入队、不阻塞:客户端停止读取时 writeSSE 会一直挂着,断开后不再等待队列。
+  const streamRun = (c: Context, run: Run, after = 0) =>
+    streamSSE(c, async (stream) => {
+      let queue: Promise<unknown> = Promise.resolve();
+      let end!: () => void;
+      const ended = new Promise<void>((r) => (end = r));
+      const gone = () => end();
+      stream.onAbort(gone);
+      if (c.req.raw.signal.aborted) gone();
+      c.req.raw.signal.addEventListener("abort", gone, { once: true });
+      const unsub = run.subscribe(
+        (e) => {
+          queue = queue.then(() => stream.writeSSE({ id: String(e.seq), data: e.data })).catch(() => {});
+        },
+        gone,
+        after,
+      );
+      await ended;
+      unsub();
+      if (!c.req.raw.signal.aborted) await queue;
+    });
 
   // 会话最近活动时间:新消息落库时刷新,列表据此排序
   const touchSession = (id: string) => db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(now(), id);
@@ -136,9 +163,11 @@ export function createApp(
     const rows = (limit
       ? db.prepare(sql).all(...args, limit, offset)
       : db.prepare(sql).all(...args)) as Array<Record<string, string | number>>;
+    const live = runs.running();
     const list = rows.map((r) => ({
       id: r.id, title: r.title, mode: r.mode, workspace: r.workspace,
       createdAt: r.created_at, updatedAt: r.updated_at || r.created_at, archived: Number(r.archived) === 1,
+      running: live.has(String(r.id)),
     }));
     // 兼容旧前端:无 limit 时返回数组;有 limit 时返回 { list, total, hasMore }
     return limit ? c.json({ list, total, hasMore: offset + rows.length < total }) : c.json(list);
@@ -159,6 +188,8 @@ export function createApp(
     return c.json(s);
   });
   app.delete("/sessions/:id", (c) => {
+    const run = runs.active(c.req.param("id"));
+    if (run) runs.cancel(run.id); // 删除会话时停止其后台生成
     db.prepare("DELETE FROM sessions WHERE id = ?").run(c.req.param("id"));
     db.prepare("DELETE FROM messages WHERE session_id = ?").run(c.req.param("id"));
     return c.json({ ok: true });
@@ -246,6 +277,36 @@ export function createApp(
     return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts, updatedAt: ts });
   });
 
+  // ---- 消息全文搜索(M7):GET /search?q=&mode=&limit= ----
+  app.get("/search", (c) =>
+    c.json(
+      searchMessages(db, c.req.query("q") ?? "", {
+        mode: c.req.query("mode") || undefined,
+        limit: Number(c.req.query("limit")) || undefined,
+        includeArchived: c.req.query("archived") === "all",
+      }),
+    ),
+  );
+
+  // ---- 生成运行(F1)----
+  // 回到会话时查询运行中的生成并续订;刚结束(未回收)的运行也返回,用于补齐回放
+  app.get("/sessions/:id/active-run", (c) => c.json(runs.active(c.req.param("id"))?.info() ?? null));
+  // 运行中的会话 id 列表:侧栏据此显示"生成中",生成结束后刷新列表
+  app.get("/runs", (c) => c.json({ running: [...runs.running()] }));
+  app.get("/runs/:id", (c) => {
+    const run = runs.get(c.req.param("id"));
+    return run ? c.json(run.info()) : c.json({ error: "run not found" }, 404);
+  });
+  // 订阅事件流:after(或 Last-Event-ID)之后的事件先回放,再实时推送
+  app.get("/runs/:id/events", (c) => {
+    const run = runs.get(c.req.param("id"));
+    if (!run) return c.json({ error: "run not found" }, 404);
+    const after = Number(c.req.query("after") ?? c.req.header("Last-Event-ID") ?? 0) || 0;
+    return streamRun(c, run, after);
+  });
+  // 唯一的中止入口:断开连接不会停止生成
+  app.post("/runs/:id/cancel", (c) => c.json({ ok: runs.cancel(c.req.param("id")) }));
+
   // ---- Chat:规则文件 + 相关记忆 + 历史,流式回复,落库 ----
   app.post("/chat", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -272,6 +333,9 @@ export function createApp(
     // D1:激活 Provider 优先,角色兜底——模型下拉才能生效
     const provider = opts?.chatProvider?.() ?? providers.activeProvider() ?? providers.registry().byRole("main");
     if (!provider) return c.json({ error: "no provider configured" }, 400);
+    // 同一会话同时只允许一个生成(F1):先拦下,避免记忆工具等副作用
+    const busyMsg = "该会话正在生成,请等待完成或先停止";
+    if (runs.active(sessionId)?.status === "running") return c.json({ error: busyMsg }, 409);
 
     // 规则层:引用的文件参与匹配 .mdc globs 与目录级 AGENTS.md / CLAUDE.md(D-019)
     const refFiles = refs.flatMap((r) => (r.refType === "file" && typeof r.path === "string" ? [r.path] : []));
@@ -324,6 +388,10 @@ export function createApp(
       ...history,
       { role: "user", content: modelMessage },
     ];
+
+    // 最后一个 await 之后再占位,与 user 落库之间没有让出事件循环,不会并发重复
+    const run = runs.start(sessionId);
+    if (!run) return c.json({ error: busyMsg }, 409);
 
     // user 落库:content 只存原话,refs 作为 ref 块(D5)
     let userMessageId: number | null = null;
@@ -383,27 +451,19 @@ export function createApp(
       provider.config.capabilities?.includes("tools") && process.env.XIYUN_EXPOSE_TOOLS === "1" && !!session.workspace;
     const tools = exposeTools ? READONLY_TOOLS : undefined;
 
-    return streamSSE(c, async (stream) => {
-      const ac = new AbortController();
-      // stream.onAbort 只在部分适配器触发;真实 HTTP 中断由请求信号透出,两者都接
-      stream.onAbort(() => ac.abort());
-      // 若在准备上下文期间客户端就已断开,信号已 aborted,监听不会再触发,先补一次
-      if (c.req.raw.signal.aborted) ac.abort();
-      c.req.raw.signal.addEventListener("abort", () => ac.abort(), { once: true });
+    // F1:生成在后台执行,不随本次连接断开而中止;只有 POST /runs/:id/cancel 触发 ac
+    run.userMessageId = userMessageId;
+    const ac = run.ac;
+    const send = (obj: unknown) => run.emit(obj);
+    // 先下发已落库的 user 消息 id 与 runId:中断或出错时客户端也能立即编辑 / 分支,断线后可凭 runId 续订
+    send({ type: "meta", userMessageId, runId: run.id });
+    // 运行结束后 emit 自动忽略,标题晚到时只落库
+    void titlePending?.then((title) => {
+      if (title) send({ type: "title", title });
+    });
+    let outcome: "done" | "error" = "done";
 
-      // SSE 写按序入队、不阻塞状态机:客户端停止读取时 writeSSE 会一直挂着,
-      // 若 await 它,中断后状态机再也拿不到控制权;stream.close() 会等待队列写完。
-      let writing: Promise<unknown> = Promise.resolve();
-      const send = (obj: unknown) => {
-        writing = writing.then(() => stream.writeSSE({ data: JSON.stringify(obj) })).catch(() => {});
-        return writing;
-      };
-      // 先下发已落库的 user 消息 id:中断或出错时客户端也能立即编辑 / 分支这条消息
-      void send({ type: "meta", userMessageId });
-      let streamOpen = true;
-      void titlePending?.then((title) => {
-        if (title && streamOpen) void send({ type: "title", title });
-      });
+    void (async () => {
 
       const blocks: ChatBlock[] = [];
       const toolBlocks = new Map<string, Extract<ChatBlock, { kind: "tool" }>>();
@@ -570,7 +630,8 @@ export function createApp(
           closeUnfinishedTools();
           const content = textOf(blocks);
           // 全空则什么都不落,避免留下空 assistant 行
-          if (content || blocks.length) persist({ content, blocks, aborted: true });
+          const messageId = content || blocks.length ? persist({ content, blocks, aborted: true }) : null;
+          send({ type: "cancelled", messageId, userMessageId });
           return;
         }
         const content = textOf(blocks);
@@ -589,9 +650,16 @@ export function createApp(
         if (ac.signal.aborted) {
           closeUnfinishedTools();
           const content = textOf(blocks);
-          if (content || blocks.length) persist({ content, blocks, aborted: true });
+          let messageId: number | null = null;
+          try {
+            if (content || blocks.length) messageId = persist({ content, blocks, aborted: true });
+          } catch {
+            // 落库失败也要让客户端收尾
+          }
+          send({ type: "cancelled", messageId, userMessageId });
           return;
         }
+        outcome = "error";
         // 出错时保留已生成的半截并标记 error,刷新后仍可见、可重试;
         // 例外:regenerate 失败不覆盖一条完整的旧回答(宁可保留旧答案)
         const error = (e instanceof Error ? e.message : "provider error").slice(0, 500);
@@ -613,9 +681,7 @@ export function createApp(
         }
         void send({ error, messageId, userMessageId });
       } finally {
-        // 客户端已断开时 writeSSE 可能永久挂起,不再等待,让响应流直接关闭
-        if (!ac.signal.aborted) await writing;
-        streamOpen = false;
+        runs.finish(run, ac.signal.aborted ? "cancelled" : outcome);
       }
 
       function textOf(list: ChatBlock[]): string {
@@ -657,7 +723,9 @@ export function createApp(
           throw e;
         }
       }
-    });
+    })().catch(() => runs.finish(run, "error"));
+
+    return streamRun(c, run);
   });
 
   // ---- 记忆 ----

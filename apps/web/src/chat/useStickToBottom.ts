@@ -21,6 +21,11 @@ export function useStickToBottom<S extends HTMLElement, C extends HTMLElement>()
     el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
   }, []);
 
+  // 跳转到历史消息前调用:解除贴底,避免随后的内容高度变化把视图拉回底部
+  const release = useCallback(() => {
+    stuck.current = false;
+  }, []);
+
   useEffect(() => {
     const el = scrollRef.current;
     const content = contentRef.current;
@@ -60,5 +65,5 @@ export function useStickToBottom<S extends HTMLElement, C extends HTMLElement>()
     };
   }, []);
 
-  return { scrollRef, contentRef, atBottom, scrollToBottom };
+  return { scrollRef, contentRef, atBottom, scrollToBottom, release };
 }

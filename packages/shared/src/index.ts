@@ -98,6 +98,16 @@ export interface SessionMeta {
   createdAt: string;
   updatedAt?: string; // 最近活动时间(最后一条消息);老数据缺省时用 createdAt
   archived?: boolean;
+  running?: boolean; // 服务端有运行中的生成(F1)
+}
+
+// 消息全文搜索命中(M7);snippet 中命中词用 \u0001 / \u0002 包住,由前端转成高亮
+export interface SearchHit {
+  messageId: number;
+  role: "user" | "assistant";
+  snippet: string;
+  createdAt: string;
+  session: SessionMeta;
 }
 
 // ---- 阶段 6:Skill 与插件 ----

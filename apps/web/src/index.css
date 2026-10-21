@@ -730,3 +730,22 @@
     margin-top: 0;
   }
 }
+
+/* M7:从搜索结果跳转到消息时的短暂高亮 */
+@layer components {
+  .msg-flash {
+    border-radius: 14px;
+    animation: msg-flash 2s ease-out;
+  }
+  @keyframes msg-flash {
+    0%,
+    35% {
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 8px var(--accent-soft);
+    }
+    100% {
+      background: transparent;
+      box-shadow: 0 0 0 8px transparent;
+    }
+  }
+}

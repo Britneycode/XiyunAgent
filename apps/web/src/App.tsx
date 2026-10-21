@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Brain, Eye, GitCompareArrows, Library, ListTodo, LoaderCircle, Plus, SquareCheckBig, SquareTerminal, WifiOff } from "lucide-react";
-import type { MemoryCandidate, SessionMeta } from "@xiyun/shared";
+import type { MemoryCandidate, SearchHit, SessionMeta } from "@xiyun/shared";
 import { ChatPage } from "./ChatPage.tsx";
 import { SettingsPage } from "./SettingsPage.tsx";
 import { MemoryPage } from "./MemoryPage.tsx";
@@ -18,7 +18,9 @@ import { InspectorBridgeProvider, type InspectorBridge } from "./layout/inspecto
 import type { RenameState } from "./layout/SessionList.tsx";
 import { SideRail } from "./layout/SideRail.tsx";
 import { ShortcutsDialog } from "./layout/ShortcutsDialog.tsx";
+import { SearchResults } from "./layout/SearchResults.tsx";
 import { Sidebar } from "./layout/Sidebar.tsx";
+import { requestFocus } from "./chat/focus.ts";
 import { StatusBar } from "./layout/StatusBar.tsx";
 import { StreamHeader } from "./layout/StreamHeader.tsx";
 import { Workbench } from "./layout/Workbench.tsx";
@@ -61,6 +63,9 @@ export function App() {
   const [online, setOnline] = useState(true);
   const [showArchived, setShowArchived] = useState(false);
   const [renaming, setRenaming] = useState<RenameState | null>(null);
+  // M7:消息全文命中;extra 是从命中打开、但不在已加载分页里的会话
+  const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [extra, setExtra] = useState<SessionMeta | null>(null);
 
   // ---- 布局状态 ----
   // 宽窗口:侧栏停靠(展开 / 收起为窄栏),开关持久化;窄窗口:窄栏常驻,展开为浮层、不持久化。
@@ -172,14 +177,14 @@ export function App() {
       const next = { ...prev };
       for (const m of MODES) {
         const id = prev[m];
-        if (id && !sessions.some((s) => s.id === id && s.mode === m)) {
+        if (id && id !== extra?.id && !sessions.some((s) => s.id === id && s.mode === m)) {
           next[m] = null;
           changed = true;
         }
       }
       return changed ? next : prev;
     });
-  }, [sessions, loaded]);
+  }, [sessions, loaded, extra]);
 
   const newSession = async () => {
     const s = await api.createSession({ mode });
@@ -191,7 +196,9 @@ export function App() {
 
   const activeId = byMode[mode];
   // 渲染前校验模式匹配:槽位指向其它模式的会话时按无效处理。
-  const active = sessions.find((s) => s.id === activeId && s.mode === mode) ?? null;
+  const active =
+    sessions.find((s) => s.id === activeId && s.mode === mode) ??
+    (extra && extra.id === activeId && extra.mode === mode ? extra : null);
 
   const selectSession = (s: SessionMeta) => {
     setByMode((prev) => ({ ...prev, [mode]: s.id }));
@@ -216,6 +223,53 @@ export function App() {
     if (!window.confirm(`删除会话「${s.title}」及其全部消息?此操作不可恢复。`)) return;
     await api.deleteSession(s.id).catch(() => {});
     await refresh();
+  };
+
+  // F1:有后台生成的会话每 2s 轮询一次;某个结束时刷新列表(排序 / 标题 / 转圈状态)
+  const runningKey = sessions.filter((s) => s.running).map((s) => s.id).join(",");
+  useEffect(() => {
+    if (!runningKey) return;
+    const known = new Set(runningKey.split(","));
+    const t = setInterval(() => {
+      void api
+        .runningSessions()
+        .then(({ running }) => {
+          const now = new Set(running);
+          if ([...known].some((id) => !now.has(id)) || running.some((id) => !known.has(id))) void refresh();
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => clearInterval(t);
+  }, [runningKey, refresh]);
+
+  // 消息全文搜索:输入停顿 250ms 后查询当前模式;不足 2 个字符只按标题过滤
+  useEffect(() => {
+    const q = query.trim();
+    if (Array.from(q).length < 2) {
+      setHits(null);
+      return;
+    }
+    let stale = false;
+    const t = setTimeout(() => {
+      api
+        .search(q, { mode, archived: showArchived, limit: 30 })
+        .then((r) => !stale && setHits(r))
+        .catch(() => !stale && setHits([]));
+    }, 250);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [query, mode, showArchived]);
+
+  const openHit = (h: SearchHit) => {
+    const s = h.session;
+    if (!sessions.some((x) => x.id === s.id)) setExtra(s);
+    requestFocus(s.id, h.messageId);
+    setByMode((prev) => ({ ...prev, [s.mode as Mode]: s.id }));
+    if (s.mode !== mode) setMode(s.mode as Mode);
+    setPage("main");
+    setSideFloating(false);
   };
 
   const visible = sessions.filter(
@@ -412,7 +466,9 @@ export function App() {
             loaded,
             renaming,
             emptyText: query
-              ? "无匹配会话"
+              ? hits
+                ? ""
+                : "无匹配会话"
               : showArchived
                 ? "没有已归档的会话"
                 : `还没有 ${meta.label} 会话`,
@@ -424,6 +480,7 @@ export function App() {
             onArchive: (s, archived) => void archiveSession(s, archived),
             onDelete: (s) => void deleteSession(s),
             onLoadMore: () => void loadMore(),
+            footer: query && hits ? <SearchResults hits={hits} onOpen={openHit} /> : null,
           }}
           onModeChange={changeMode}
           onOpenPage={openPage}

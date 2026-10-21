@@ -127,7 +127,7 @@ export function Sidebar(props: SidebarProps) {
                 }
               }}
               onBlur={() => !query && setSearching(false)}
-              placeholder="搜索会话标题"
+              placeholder="搜索会话与消息"
               aria-label="搜索会话"
               className="min-w-0 flex-1 bg-transparent text-ui text-fg outline-none placeholder:text-subtle"
             />

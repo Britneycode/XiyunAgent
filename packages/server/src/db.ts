@@ -47,6 +47,23 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
        WHERE updated_at IS NULL`,
     );
   },
+  // v9:messages_fts(消息全文索引,trigram 分词,中英文子串都能搜);触发器同步,建表时回填已有消息
+  (db) => {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, session_id UNINDEXED, tokenize='trigram');
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, content, session_id) VALUES (new.id, new.content, new.session_id);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+        DELETE FROM messages_fts WHERE rowid = old.id;
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+        UPDATE messages_fts SET content = new.content WHERE rowid = old.id;
+      END;
+      DELETE FROM messages_fts;
+      INSERT INTO messages_fts(rowid, content, session_id) SELECT id, content, session_id FROM messages;
+    `);
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

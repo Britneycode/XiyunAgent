@@ -49,6 +49,13 @@ function parseSSE(text: string): Array<Record<string, unknown>> {
     .map((l) => JSON.parse(l.slice(5).trim()) as Record<string, unknown>);
 }
 
+// F1:中断走 cancel 接口(断开连接不再中止生成)
+async function cancelActive(app: ReturnType<typeof setup>["app"], sessionId: string) {
+  const run = (await (await app.request(`/sessions/${sessionId}/active-run`)).json()) as { id: string } | null;
+  if (!run) throw new Error("no active run");
+  return (await (await app.request(`/runs/${run.id}/cancel`, { method: "POST" })).json()) as { ok: boolean };
+}
+
 async function session(app: ReturnType<typeof setup>["app"]) {
   const res = await app.request("/sessions", { method: "POST", headers: json, body: JSON.stringify({ mode: "chat" }) });
   return (await res.json()) as { id: string };
@@ -218,7 +225,7 @@ describe("/chat 块协议", () => {
     const s = await session(app);
     const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "hi" })).text());
     const ids = db.prepare("SELECT id, role FROM messages ORDER BY id").all() as Array<{ id: number; role: string }>;
-    expect(evs[0]).toEqual({ type: "meta", userMessageId: ids[0]!.id });
+    expect(evs[0]).toEqual({ type: "meta", userMessageId: ids[0]!.id, runId: expect.any(String) });
     expect(evs.at(-1)).toEqual({ done: true, messageId: ids[1]!.id, userMessageId: ids[0]!.id });
   });
 
@@ -398,7 +405,7 @@ describe("/chat 块协议", () => {
   });
 
   it("中断时落半截并标记 aborted", async () => {
-    // 用内部 AbortController 模拟 stream.onAbort:假 Provider 挂起,触发 abort 后抛 AbortError
+    // 假 Provider 挂起,cancel 后抛 AbortError
     let internal!: AbortController;
     const provider: ChatProvider = {
       config: { id: "a", name: "a", baseUrl: "http://x", apiKey: "k", model: "m" },
@@ -414,11 +421,14 @@ describe("/chat 块协议", () => {
     const s = await session(app);
     internal = new AbortController();
     const p = app.request("/chat", {
-      method: "POST", headers: json, body: JSON.stringify({ sessionId: s.id, message: "q" }), signal: internal.signal,
+      method: "POST", headers: json, body: JSON.stringify({ sessionId: s.id, message: "q" }),
     });
     await new Promise((r) => setTimeout(r, 20));
+    // 服务端 cancel 触发 run.ac;假 Provider 通过 internal 感知中止
+    expect(await cancelActive(app, s.id)).toEqual({ ok: true });
     internal.abort();
-    await p.catch(() => {});
+    const events = parseSSE(await (await p).text());
+    expect(events.at(-1)).toMatchObject({ type: "cancelled" });
     // 等服务端收尾落库
     await new Promise((r) => setTimeout(r, 50));
     const row = db.prepare("SELECT content, aborted FROM messages WHERE role = 'assistant'").get() as
@@ -443,13 +453,12 @@ describe("/chat 块协议", () => {
     };
     const { app, db } = setup(provider);
     const s = await session(app);
-    const internal = new AbortController();
     const p = app.request("/chat", {
-      method: "POST", headers: json, body: JSON.stringify({ sessionId: s.id, message: "q" }), signal: internal.signal,
+      method: "POST", headers: json, body: JSON.stringify({ sessionId: s.id, message: "q" }),
     });
     await new Promise((r) => setTimeout(r, 20));
-    internal.abort();
-    await p.catch(() => {});
+    await cancelActive(app, s.id);
+    await (await p).text();
     await new Promise((r) => setTimeout(r, 50));
     const row = db.prepare("SELECT content, aborted FROM messages WHERE role = 'assistant'").get() as
       | { content: string; aborted: number }
@@ -475,12 +484,71 @@ describe("/chat 块协议", () => {
     const s = await session(app);
     internal = new AbortController();
     const p = app.request("/chat", {
-      method: "POST", headers: json, body: JSON.stringify({ sessionId: s.id, message: "q" }), signal: internal.signal,
+      method: "POST", headers: json, body: JSON.stringify({ sessionId: s.id, message: "q" }),
     });
     await new Promise((r) => setTimeout(r, 20));
+    // 服务端 cancel 触发 run.ac;假 Provider 通过 internal 感知中止
+    expect(await cancelActive(app, s.id)).toEqual({ ok: true });
     internal.abort();
-    await p.catch(() => {});
+    const events = parseSSE(await (await p).text());
+    expect(events.at(-1)).toMatchObject({ type: "cancelled" });
     await new Promise((r) => setTimeout(r, 50));
     expect((db.prepare("SELECT COUNT(*) c FROM messages WHERE role = 'assistant'").get() as { c: number }).c).toBe(0);
+  });
+
+  it("F1:断开连接不中止生成,回复照常落库", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const provider: ChatProvider = {
+      config: { id: "bg", name: "bg", baseUrl: "http://x", apiKey: "k", model: "m" },
+      async *streamChat() {},
+      async *streamEvents() {
+        yield { type: "text", delta: "前" };
+        await gate;
+        yield { type: "text", delta: "后" };
+      },
+    };
+    const { app, db } = setup(provider);
+    const s = await session(app);
+    const client = new AbortController();
+    const p = app.request("/chat", {
+      method: "POST", headers: json, body: JSON.stringify({ sessionId: s.id, message: "长任务" }), signal: client.signal,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    client.abort(); // 用户切走 / 断网
+    await p.then((r) => r.text()).catch(() => {});
+    const run = (await (await app.request(`/sessions/${s.id}/active-run`)).json()) as { id: string; status: string };
+    expect(run.status).toBe("running");
+    const list = (await (await app.request("/sessions")).json()) as Array<{ id: string; running: boolean }>;
+    expect(list.find((x) => x.id === s.id)?.running).toBe(true);
+    // 生成中再发消息被拒
+    expect((await post(app, { sessionId: s.id, message: "插队" })).status).toBe(409);
+    release();
+    // 续订:回放全部事件直到结束
+    const evs = parseSSE(await (await app.request(`/runs/${run.id}/events`)).text());
+    expect(evs[0]).toMatchObject({ type: "meta" });
+    expect(evs.at(-1)).toMatchObject({ done: true });
+    const row = db.prepare("SELECT content, aborted FROM messages WHERE role = 'assistant'").get() as { content: string; aborted: number };
+    expect(row).toEqual({ content: "前后", aborted: 0 });
+    expect(((await (await app.request(`/sessions/${s.id}/active-run`)).json()) as { status: string }).status).toBe("done");
+  });
+
+  it("F1:按 after / Last-Event-ID 只回放之后的事件,SSE 带 id", async () => {
+    const { app } = setup(fakeProvider([{ type: "text", delta: "a" }, { type: "text", delta: "b" }]));
+    const s = await session(app);
+    const raw = await (await post(app, { sessionId: s.id, message: "hi" })).text();
+    const ids = raw.split("\n").filter((l) => l.startsWith("id:")).map((l) => Number(l.slice(3)));
+    expect(ids[0]).toBe(1);
+    expect(ids).toEqual([...ids].sort((x, y) => x - y));
+    const run = (await (await app.request(`/sessions/${s.id}/active-run`)).json()) as { id: string };
+    const tail = parseSSE(await (await app.request(`/runs/${run.id}/events?after=${ids.at(-2)}`)).text());
+    expect(tail).toHaveLength(1);
+    expect(tail[0]).toMatchObject({ done: true });
+    const tail2 = parseSSE(
+      await (await app.request(`/runs/${run.id}/events`, { headers: { "Last-Event-ID": String(ids.at(-1)) } })).text(),
+    );
+    expect(tail2).toHaveLength(0);
+    expect((await app.request("/runs/nope/events")).status).toBe(404);
+    expect(await (await app.request("/runs/nope/cancel", { method: "POST" })).json()).toEqual({ ok: false });
   });
 });

@@ -5,9 +5,11 @@ import type { UIMessage } from "./useChatStream.ts";
 // api.ts 顶层读取 location,node 环境下先补一个最小桩再动态导入
 let applyQueue: (msg: UIMessage, queue: StreamEvent[]) => UIMessage;
 let applyStream: (ms: UIMessage[], queue: StreamEvent[]) => UIMessage[];
+let attachBase: (ms: UIMessage[], userMessageId: number | null) => UIMessage[];
+let finalizeLast: (ms: UIMessage[], o: { cancelled: boolean; error?: string }) => UIMessage[];
 beforeAll(async () => {
   (globalThis as { location?: unknown }).location ??= { protocol: "http:" };
-  ({ applyQueue, applyStream } = await import("./useChatStream.ts"));
+  ({ applyQueue, applyStream, attachBase, finalizeLast } = await import("./useChatStream.ts"));
 });
 
 const empty = (): UIMessage => ({ role: "assistant", content: "", blocks: [], streaming: true });
@@ -106,5 +108,37 @@ describe("applyStream:落库 id 回填", () => {
     expect(ms).toEqual(snapshot);
     const userLast: UIMessage[] = [{ role: "user", content: "q" }];
     expect(applyStream(userLast, [{ done: true, messageId: 1 }])).toBe(userLast);
+  });
+});
+
+describe("F1 后台生成:续订与收尾", () => {
+  it("attachBase 去掉该轮 user 之后已落库的消息,并追加生成中的占位", () => {
+    const ms = [
+      { id: 1, role: "user" as const, content: "q1" },
+      { id: 2, role: "assistant" as const, content: "a1" },
+      { id: 3, role: "user" as const, content: "q2" },
+      { id: 4, role: "assistant" as const, content: "刚落库" },
+    ];
+    const out = attachBase(ms, 3);
+    expect(out.map((m) => m.id)).toEqual([1, 2, 3, undefined]);
+    expect(out.at(-1)).toMatchObject({ role: "assistant", streaming: true, content: "" });
+    // regenerate:userMessageId 指向上一条 user,旧回答被去掉
+    expect(attachBase(ms.slice(0, 2), 1).map((m) => m.id)).toEqual([1, undefined]);
+  });
+
+  it("cancelled 事件回填落库 id,finalizeLast 标记 aborted;全空时移除占位", () => {
+    const base = [
+      { role: "user" as const, content: "q", localKey: "u" },
+      { role: "assistant" as const, content: "", blocks: [], streaming: true, localKey: "a" },
+    ];
+    const streamed = applyStream(base, [
+      { type: "meta", userMessageId: 7, runId: "r" },
+      { delta: "半" },
+      { type: "cancelled", messageId: 8, userMessageId: 7 },
+    ]);
+    expect(streamed.map((m) => m.id)).toEqual([7, 8]);
+    expect(finalizeLast(streamed, { cancelled: true }).at(-1)).toMatchObject({ aborted: true, streaming: false, content: "半" });
+    expect(finalizeLast(base, { cancelled: true })).toHaveLength(1);
+    expect(finalizeLast(streamed, { cancelled: false, error: "boom" }).at(-1)).toMatchObject({ error: "boom", streaming: false });
   });
 });
