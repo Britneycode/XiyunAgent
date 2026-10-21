@@ -22,8 +22,24 @@ export interface ThemePreset {
 const UI_FONT = "system-ui, sans-serif";
 const SERIF = "Georgia, 'Songti SC', serif";
 const MONO = "Consolas, 'Cascadia Mono', monospace";
+// 工作台字体栈(Linen / Zinc 共用)。均为系统字体或可选本地安装字体,不依赖网络。
+const WORKBENCH_UI = "Inter, 'Segoe UI Variable Text', 'Segoe UI', system-ui, 'PingFang SC', 'Microsoft YaHei UI', sans-serif";
+const WORKBENCH_MONO = "'JetBrains Mono', 'Cascadia Code', 'Cascadia Mono', 'SF Mono', Consolas, Menlo, monospace";
 
 export const PRESETS: ThemePreset[] = [
+  {
+    // Linen:默认主题。暖调中性灰(亚麻/羊皮纸)+ 赭陶强调色,浅深两套均满足 WCAG AA 正文对比度。
+    id: "linen", name: "Linen", appearance: "system",
+    tokens: { bg: "#fbfaf7", surface: "#f5f3ee", text: "#1d1c19", muted: "#6b675e", border: "#e3dfd5", accent: "#b0532f", codeBg: "#f3f1eb", codeText: "#1d1c19" },
+    darkTokens: { bg: "#1a1917", surface: "#201f1c", text: "#ecebe5", muted: "#a29f96", border: "#35332f", accent: "#d97757", codeBg: "#151412", codeText: "#e6e4dc" },
+    fonts: { ui: WORKBENCH_UI, reading: WORKBENCH_UI, code: WORKBENCH_MONO },
+  },
+  {
+    id: "zinc", name: "Zinc", appearance: "system",
+    tokens: { bg: "#ffffff", surface: "#fafafa", text: "#18181b", muted: "#71717a", border: "#e4e4e7", accent: "#4f6bed", codeBg: "#f4f4f5", codeText: "#18181b" },
+    darkTokens: { bg: "#09090b", surface: "#111113", text: "#e4e4e7", muted: "#a1a1aa", border: "#27272a", accent: "#6d8cff", codeBg: "#0c0c0e", codeText: "#e4e4e7" },
+    fonts: { ui: WORKBENCH_UI, reading: WORKBENCH_UI, code: WORKBENCH_MONO },
+  },
   {
     id: "system", name: "System", appearance: "system",
     tokens: { bg: "#ffffff", surface: "#f6f7f9", text: "#1f2329", muted: "#646a73", border: "#d9dce1", accent: "#3b6ef6", codeBg: "#f3f4f6", codeText: "#1f2329" },
@@ -72,8 +88,9 @@ export interface ThemeSettings {
   density: "comfortable" | "compact";
 }
 
+// 新用户默认 Linen;已保存过主题的用户沿用其 presetId,不受影响。
 const DEFAULT_THEME: ThemeSettings = {
-  presetId: "system",
+  presetId: "linen",
   accent: "",
   fontFamily: "",
   readingFontFamily: "",
@@ -127,6 +144,35 @@ export function allPresets(): ThemePreset[] {
 
 const FONT_SIZES = { small: "13px", medium: "14.5px", large: "16.5px" } as const;
 
+// ---- 强调色前景:按 WCAG 相对亮度在白字与深字之间取对比度更高者 ----
+const ON_ACCENT_LIGHT = "#ffffff";
+const ON_ACCENT_DARK = "#1a1917";
+
+function luminance(hex: string): number | null {
+  let h = hex.replace("#", "");
+  if (h.length === 3 || h.length === 4) h = [...h.slice(0, 3)].map((c) => c + c).join("");
+  if (h.length !== 6 && h.length !== 8) return null;
+  const channel = (i: number) => {
+    const v = parseInt(h.slice(i, i + 2), 16) / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4);
+}
+
+function contrast(a: number, b: number): number {
+  const [hi, lo] = a > b ? [a, b] : [b, a];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+// 用户自定义强调色同样适用;无法解析的颜色回退白字。
+export function readableOn(accent: string): string {
+  const l = luminance(accent);
+  if (l === null) return ON_ACCENT_LIGHT;
+  const light = contrast(l, luminance(ON_ACCENT_LIGHT) ?? 1);
+  const dark = contrast(l, luminance(ON_ACCENT_DARK) ?? 0);
+  return light >= dark ? ON_ACCENT_LIGHT : ON_ACCENT_DARK;
+}
+
 export function applyTheme(t: ThemeSettings): void {
   const preset = allPresets().find((p) => p.id === t.presetId) ?? PRESETS[0];
   const systemDark = matchMedia("(prefers-color-scheme: dark)").matches;
@@ -140,7 +186,9 @@ export function applyTheme(t: ThemeSettings): void {
   r.style.setProperty("--text", tokens.text);
   r.style.setProperty("--muted", tokens.muted);
   r.style.setProperty("--border", tokens.border);
-  r.style.setProperty("--accent", t.accent || tokens.accent);
+  const accent = t.accent || tokens.accent;
+  r.style.setProperty("--accent", accent);
+  r.style.setProperty("--accent-fg", readableOn(accent));
   r.style.setProperty("--code-bg", tokens.codeBg);
   r.style.setProperty("--code-text", tokens.codeText);
   r.style.setProperty("--font", t.fontFamily || preset.fonts.ui);

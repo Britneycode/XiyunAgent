@@ -1,0 +1,227 @@
+/*
+ * 样式入口:Tailwind v4 + 设计 token。
+ * 层顺序:theme → base → legacy → components → utilities。
+ * legacy 层承载 styles.css 中尚未迁移的旧组件样式,排在 base 之后、utilities 之前:
+ * 既能覆盖 preflight 重置,又会被 Tailwind 工具类覆盖。
+ */
+@layer theme, base, legacy, components, utilities;
+@import "tailwindcss";
+
+/* public/vendor 下是压缩后的第三方脚本,不参与类名扫描 */
+@source not "../public";
+
+/* 暗色变体跟随 theme.ts 写入的 data-theme,而不是系统偏好 */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/*
+ * 语义色映射:运行时由 theme.ts 写入 8 个基础变量,其余层级由 color-mix 派生。
+ * inline 让工具类直接引用 var(),主题切换无需重新编译,透明度修饰符(/80)同样可用。
+ */
+@theme inline {
+  --color-canvas: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-elevated: var(--elevated);
+  --color-fg: var(--text);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-line: var(--line);
+  --color-line-strong: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-err: var(--err);
+  --color-warn: var(--warn);
+  --color-code: var(--code-bg);
+  --color-code-fg: var(--code-text);
+  --font-sans: var(--font);
+  --font-reading: var(--reading-font);
+  --font-mono: var(--code-font);
+}
+
+@theme {
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-ui: 0.8125rem;
+  --text-ui--line-height: 1.25rem;
+  --ease-snap: cubic-bezier(0.16, 1, 0.3, 1);
+  --shadow-pop: 0 18px 44px -18px var(--shadow-color), 0 2px 8px -2px var(--shadow-color);
+  --shadow-composer: 0 1px 2px var(--shadow-soft), 0 8px 24px -12px var(--shadow-color);
+  --shadow-pill: 0 1px 2px var(--shadow-soft), 0 0 0 0.5px var(--shadow-soft);
+  --animate-breathe: breathe 1.4s ease-in-out infinite;
+
+  @keyframes breathe {
+    0%,
+    100% {
+      opacity: 0.35;
+      transform: scale(0.85);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1.1);
+    }
+  }
+}
+
+@layer base {
+  :root {
+    /* 基础 token 默认值(Linen Light);theme.ts 的 applyTheme 以内联样式覆盖 */
+    --bg: #fbfaf7;
+    --surface: #f5f3ee;
+    --text: #1d1c19;
+    --muted: #6b675e;
+    --border: #e3dfd5;
+    --accent: #b0532f;
+    --accent-fg: #ffffff; /* applyTheme 按对比度重算 */
+    --code-bg: #f3f1eb;
+    --code-text: #1d1c19;
+
+    /* 派生层:所有预设与自定义主题包共用,不进入主题包白名单 */
+    --surface-2: color-mix(in srgb, var(--surface) 92%, var(--text));
+    --surface-3: color-mix(in srgb, var(--surface) 85%, var(--text));
+    --elevated: color-mix(in srgb, var(--bg) 40%, #ffffff); /* 输入框、浮层、分段控件选中块 */
+    --line: color-mix(in srgb, var(--border) 80%, transparent);
+    --subtle: color-mix(in srgb, var(--muted) 72%, var(--bg));
+    --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+    --shadow-color: rgb(48 38 24 / 0.14);
+    --shadow-soft: rgb(48 38 24 / 0.06);
+    --ok: #15803d;
+    --err: #c62828;
+    --warn: #b45309;
+
+    /* 布局尺寸 */
+    --w-rail: 52px;
+    --h-status: 24px;
+
+    color-scheme: light;
+  }
+
+  :root[data-theme="dark"] {
+    --elevated: color-mix(in srgb, var(--surface) 90%, var(--text));
+    --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+    --shadow-color: rgb(0 0 0 / 0.55);
+    --shadow-soft: rgb(0 0 0 / 0.3);
+    --ok: #4ade80;
+    --err: #f87171;
+    --warn: #fbbf24;
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: var(--font-size, 14.5px);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--muted) 35%, transparent) transparent;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+
+  :where(button:not(:disabled), [role="button"]:not([aria-disabled="true"])) {
+    cursor: pointer;
+  }
+
+  :where(button, a, input, textarea, select, [role="button"], [role="tab"], [role="separator"], [tabindex]):focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+/*
+ * 旧组件兼容:preflight 会清空标题、列表、段落等默认样式,
+ * 尚未迁移的页面(设置、记忆、Work、Code 抽屉、旧消息渲染)统一包在 .legacy 容器中,
+ * 在这里恢复接近浏览器默认的排版。:where() 保持零特异性,styles.css 的规则可直接覆盖。
+ * 嵌在旧页面里的新组件以 data-ui 标记,其子树不受这些规则影响。
+ */
+@layer legacy {
+  :where(.legacy) :where(h1):not(:where([data-ui] *)) {
+    font-size: 2em;
+    font-weight: 700;
+    margin: 0.67em 0;
+  }
+  :where(.legacy) :where(h2):not(:where([data-ui] *)) {
+    font-size: 1.5em;
+    font-weight: 700;
+    margin: 0.83em 0;
+  }
+  :where(.legacy) :where(h3):not(:where([data-ui] *)) {
+    font-size: 1.17em;
+    font-weight: 700;
+    margin: 1em 0;
+  }
+  :where(.legacy) :where(h4, h5, h6):not(:where([data-ui] *)) {
+    font-weight: 700;
+    margin: 1.33em 0;
+  }
+  :where(.legacy) :where(p, dl, figure, table):not(:where([data-ui] *)) {
+    margin: 1em 0;
+  }
+  :where(.legacy) :where(ul, ol):not(:where([data-ui] *)) {
+    margin: 1em 0;
+    padding-left: 1.6em;
+  }
+  :where(.legacy) :where(ul):not(:where([data-ui] *)) {
+    list-style: disc;
+  }
+  :where(.legacy) :where(ol):not(:where([data-ui] *)) {
+    list-style: decimal;
+  }
+  :where(.legacy) :where(li > ul, li > ol):not(:where([data-ui] *)) {
+    margin: 0;
+  }
+  :where(.legacy) :where(blockquote):not(:where([data-ui] *)) {
+    margin: 1em 0;
+    padding-left: 1em;
+    border-left: 3px solid var(--border);
+    color: var(--muted);
+  }
+  :where(.legacy) :where(hr):not(:where([data-ui] *)) {
+    margin: 1.5em 0;
+    border-top: 1px solid var(--border);
+  }
+  :where(.legacy) :where(a):not(:where([data-ui] *)) {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  :where(.legacy) :where(table):not(:where([data-ui] *)) {
+    border-collapse: collapse;
+  }
+  :where(.legacy) :where(th, td):not(:where([data-ui] *)) {
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    text-align: left;
+  }
+  :where(.legacy) :where(img):not(:where([data-ui] *)) {
+    display: inline-block;
+  }
+  :where(.legacy) :where(label):not(:where([data-ui] *)) {
+    cursor: default;
+  }
+}

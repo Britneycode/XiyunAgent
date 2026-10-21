@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Brain, Eye, ListTodo, LoaderCircle, Plus, WifiOff } from "lucide-react";
 import type { MemoryCandidate, SessionMeta } from "@xiyun/shared";
 import { ChatPage } from "./ChatPage.tsx";
 import { SettingsPage } from "./SettingsPage.tsx";
@@ -10,14 +11,27 @@ import type { Preview } from "./chat/blocks.tsx";
 import { PreviewPanel } from "./chat/PreviewPanel.tsx";
 import { api, health } from "./api.ts";
 import { applyTheme, loadTheme } from "./theme.ts";
+import { CandidateList } from "./layout/CandidateList.tsx";
+import { EmptyState } from "./layout/EmptyState.tsx";
+import { Inspector, type InspectorTab } from "./layout/Inspector.tsx";
+import type { RenameState } from "./layout/SessionList.tsx";
+import { SideRail } from "./layout/SideRail.tsx";
+import { Sidebar } from "./layout/Sidebar.tsx";
+import { StatusBar } from "./layout/StatusBar.tsx";
+import { StreamHeader } from "./layout/StreamHeader.tsx";
+import { Workbench } from "./layout/Workbench.tsx";
+import { MODE_META, MODES, type InspectorTabId, type Mode, type Page } from "./layout/types.ts";
+import { Button, Kbd } from "./ui/primitives.tsx";
+import { isBoolean, useHotkey, useMediaQuery, usePersistentState } from "./ui/hooks.ts";
 
-type Mode = "chat" | "work" | "code";
-type Page = "main" | "memory" | "settings";
-
-const MODE_LABEL: Record<Mode, string> = { chat: "Chat", work: "Work", code: "Code" };
-
-const MODES = Object.keys(MODE_LABEL) as Mode[];
 const ACTIVE_KEY = "xiyun.activeSessions";
+const SIDE_KEY = "xiyun.layout.sideOpen";
+// 断点:窄于此宽度时面板改为浮层
+const SIDE_OVERLAY_QUERY = "(max-width: 759px)";
+const INSPECTOR_OVERLAY_QUERY = "(max-width: 1099px)";
+
+// 未迁移的页面包在 .legacy 中,沿用 styles.css 的旧样式与排版
+const legacy = (node: ReactNode) => <div className="legacy flex min-h-0 flex-1 flex-col bg-canvas">{node}</div>;
 
 const emptyByMode = (): Record<Mode, string | null> => ({ chat: null, work: null, code: null });
 
@@ -40,22 +54,53 @@ export function App() {
   const [loaded, setLoaded] = useState(false);
   const [byMode, setByMode] = useState<Record<Mode, string | null>>(loadActiveSessions);
   const [query, setQuery] = useState("");
-  // 窗口 <980px 时 aside 变浮层,默认收起避免遮挡主区;用户可用顶栏按钮展开
-  const [asideOpen, setAsideOpen] = useState(() => window.innerWidth >= 980);
-  const [asideTab, setAsideTab] = useState<"candidates" | "tasks" | "preview">("candidates");
   const [preview, setPreview] = useState<Preview>(null);
   const [candidates, setCandidates] = useState<MemoryCandidate[]>([]);
   const [online, setOnline] = useState(true);
   const [showArchived, setShowArchived] = useState(false);
-  const [renaming, setRenaming] = useState<{ id: string; title: string } | null>(null);
-  // 窗口 <720px 时 rail 变浮层,默认收起避免遮挡主区;顶栏按钮展开
-  const [railOpen, setRailOpen] = useState(() => window.innerWidth >= 720);
+  const [renaming, setRenaming] = useState<RenameState | null>(null);
 
-  // 预览入口:记录内容并自动展开 aside 切到预览 tab
+  // ---- 布局状态 ----
+  // 宽窗口:侧栏停靠(展开 / 收起为窄栏),开关持久化;窄窗口:窄栏常驻,展开为浮层、不持久化。
+  const sideOverlay = useMediaQuery(SIDE_OVERLAY_QUERY);
+  const inspectorOverlay = useMediaQuery(INSPECTOR_OVERLAY_QUERY);
+  const [sideDocked, setSideDocked] = usePersistentState<boolean>(SIDE_KEY, true, isBoolean);
+  const [sideFloating, setSideFloating] = useState(false);
+  const sideOpen = sideOverlay ? sideFloating : sideDocked;
+  const setSideOpen = (open: boolean) => (sideOverlay ? setSideFloating(open) : setSideDocked(open));
+  // 检查器默认收起,点击工具卡片/代码块等预览入口时自动滑出
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTabId>("preview");
+
+  // 窗口跨越断点时收起浮层,避免停靠态与浮层态同时出现
+  useEffect(() => {
+    setSideFloating(false);
+  }, [sideOverlay]);
+
+  // 搜索聚焦请求:Ctrl+K 或窄栏搜索按钮 → 展开侧栏并聚焦搜索框
+  const [searchRequested, setSearchRequested] = useState(false);
+  const onSearchFocused = useCallback(() => setSearchRequested(false), []);
+  const requestSearch = () => {
+    setSideOpen(true);
+    setSearchRequested(true);
+  };
+
+  useHotkey("b", () => setSideOpen(!sideOpen), { mod: true });
+  useHotkey("j", () => setInspectorOpen((v) => !v), { mod: true });
+  useHotkey("k", requestSearch, { mod: true });
+  useHotkey("1", () => changeMode("chat"), { mod: true });
+  useHotkey("2", () => changeMode("work"), { mod: true });
+  useHotkey("3", () => changeMode("code"), { mod: true });
+
+  const openInspector = (tab: InspectorTabId) => {
+    setInspectorTab(tab);
+    setInspectorOpen(true);
+  };
+
+  // 预览入口:记录内容并自动展开检查器切到预览 tab
   const showPreview = (p: Preview) => {
     setPreview(p);
-    setAsideTab("preview");
-    setAsideOpen(true);
+    openInspector("preview");
   };
 
   useEffect(() => applyTheme(loadTheme()), []);
@@ -120,11 +165,18 @@ export function App() {
     await refresh();
     setByMode((prev) => ({ ...prev, [mode]: s.id }));
     setPage("main");
+    setSideFloating(false);
   };
 
   const activeId = byMode[mode];
   // 渲染前校验模式匹配:槽位指向其它模式的会话时按无效处理。
   const active = sessions.find((s) => s.id === activeId && s.mode === mode) ?? null;
+
+  const selectSession = (s: SessionMeta) => {
+    setByMode((prev) => ({ ...prev, [mode]: s.id }));
+    setPage("main");
+    setSideFloating(false);
+  };
 
   const saveRename = async () => {
     if (!renaming) return;
@@ -165,157 +217,191 @@ export function App() {
     setPage("main");
   };
 
+  // 模式分段控件:切换模式并回到主区;各模式的活动会话由 byMode 分别记住
+  function changeMode(m: Mode) {
+    setMode(m);
+    setPage("main");
+  }
+
+  const openPage = (p: Exclude<Page, "main">) => {
+    setPage(p);
+    setSideFloating(false);
+  };
+
+  const meta = MODE_META[mode];
+  const headerTitle =
+    page === "settings" ? "设置" : page === "memory" ? "记忆管理" : (active?.title ?? `${meta.label} 工作台`);
+
+  const emptyMain = (
+    <EmptyState
+      icon={meta.icon}
+      title={`新建或选择一个 ${meta.label} 会话开始`}
+      description={meta.hint}
+      action={
+        <div className="flex items-center gap-2">
+          <Button variant="primary" size="md" onClick={() => void newSession()}>
+            <Plus size={14} strokeWidth={2} />
+            新会话
+          </Button>
+          <span className="flex items-center gap-1 text-2xs text-subtle">
+            <Kbd>Ctrl</Kbd>
+            <Kbd>K</Kbd>
+            搜索会话
+          </span>
+        </div>
+      }
+    />
+  );
+
+  const mainContent =
+    page === "settings" ? (
+      legacy(<SettingsPage />)
+    ) : page === "memory" ? (
+      legacy(<MemoryPage onChanged={refreshCandidates} />)
+    ) : !online ? (
+      <EmptyState
+        icon={WifiOff}
+        title="Server 未连接"
+        description="操作暂不可用。请确认本地服务已启动(默认 127.0.0.1:3777)。"
+      />
+    ) : !loaded ? (
+      <EmptyState icon={LoaderCircle} spin title="加载中…" />
+    ) : !active ? (
+      emptyMain
+    ) : mode === "work" ? (
+      legacy(<WorkPage session={active} onSessionChanged={refresh} />)
+    ) : mode === "code" ? (
+      legacy(<CodePage session={active} onSessionChanged={refresh} />)
+    ) : (
+      legacy(
+        <ChatPage
+          key={active.id}
+          session={active}
+          onBranch={(mid) => void branchTo(active.id, mid)}
+          onPreview={showPreview}
+          onNewSession={() => void newSession()}
+          onCandidatesChanged={refreshCandidates}
+        />,
+      )
+    );
+
+  const inspectorTabs: Array<InspectorTab<InspectorTabId>> = [
+    {
+      id: "preview",
+      label: "预览",
+      icon: Eye,
+      content: (
+        <div className="legacy">
+          <PreviewPanel preview={preview} />
+        </div>
+      ),
+    },
+    {
+      id: "tasks",
+      label: "子任务",
+      icon: ListTodo,
+      // 只在当前模式的活动会话有效时绑定 sessionId/mode/workspace,否则仅传当前 mode 用于预设文案。
+      content: (
+        <div className="legacy">
+          <TasksPanel sessionId={active?.id ?? null} mode={active?.mode ?? mode} workspace={active?.workspace ?? ""} />
+        </div>
+      ),
+    },
+    {
+      id: "candidates",
+      label: "候选",
+      icon: Brain,
+      badge: candidates.length,
+      content: (
+        <CandidateList candidates={candidates} onResolve={resolveCandidate} onOpenMemory={() => setPage("memory")} />
+      ),
+    },
+  ];
+
   return (
-    <div className="shell">
-      <header className="topbar">
-        {!railOpen && (
-          <button className="icon" onClick={() => setRailOpen(true)} title="展开会话栏">⇥</button>
-        )}
-        <span className="brand">XiyunAgent</span>
-        <nav className="mode-switch">
-          {MODES.map((m) => (
-            <button key={m} className={m === mode ? "active" : ""} onClick={() => { setMode(m); setPage("main"); }}>
-              {MODE_LABEL[m]}
-            </button>
-          ))}
-        </nav>
-        <span className="status">
-          <i className={`dot${online ? "" : " err"}`} />
-          {online ? "已连接" : "Server 未连接"}
-        </span>
-        <span className="spacer" />
-        <button onClick={() => setPage("memory")} title="记忆管理">
-          记忆{candidates.length > 0 ? `(${candidates.length})` : ""}
-        </button>
-        <button onClick={() => setPage("settings")} title="设置">设置</button>
-        <button className="icon" onClick={() => setAsideOpen(!asideOpen)} title={asideOpen ? "收起侧栏" : "展开侧栏"}>
-          {asideOpen ? "⇥" : "⇤"}
-        </button>
-      </header>
-      <div className="shell-body">
-        {railOpen && <div className="rail-scrim" onClick={() => setRailOpen(false)} />}
-        <aside className={`rail${railOpen ? " open" : ""}`}>
-          <div className="rail-head">
-            <span className="rail-title">{MODE_LABEL[mode]} 会话</span>
-            <button className="icon rail-close" onClick={() => setRailOpen(false)} title="收起会话栏">⇤</button>
-          </div>
-          <button className="primary" onClick={() => void newSession()}>新会话</button>
-          <input placeholder="搜索会话" value={query} onChange={(e) => setQuery(e.target.value)} />
-          <button
-            className={showArchived ? "active" : ""}
-            style={{ fontSize: 12, color: showArchived ? undefined : "var(--muted)" }}
-            onClick={() => setShowArchived(!showArchived)}
-          >
-            {showArchived ? "← 返回会话列表" : "已归档会话"}
-          </button>
-          {visible.map((s) =>
-            renaming?.id === s.id ? (
-              <input
-                key={s.id}
-                autoFocus
-                value={renaming.title}
-                onChange={(e) => setRenaming({ id: s.id, title: e.target.value })}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void saveRename();
-                  if (e.key === "Escape") setRenaming(null);
-                }}
-                onBlur={() => void saveRename()}
-              />
-            ) : (
-              <div key={s.id} className={`session-item${s.id === activeId ? " active" : ""}`} role="button" tabIndex={0}
-                onClick={() => { setByMode((prev) => ({ ...prev, [mode]: s.id })); setPage("main"); }}
-                onKeyDown={(e) => e.key === "Enter" && (setByMode((prev) => ({ ...prev, [mode]: s.id })), setPage("main"))}
-                title={s.title}
-              >
-                <span className="session-title">{s.title}</span>
-                <span className="session-actions" onClick={(e) => e.stopPropagation()}>
-                  <button title="重命名" onClick={() => setRenaming({ id: s.id, title: s.title })}>✎</button>
-                  {showArchived ? (
-                    <button title="恢复" onClick={() => void archiveSession(s, false)}>↩</button>
-                  ) : (
-                    <button title="归档" onClick={() => void archiveSession(s, true)}>▤</button>
-                  )}
-                  <button title="删除" onClick={() => void deleteSession(s)}>✕</button>
-                </span>
-              </div>
-            ),
-          )}
-          {visible.length === 0 && <span style={{ color: "var(--muted)", fontSize: 12 }}>无匹配会话</span>}
-        </aside>
-        <main className="main">
-          {page === "settings" ? (
-            <SettingsPage />
-          ) : page === "memory" ? (
-            <MemoryPage onChanged={refreshCandidates} />
-          ) : !online ? (
-            <div className="empty">Server 未连接,操作不可用。请确认本地服务已启动。</div>
-          ) : !loaded ? (
-            <div className="empty">加载中…</div>
-          ) : mode === "work" ? (
-            active ? (
-              <WorkPage session={active} onSessionChanged={refresh} />
-            ) : (
-              <div className="empty">新建或选择一个 Work 会话开始。</div>
-            )
-          ) : mode === "code" ? (
-            active ? (
-              <CodePage session={active} onSessionChanged={refresh} />
-            ) : (
-              <div className="empty">新建或选择一个 Code 会话开始。</div>
-            )
-          ) : active ? (
-            <ChatPage
-              key={active.id}
-              session={active}
-              onBranch={(mid) => void branchTo(active.id, mid)}
-              onPreview={showPreview}
-              onNewSession={() => void newSession()}
-              onCandidatesChanged={refreshCandidates}
-            />
-          ) : (
-            <div className="empty">新建或选择一个 Chat 会话开始。</div>
-          )}
-        </main>
-        {asideOpen && (
-          <aside className="aside">
-            <div className="aside-tabs">
-              <button className={asideTab === "candidates" ? "active" : ""} onClick={() => setAsideTab("candidates")}>
-                候选({candidates.length})
-              </button>
-              <button className={asideTab === "tasks" ? "active" : ""} onClick={() => setAsideTab("tasks")}>
-                子任务
-              </button>
-              <button className={asideTab === "preview" ? "active" : ""} onClick={() => setAsideTab("preview")}>
-                预览
-              </button>
-            </div>
-            {asideTab === "preview" ? (
-              <PreviewPanel preview={preview} />
-            ) : asideTab === "tasks" ? (
-              // 只在当前模式的活动会话有效时绑定 sessionId/mode/workspace,否则仅传当前 mode 用于预设文案。
-              <TasksPanel
-                sessionId={active?.id ?? null}
-                mode={active?.mode ?? mode}
-                workspace={active?.workspace ?? ""}
-              />
-            ) : (
-              <>
-                {candidates.length === 0 && <span style={{ color: "var(--muted)", fontSize: 12 }}>对话中产生的候选记忆会出现在这里。</span>}
-                {candidates.slice(0, 8).map((c) => (
-                  <div className="cand" key={c.id}>
-                    <div>{c.content}</div>
-                    <div className="reason">{c.reason || "提取自对话"} · 置信度 {c.confidence.toFixed(2)}</div>
-                    <div className="row">
-                      <button className="primary" onClick={() => void resolveCandidate(c.id, "confirm")}>确认</button>
-                      <button onClick={() => void resolveCandidate(c.id, "reject")}>忽略</button>
-                    </div>
-                  </div>
-                ))}
-              </>
-            )}
-          </aside>
-        )}
-      </div>
-    </div>
+    <Workbench
+      rail={
+        <SideRail
+          mode={mode}
+          page={page}
+          pendingCandidates={candidates.length}
+          onExpand={() => setSideOpen(true)}
+          onModeChange={changeMode}
+          onNew={() => void newSession()}
+          onSearch={requestSearch}
+          onOpenPage={openPage}
+        />
+      }
+      sidebar={
+        <Sidebar
+          mode={mode}
+          page={page}
+          pendingCandidates={candidates.length}
+          query={query}
+          focusSearch={searchRequested}
+          showArchived={showArchived}
+          sessionCount={visible.length}
+          hasMore={hasMore}
+          list={{
+            sessions: visible,
+            activeId: page === "main" ? activeId : null,
+            loaded,
+            renaming,
+            emptyText: query
+              ? "无匹配会话"
+              : showArchived
+                ? "没有已归档的会话"
+                : `还没有 ${meta.label} 会话`,
+            onSelect: selectSession,
+            onRenameStart: (s) => setRenaming({ id: s.id, title: s.title }),
+            onRenameChange: (title) => setRenaming((r) => (r ? { ...r, title } : r)),
+            onRenameCommit: () => void saveRename(),
+            onRenameCancel: () => setRenaming(null),
+            onArchive: (s, archived) => void archiveSession(s, archived),
+            onDelete: (s) => void deleteSession(s),
+            onLoadMore: () => void loadMore(),
+          }}
+          onModeChange={changeMode}
+          onOpenPage={openPage}
+          onNew={() => void newSession()}
+          onQueryChange={setQuery}
+          onToggleArchived={() => setShowArchived(!showArchived)}
+          onCollapse={() => setSideOpen(false)}
+          onSearchFocused={onSearchFocused}
+        />
+      }
+      sideOpen={sideOpen}
+      sideOverlay={sideOverlay}
+      onSideClose={() => setSideOpen(false)}
+      inspector={
+        <Inspector
+          tabs={inspectorTabs}
+          active={inspectorTab}
+          onActiveChange={setInspectorTab}
+          onClose={() => setInspectorOpen(false)}
+        />
+      }
+      inspectorOpen={inspectorOpen}
+      inspectorOverlay={inspectorOverlay}
+      onInspectorClose={() => setInspectorOpen(false)}
+      statusBar={
+        <StatusBar
+          online={online}
+          mode={mode}
+          workspace={page === "main" ? active?.workspace : undefined}
+          pendingCandidates={candidates.length}
+          onOpenCandidates={() => openInspector("candidates")}
+        />
+      }
+    >
+      <StreamHeader
+        title={headerTitle}
+        badge={page === "main" && active ? meta.label : undefined}
+        workspace={page === "main" ? active?.workspace : undefined}
+        inspectorOpen={inspectorOpen}
+        onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
+      />
+      {mainContent}
+    </Workbench>
   );
 }
