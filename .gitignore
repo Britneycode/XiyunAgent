@@ -8,6 +8,15 @@ DECISIONS.md
 RISKS.md
 history/
 
+# Superpowers SDD 计划工作区（ledger、brief、review 包）
+.superpowers/
+
+# 本地工具产物与临时工作区（验收截图、浏览器会话、未完成的改造草稿）
+.claude/
+.playwright-mcp/
+.tailwind-wip/
+docs/superpowers/plans/
+
 # Node / build
 node_modules/
 dist/
