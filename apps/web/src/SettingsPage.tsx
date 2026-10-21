@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import type { ModelRole, ProviderConfig, SkillInfo } from "@xiyun/shared";
+import type { ModelRole, ProviderConfig, ProviderProtocol, SkillInfo } from "@xiyun/shared";
 import { api } from "./api.ts";
+import {
+  applyPreset, emptyForm, formFrom, mergeModelIds, PRESETS, PROTOCOL_OPTIONS, toConfig, type ProviderForm,
+} from "./settings/providerForm.ts";
 import {
   allPresets, applyTheme, exportThemePackage, importThemePackage, loadTheme, resetTheme, saveTheme,
   type ThemeSettings,
@@ -91,15 +94,24 @@ function AppearanceSection() {
 
 function ProvidersSection() {
   const [providers, setProviders] = useState<Awaited<ReturnType<typeof api.providers>>>([]);
-  const [draft, setDraft] = useState<ProviderConfig>({ id: "", name: "", baseUrl: "", apiKey: "", model: "", roles: ["main"], capabilities: ["stream"] });
+  const [form, setForm] = useState<ProviderForm>(emptyForm);
   const [probe, setProbe] = useState<Record<string, string>>({});
+  const [fetchNote, setFetchNote] = useState("");
+  const { draft } = form;
+  const setDraft = (d: ProviderConfig) => setForm((f) => ({ ...f, draft: d }));
+  const params = draft.params ?? {};
+  const setParam = (k: keyof NonNullable<ProviderConfig["params"]>, v: unknown) =>
+    setDraft({ ...draft, params: { ...params, [k]: v === "" || v === undefined ? undefined : v } });
+  const protocol = PROTOCOL_OPTIONS.find((o) => o.id === (draft.protocol ?? "openai")) ?? PROTOCOL_OPTIONS[0]!;
+  const saved = providers.some((p) => p.id === draft.id);
 
   useEffect(() => { void api.providers().then(setProviders); }, []);
 
   const saveProvider = async () => {
-    await api.saveProvider({ ...draft, id: draft.id || crypto.randomUUID() });
+    await api.saveProvider(toConfig(form));
     setProviders(await api.providers());
-    setDraft({ id: "", name: "", baseUrl: "", apiKey: "", model: "", roles: ["main"], capabilities: ["stream"] });
+    setForm(emptyForm());
+    setFetchNote("");
   };
 
   const doProbe = async (id: string) => {
@@ -112,16 +124,34 @@ function ProvidersSection() {
     }
   };
 
+  // 用已保存的 Key 向服务商拉取模型列表,合并进"模型列表"
+  const fetchModels = async () => {
+    setFetchNote("获取中…");
+    try {
+      const r = await api.providerModels(draft.id);
+      const merged = mergeModelIds(form.modelsText, r.models);
+      setForm((f) => ({ ...f, modelsText: merged.text }));
+      setFetchNote(`共 ${r.models.length} 个,新增 ${merged.added} 个`);
+    } catch (e) {
+      setFetchNote(e instanceof Error ? e.message : "获取失败");
+    }
+  };
+
+  const area = { width: "100%", minHeight: 64, fontFamily: "var(--font-mono, monospace)", fontSize: 12 } as const;
+
   return (
     <>
       <h2>模型</h2>
       {providers.map((p) => (
         <div key={p.id} style={{ marginBottom: 10 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <span style={{ flex: 1 }}>{p.name || "(未命名)"}({p.model})[{p.roles?.join(",") || "无角色"}]</span>
+            <span style={{ flex: 1 }}>
+              {p.active ? "★ " : ""}{p.name || "(未命名)"}({PROTOCOL_OPTIONS.find((o) => o.id === (p.protocol ?? "openai"))?.label} · {p.model}
+              {(p.models?.length ?? 0) > 1 ? ` 等 ${p.models!.length} 个模型` : ""})[{p.roles?.join(",") || "无角色"}]
+            </span>
             <button onClick={() => void api.activateProvider(p.id).then(api.providers).then(setProviders)}>设为默认</button>
             <button onClick={() => void doProbe(p.id)}>探测</button>
-            <button onClick={() => setDraft({ ...p, apiKey: "" })}>编辑</button>
+            <button onClick={() => { setForm(formFrom(p)); setFetchNote(""); }}>编辑</button>
             <button onClick={() => void api.deleteProvider(p.id).then(api.providers).then(setProviders)}>删除</button>
           </div>
           {(probe[p.id] || (p.capabilities?.length ?? 0) > 0) && (
@@ -132,12 +162,57 @@ function ProvidersSection() {
           )}
         </div>
       ))}
+      <h3 style={{ marginBottom: 0 }}>{draft.id && saved ? `编辑 ${draft.name || "Provider"}` : "添加 Provider"}</h3>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", margin: "8px 0", fontSize: 12 }}>
+        <span style={{ color: "var(--muted)" }}>预设:</span>
+        {PRESETS.map((pr) => (
+          <button key={pr.name} onClick={() => setForm((f) => applyPreset(f, pr))}>{pr.name}</button>
+        ))}
+      </div>
       <label>名称 <input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} /></label>
-      <label>Base URL <input value={draft.baseUrl} placeholder="https://api.openai.com/v1"
+      <label>协议
+        <select value={protocol.id} onChange={(e) => setDraft({ ...draft, protocol: e.target.value as ProviderProtocol })}>
+          {PROTOCOL_OPTIONS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+        </select>
+      </label>
+      <label>Base URL <input value={draft.baseUrl} placeholder={protocol.placeholder}
         onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} /></label>
-      <label>API Key <input type="password" value={draft.apiKey} placeholder="留空则保留原 Key"
+      <label>API Key <input type="password" value={draft.apiKey} placeholder={saved ? "留空则保留原 Key" : ""}
         onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })} /></label>
-      <label>模型 <input value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} /></label>
+      <label>默认模型 <input value={draft.model} placeholder="留空取模型列表第一项" onChange={(e) => setDraft({ ...draft, model: e.target.value })} /></label>
+      <div style={{ margin: "var(--pad) 0" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ flex: 1 }}>模型列表<span style={{ fontSize: 12, color: "var(--muted)" }}>(每行:模型 id [上下文如 128k] [vision/tools/json])</span></span>
+          <button disabled={!saved} title={saved ? "用已保存的 Key 获取" : "先保存再获取"} onClick={() => void fetchModels()}>获取模型列表</button>
+        </div>
+        <textarea style={area} value={form.modelsText} placeholder={"gpt-4o 128k vision tools\ngpt-4o-mini 128k"}
+          onChange={(e) => setForm((f) => ({ ...f, modelsText: e.target.value }))} />
+        {fetchNote && <div style={{ fontSize: 12, color: "var(--muted)" }}>{fetchNote}</div>}
+      </div>
+      <label>上下文长度(默认) <input type="number" style={{ width: 235 }} min={0} value={draft.contextLength ?? ""} placeholder="未填则不显示上下文占比"
+        onChange={(e) => setDraft({ ...draft, contextLength: e.target.value ? Number(e.target.value) : undefined })} /></label>
+      <label>温度 <input type="number" style={{ width: 235 }} step={0.1} min={0} max={2} value={params.temperature ?? ""} placeholder="服务商默认"
+        onChange={(e) => setParam("temperature", e.target.value === "" ? undefined : Number(e.target.value))} /></label>
+      <label>单次回复上限(tokens) <input type="number" style={{ width: 235 }} min={1} value={params.maxTokens ?? ""} placeholder={protocol.id === "anthropic" ? "默认 8192" : "服务商默认"}
+        onChange={(e) => setParam("maxTokens", e.target.value === "" ? undefined : Number(e.target.value))} /></label>
+      <label>思考强度
+        <select value={params.reasoningEffort ?? ""} onChange={(e) => setParam("reasoningEffort", e.target.value || undefined)}>
+          <option value="">默认(不指定)</option>
+          <option value="low">低</option>
+          <option value="medium">中</option>
+          <option value="high">高</option>
+        </select>
+      </label>
+      <details style={{ margin: "var(--pad) 0" }}>
+        <summary>高级:附加请求头 / 查询参数</summary>
+        <div style={{ fontSize: 12, color: "var(--muted)", margin: "6px 0" }}>
+          值中的 {"{apiKey}"} 会替换为上面的 API Key;自定义了鉴权头时不再发送默认鉴权头。Azure 例:请求头 api-key: {"{apiKey}"},查询参数 api-version=2024-10-21
+        </div>
+        <div>请求头(每行 Name: value)</div>
+        <textarea style={area} value={form.headersText} onChange={(e) => setForm((f) => ({ ...f, headersText: e.target.value }))} />
+        <div>查询参数(每行 key=value)</div>
+        <textarea style={area} value={form.queryText} onChange={(e) => setForm((f) => ({ ...f, queryText: e.target.value }))} />
+      </details>
       <label>角色标签
         <span style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {ROLES.map((r) => (
@@ -151,7 +226,7 @@ function ProvidersSection() {
           ))}
         </span>
       </label>
-      <label>能力标签
+      <label>能力标签(默认)
         <span style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {CAPABILITIES.map((cap) => (
             <span key={cap}>
@@ -164,7 +239,10 @@ function ProvidersSection() {
           ))}
         </span>
       </label>
-      <button className="primary" onClick={() => void saveProvider()}>保存 Provider</button>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button className="primary" onClick={() => void saveProvider()}>保存 Provider</button>
+        {draft.id && <button onClick={() => { setForm(emptyForm()); setFetchNote(""); }}>取消编辑</button>}
+      </div>
     </>
   );
 }

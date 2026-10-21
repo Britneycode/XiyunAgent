@@ -6,7 +6,7 @@ export type StreamEvent =
   | { type: "block_delta"; id: string; delta: string }
   | { type: "block_end"; id: string; block: ChatBlock }
   | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
-  | { type: "meta"; userMessageId: number | null; runId?: string } // 首个事件:本轮 user 消息的落库 id 与后台运行 id
+  | { type: "meta"; userMessageId: number | null; runId?: string; model?: string | null } // 首个事件:本轮 user 消息的落库 id、后台运行 id 与所用模型
   | { type: "cancelled"; messageId: number | null; userMessageId: number | null } // 被停止:半截已落库(无内容时 messageId 为 null)
   | { type: "title"; title: string } // 新会话自动命名完成(模型起的标题)
   | { delta: string; id?: string }
@@ -91,9 +91,10 @@ export const api = {
   cancelTask: (id: string) => req(`/tasks/${id}/cancel`, { method: "POST" }),
   retryTask: (id: string) => req(`/tasks/${id}/retry`, { method: "POST" }),
   resumeTask: (id: string, answer: string) => req(`/tasks/${id}/resume`, { method: "POST", body: JSON.stringify({ answer }) }),
+  providerModels: (id: string) => req<{ models: string[] }>(`/providers/${id}/models`),
   probeProvider: (id: string) => req<{ ok: boolean; latencyMs: number; model: string; error?: string }>(`/providers/${id}/probe`, { method: "POST" }),
   // ---- 阶段 4:工具 ----
-  updateSession: (id: string, b: { workspace?: string; title?: string; archived?: boolean }) =>
+  updateSession: (id: string, b: { workspace?: string; title?: string; archived?: boolean; providerId?: string | null; model?: string | null }) =>
     req(`/sessions/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   shells: () => req<ShellInfo[]>("/tools/shells"),
   toolShell: (b: { workspace: string; command: string; shell?: string; confirmed?: boolean }) =>
@@ -263,7 +264,7 @@ export async function streamChat(
   signal?: AbortSignal,
   regenerate = false,
   // opts.onEvent 不为空时,所有事件原样透传(含块事件);否则退回旧 onDelta 行为
-  opts?: { onEvent?: (ev: StreamEvent) => void; context?: string; refs?: RefPayload[] },
+  opts?: { onEvent?: (ev: StreamEvent) => void; context?: string; refs?: RefPayload[]; providerId?: string; model?: string },
 ): Promise<void> {
   const post = () =>
     fetch(`${base}/chat`, {
@@ -274,6 +275,8 @@ export async function streamChat(
         sessionId, message, regenerate,
         context: opts?.context,
         refs: opts?.refs,
+        providerId: opts?.providerId,
+        model: opts?.model,
       }),
       signal: signal ?? null,
     });

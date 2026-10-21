@@ -225,7 +225,7 @@ describe("/chat 块协议", () => {
     const s = await session(app);
     const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "hi" })).text());
     const ids = db.prepare("SELECT id, role FROM messages ORDER BY id").all() as Array<{ id: number; role: string }>;
-    expect(evs[0]).toEqual({ type: "meta", userMessageId: ids[0]!.id, runId: expect.any(String) });
+    expect(evs[0]).toEqual({ type: "meta", userMessageId: ids[0]!.id, runId: expect.any(String), model: expect.anything() });
     expect(evs.at(-1)).toEqual({ done: true, messageId: ids[1]!.id, userMessageId: ids[0]!.id });
   });
 

@@ -30,7 +30,8 @@ import { loadDraft, saveDraft } from "./drafts.ts";
 import { cn } from "../ui/cn.ts";
 import { Highlight, MenuGroupLabel, MenuItem, MenuList, PopoverSurface, useActiveIndex } from "../ui/menu.tsx";
 import { Button, IconButton, Kbd, StatusDot } from "../ui/primitives.tsx";
-import { ModelPicker, type ProviderOption } from "./ModelPicker.tsx";
+import { ModelPicker } from "./ModelPicker.tsx";
+import { resolveOption, type ModelOption } from "./modelOptions.ts";
 import { TokenMeter } from "./TokenMeter.tsx";
 import { contextBaseline, estimateTokens } from "./tokens.ts";
 import type { UIMessage } from "./useChatStream.ts";
@@ -119,7 +120,9 @@ export function Composer(props: {
   onNewSession?: () => void;
   onCandidatesChanged?: () => void;
   onEditLast?: () => void; // 输入框为空时按 ↑ 编辑上一条消息
+  onSessionChanged?: () => void; // 会话模型改动后刷新会话列表
   messages: UIMessage[];
+  models: { options: ModelOption[]; globalId: string };
 }) {
   // 草稿按会话恢复(Composer 随会话切换重新挂载)
   const [draft] = useState(() => loadDraft(props.session.id));
@@ -130,8 +133,8 @@ export function Composer(props: {
   const [docs, setDocs] = useState<WorkDoc[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const [sourceNote, setSourceNote] = useState("");
-  const [providers, setProviders] = useState<ProviderOption[]>([]);
-  const [activeId, setActiveId] = useState("");
+  // 会话级模型(M3):本地先行更新,PATCH 后刷新会话列表
+  const [sel, setSel] = useState({ providerId: props.session.providerId ?? null, model: props.session.model ?? null });
   const [note, setNote] = useState<{ text: string; tone: "info" | "err" } | null>(null);
   const [focused, setFocused] = useState(false);
 
@@ -189,30 +192,15 @@ export function Composer(props: {
     el.setSelectionRange(end, end);
   }, [props.editingId]);
 
-  // ---- 全局模型 ----
-  useEffect(() => {
-    void api
-      .providers()
-      .then((ps) => {
-        setProviders(
-          ps.map((p) => ({
-            id: p.id,
-            name: p.name,
-            model: p.model,
-            baseUrl: p.baseUrl,
-            contextLength: p.contextLength,
-            capabilities: p.capabilities,
-          })),
-        );
-        // 以服务端 active 为准,刷新后下拉与实际生效的 Provider 保持一致
-        setActiveId(ps.find((p) => p.active)?.id ?? ps[0]?.id ?? "");
-      })
-      .catch(() => {});
-  }, []);
-
-  const switchModel = async (id: string) => {
-    setActiveId(id);
-    await api.activateProvider(id).catch(() => {});
+  // ---- 会话模型 ----
+  const { options, globalId } = props.models;
+  const resolved = resolveOption(options, globalId, sel);
+  const globalOption = resolveOption(options, globalId, {}).option;
+  const switchModel = async (o: ModelOption | null) => {
+    const next = o ? { providerId: o.providerId, model: o.model } : { providerId: null, model: null };
+    setSel(next);
+    await api.updateSession(props.session.id, next).catch(() => {});
+    props.onSessionChanged?.();
   };
 
   // ---- `@` 引用源:菜单打开时并行拉取文件与文档,失败只减少一类结果 ----
@@ -522,7 +510,7 @@ export function Composer(props: {
   const baseline = useMemo(() => contextBaseline(props.messages), [props.messages]);
   const refsEstimate = useMemo(() => refs.reduce((n, r) => n + estimateTokens(r.excerpt), 0), [refs]);
   const draftEstimate = estimateTokens(value);
-  const contextLength = providers.find((p) => p.id === activeId)?.contextLength;
+  const contextLength = resolved.option?.contextLength;
 
   const canSend = value.trim().length > 0;
   const activeOptionId = menu && nav.index >= 0 ? `${menuId}-${nav.index}` : undefined;
@@ -751,10 +739,11 @@ export function Composer(props: {
           )}
           <span className="mx-1 h-4 w-px bg-line" aria-hidden />
           <ModelPicker
-            providers={providers}
-            activeId={activeId}
+            options={options}
+            value={resolved.followGlobal ? null : (resolved.option?.key ?? null)}
+            globalOption={globalOption}
             disabled={props.busy}
-            onSelect={(id) => void switchModel(id)}
+            onSelect={(o) => void switchModel(o)}
           />
           <span className="flex-1" />
           <TokenMeter

@@ -12,16 +12,66 @@ export type ModelRole =
   | "researcher"
   | "tutor";
 
+// 接口协议(M2 / D-021):openai = Chat Completions 兼容(含 Azure、各家网关);anthropic = Messages API;gemini = Gemini API
+export type ProviderProtocol = "openai" | "anthropic" | "gemini";
+
+// 同一个 Provider 下的一个可选模型;未填的上下文 / 能力沿用 Provider 级配置
+export interface ModelInfo {
+  id: string;
+  contextLength?: number;
+  capabilities?: string[];
+}
+
+export interface ModelParams {
+  temperature?: number;
+  maxTokens?: number; // 单次回复上限;anthropic 必填,缺省 8192
+  reasoningEffort?: "low" | "medium" | "high"; // openai: reasoning_effort;anthropic / gemini 换算成思考预算
+}
+
 export interface ProviderConfig {
   id: string;
   name: string;
   baseUrl: string;
   apiKey: string;
-  model: string;
+  protocol?: ProviderProtocol; // 缺省 openai(老配置)
+  model: string; // 默认模型
+  models?: ModelInfo[]; // 可选模型列表;默认模型不在其中时自动补到首位
   contextLength?: number;
   roles?: ModelRole[];
   // 能力标签(用户声明 + probe 验证):stream/tools/vision/json。空 = 未声明,按最低限度 stream 处理。
   capabilities?: string[];
+  // 附加请求头 / 查询参数(如 Azure 的 api-key、api-version);值里的 {apiKey} 在请求时替换为 API Key
+  headers?: Record<string, string>;
+  query?: Record<string, string>;
+  params?: ModelParams;
+}
+
+// Provider 的全部可选模型:默认模型在首位,继承 Provider 级上下文长度与能力
+export function modelsOf(c: Pick<ProviderConfig, "model" | "models" | "contextLength" | "capabilities">): ModelInfo[] {
+  const list: ModelInfo[] = [];
+  const seen = new Set<string>();
+  const push = (m: ModelInfo) => {
+    const id = m.id.trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    list.push({
+      id,
+      ...(m.contextLength ?? c.contextLength ? { contextLength: m.contextLength ?? c.contextLength } : {}),
+      ...(m.capabilities?.length || c.capabilities?.length ? { capabilities: m.capabilities?.length ? m.capabilities : c.capabilities } : {}),
+    });
+  };
+  // 默认模型若在列表里有单独的上下文 / 能力设置,以列表项为准
+  if (c.model) push(c.models?.find((m) => m?.id === c.model) ?? { id: c.model });
+  for (const m of c.models ?? []) if (m && typeof m.id === "string") push(m);
+  return list;
+}
+
+// 指定模型后的配置副本;模型不在列表里时回退默认模型
+export function withModel(c: ProviderConfig, model?: string | null): ProviderConfig {
+  const all = modelsOf(c);
+  const info = all.find((m) => m.id === model) ?? all[0];
+  if (!info) return c;
+  return { ...c, model: info.id, contextLength: info.contextLength, capabilities: info.capabilities };
 }
 
 export type ChatBlock =
@@ -59,6 +109,7 @@ export interface ChatMessage {
   aborted?: boolean;
   usage?: TokenUsage; // 仅 assistant;模型未返回 usage 时缺省
   error?: string; // 仅 assistant:生成出错时保留半截内容,附带错误信息
+  model?: string; // 仅 assistant:生成这条回复的模型(M3)
 }
 
 export interface Fact {
@@ -99,6 +150,9 @@ export interface SessionMeta {
   updatedAt?: string; // 最近活动时间(最后一条消息);老数据缺省时用 createdAt
   archived?: boolean;
   running?: boolean; // 服务端有运行中的生成(F1)
+  // 会话级模型(M3):都为空 = 跟随全局默认;providerId 指向已删除的 Provider 时同样回退全局
+  providerId?: string | null;
+  model?: string | null;
 }
 
 // 消息全文搜索命中(M7);snippet 中命中词用 \u0001 / \u0002 包住,由前端转成高亮

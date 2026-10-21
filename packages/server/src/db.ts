@@ -64,6 +64,14 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
       INSERT INTO messages_fts(rowid, content, session_id) SELECT id, content, session_id FROM messages;
     `);
   },
+  // v10:会话级模型 sessions.provider_id / model(NULL = 跟随全局);messages.model(生成该回复的模型)
+  (db) => {
+    const sc = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!sc.includes("provider_id")) db.exec("ALTER TABLE sessions ADD COLUMN provider_id TEXT");
+    if (!sc.includes("model")) db.exec("ALTER TABLE sessions ADD COLUMN model TEXT");
+    const mc = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!mc.includes("model")) db.exec("ALTER TABLE messages ADD COLUMN model TEXT");
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

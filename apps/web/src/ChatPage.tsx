@@ -10,6 +10,8 @@ import { StreamingMarkdown } from "./chat/StreamingMarkdown.tsx";
 import { formatTokens, messageTokens, MESSAGE_OVERHEAD } from "./chat/tokens.ts";
 import { UsageBadge } from "./chat/UsageBadge.tsx";
 import { useFocusRequest } from "./chat/focus.ts";
+import { ModelPicker } from "./chat/ModelPicker.tsx";
+import { useModelOptions, type ModelOption } from "./chat/modelOptions.ts";
 import { useChatStream, type UIMessage } from "./chat/useChatStream.ts";
 import { useStickToBottom } from "./chat/useStickToBottom.ts";
 import { MODE_META, type Mode } from "./layout/types.ts";
@@ -29,7 +31,8 @@ export interface ChatPageProps {
 
 // 消息项的操作经由 ref 传入,保持引用稳定,让历史消息在流式过程中跳过重渲染
 interface ItemActions {
-  regenerate: () => void;
+  regenerate: (override?: { providerId: string; model: string }) => void;
+  models?: ModelOption[]; // "换个模型重新生成"的候选
   startEdit: (id: number, content: string) => void;
   branch?: (id: number) => void;
   preview?: (p: Preview) => void;
@@ -59,12 +62,14 @@ const MessageItem = memo(function MessageItem({
   busy,
   editing,
   actions,
+  altModels = false,
 }: {
   m: UIMessage;
   isLast: boolean;
   busy: boolean;
   editing: boolean;
   actions: RefObject<ItemActions>;
+  altModels?: boolean; // 有多个模型可选:末条回复显示"换个模型重新生成"
 }) {
   if (m.role === "user") {
     const refs = (m.blocks ?? []).filter((b): b is RefBlock => b.kind === "ref");
@@ -149,7 +154,21 @@ const MessageItem = memo(function MessageItem({
                 <RotateCcw size={13} strokeWidth={1.75} />
               </IconButton>
             )}
+            {isLast && !busy && altModels && (
+              <ModelPicker
+                compact
+                options={actions.current?.models ?? []}
+                value={null}
+                disabled={busy}
+                onSelect={(o) => o && actions.current?.regenerate({ providerId: o.providerId, model: o.model })}
+              />
+            )}
           </div>
+          {m.model && (
+            <span className="ml-0.5 max-w-[180px] truncate px-1 font-mono text-2xs text-subtle" title={`生成模型:${m.model}`}>
+              {m.model}
+            </span>
+          )}
           {m.usage ? (
             <UsageBadge usage={m.usage} />
           ) : (
@@ -218,8 +237,9 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
     if (text) void send(text);
   };
 
+  const models = useModelOptions();
   const actions = useRef<ItemActions>({ regenerate, startEdit });
-  actions.current = { regenerate, startEdit, branch: onBranch, preview: onPreview };
+  actions.current = { regenerate, startEdit, branch: onBranch, preview: onPreview, models: models.options };
 
   // 复制快捷键的结果提示:底部浮出,1.6s 后消失
   const [toast, setToast] = useState<{ text: string; ok: boolean } | null>(null);
@@ -287,6 +307,7 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
                   busy={busy}
                   editing={editingId != null && m.id === editingId}
                   actions={actions}
+                  altModels={i === messages.length - 1 && models.options.length > 1}
                 />
               ))
             )}
@@ -347,7 +368,9 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
         onNewSession={onNewSession}
         onCandidatesChanged={onCandidatesChanged}
         onEditLast={editLast}
+        onSessionChanged={onSessionChanged}
         messages={messages}
+        models={models}
       />
     </div>
   );

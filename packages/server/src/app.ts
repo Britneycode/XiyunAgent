@@ -131,7 +131,7 @@ export function createApp(
   });
   // 连通性探测:发 1-token 请求验证 baseUrl/apiKey/model 可用,返回耗时。
   app.post("/providers/:id/probe", async (c) => {
-    const p = providers.probeProvider(c.req.param("id"));
+    const p = providers.probeProvider(c.req.param("id"), c.req.query("model"));
     if (!p) return c.json({ error: "provider not found" }, 404);
     const t0 = Date.now();
     try {
@@ -143,6 +143,18 @@ export function createApp(
       return c.json({ ok: true, latencyMs: Date.now() - t0, model: p.config.model });
     } catch (e) {
       return c.json({ ok: false, latencyMs: Date.now() - t0, error: e instanceof Error ? e.message : "probe failed" });
+    }
+  });
+
+  // 拉取服务商的模型列表(设置页"获取模型");失败返回可读错误
+  app.get("/providers/:id/models", async (c) => {
+    const p = providers.probeProvider(c.req.param("id"));
+    if (!p) return c.json({ error: "provider not found" }, 404);
+    if (!p.listModels) return c.json({ error: "该协议不支持获取模型列表" }, 400);
+    try {
+      return c.json({ models: (await p.listModels(AbortSignal.timeout(15_000))).sort() });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : "获取失败" }, 502);
     }
   });
 
@@ -168,6 +180,7 @@ export function createApp(
       id: r.id, title: r.title, mode: r.mode, workspace: r.workspace,
       createdAt: r.created_at, updatedAt: r.updated_at || r.created_at, archived: Number(r.archived) === 1,
       running: live.has(String(r.id)),
+      providerId: (r.provider_id as string | null) ?? null, model: (r.model as string | null) ?? null,
     }));
     // 兼容旧前端:无 limit 时返回数组;有 limit 时返回 { list, total, hasMore }
     return limit ? c.json({ list, total, hasMore: offset + rows.length < total }) : c.json(list);
@@ -220,10 +233,10 @@ export function createApp(
 
   app.get("/sessions/:id/messages", (c) => {
     const rows = db
-      .prepare("SELECT id, role, content, blocks, aborted, usage, error FROM messages WHERE session_id = ? ORDER BY id")
+      .prepare("SELECT id, role, content, blocks, aborted, usage, error, model FROM messages WHERE session_id = ? ORDER BY id")
       .all(c.req.param("id")) as unknown as Array<{
       id: number; role: string; content: string; blocks: string | null; aborted: number; usage: string | null;
-      error: string | null;
+      error: string | null; model: string | null;
     }>;
     return c.json(
       rows.map((r) => ({
@@ -234,6 +247,7 @@ export function createApp(
         aborted: r.aborted ? true : undefined,
         usage: parseUsage(r.usage),
         error: r.error ?? undefined,
+        model: r.model ?? undefined,
       })),
     );
   });
@@ -254,27 +268,31 @@ export function createApp(
     const sessionId = c.req.param("id");
     const body = (await c.req.json().catch(() => ({}))) as { messageId?: number; title?: string };
     const src = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
-      | { id: string; title: string; mode: string; workspace: string }
+      | { id: string; title: string; mode: string; workspace: string; provider_id: string | null; model: string | null }
       | undefined;
     if (!src) return c.json({ error: "session not found" }, 404);
     const maxId = typeof body.messageId === "number" ? body.messageId : Number.MAX_SAFE_INTEGER;
     const msgs = db
-      .prepare("SELECT role, content, blocks, aborted, usage, error, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
+      .prepare("SELECT role, content, blocks, aborted, usage, error, model, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
       .all(sessionId, maxId) as unknown as Array<{
       role: string; content: string; blocks: string | null; aborted: number; usage: string | null; error: string | null;
-      created_at: string;
+      model: string | null; created_at: string;
     }>;
     const nid = randomUUID();
     const title = (body.title?.trim() || `${src.title}(分支)`).slice(0, 80);
     const ts = now();
-    db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(
-      nid, title, src.mode, src.workspace, ts, ts,
+    // 分支沿用原会话的模型选择
+    db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, updated_at, provider_id, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
+      nid, title, src.mode, src.workspace, ts, ts, src.provider_id, src.model,
     );
     const ins = db.prepare(
-      "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
-    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.error, m.created_at);
-    return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts, updatedAt: ts });
+    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.error, m.model, m.created_at);
+    return c.json({
+      id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts, updatedAt: ts,
+      providerId: src.provider_id, model: src.model,
+    });
   });
 
   // ---- 消息全文搜索(M7):GET /search?q=&mode=&limit= ----
@@ -315,6 +333,8 @@ export function createApp(
       regenerate?: boolean;
       context?: string;
       refs?: Array<{ refType: "message" | "doc" | "file"; label: string; excerpt: string; path?: string }>;
+      providerId?: string; // 本次请求临时指定模型(如"换个模型重新生成"),优先于会话设置
+      model?: string;
     };
     if (!body.sessionId || typeof body.message !== "string" || !body.message.trim())
       return c.json({ error: "缺少 sessionId/message" }, 400);
@@ -327,12 +347,16 @@ export function createApp(
     const context = typeof body.context === "string" ? body.context : "";
     const refs = Array.isArray(body.refs) ? body.refs : [];
     const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
-      | { id: string; workspace: string; mode: string; title: string }
+      | { id: string; workspace: string; mode: string; title: string; provider_id: string | null; model: string | null }
       | undefined;
     if (!session) return c.json({ error: "session not found" }, 404);
-    // D1:激活 Provider 优先,角色兜底——模型下拉才能生效
-    const provider = opts?.chatProvider?.() ?? providers.activeProvider() ?? providers.registry().byRole("main");
+    // 模型优先级(M3 / D-021):请求指定 > 会话设置 > 全局激活(D-013)> main 角色兜底
+    const pick = typeof body.providerId === "string" && body.providerId
+      ? { id: body.providerId, model: body.model ?? null }
+      : { id: session.provider_id, model: session.model };
+    const provider = opts?.chatProvider?.() ?? providers.resolve(pick.id, pick.model) ?? providers.registry().byRole("main");
     if (!provider) return c.json({ error: "no provider configured" }, 400);
+    const modelName = provider.config.model || null; // 落到 assistant 消息上,前端气泡显示
     // 同一会话同时只允许一个生成(F1):先拦下,避免记忆工具等副作用
     const busyMsg = "该会话正在生成,请等待完成或先停止";
     if (runs.active(sessionId)?.status === "running") return c.json({ error: busyMsg }, 409);
@@ -456,7 +480,7 @@ export function createApp(
     const ac = run.ac;
     const send = (obj: unknown) => run.emit(obj);
     // 先下发已落库的 user 消息 id 与 runId:中断或出错时客户端也能立即编辑 / 分支,断线后可凭 runId 续订
-    send({ type: "meta", userMessageId, runId: run.id });
+    send({ type: "meta", userMessageId, runId: run.id, model: modelName });
     // 运行结束后 emit 自动忽略,标题晚到时只落库
     void titlePending?.then((title) => {
       if (title) send({ type: "title", title });
@@ -704,7 +728,7 @@ export function createApp(
           }
           const r = db
             .prepare(
-              "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?)",
             )
             .run(
               sessionId,
@@ -713,6 +737,7 @@ export function createApp(
               input.aborted ? 1 : 0,
               usage ? JSON.stringify(usage) : null,
               input.error ?? null,
+              modelName,
               now(),
             );
           db.exec("COMMIT");
@@ -859,9 +884,11 @@ export function createApp(
 
   // 修改会话:工作区(Code/Work 绑定项目目录)、标题重命名、归档开关;至少给一个字段
   app.patch("/sessions/:id", async (c) => {
-    const b = (await c.req.json().catch(() => ({}))) as { workspace?: string; title?: string; archived?: boolean };
+    const b = (await c.req.json().catch(() => ({}))) as {
+      workspace?: string; title?: string; archived?: boolean; providerId?: string | null; model?: string | null;
+    };
     const sets: string[] = [];
-    const vals: Array<string | number> = [];
+    const vals: Array<string | number | null> = [];
     if (typeof b.workspace === "string" && b.workspace.trim()) {
       sets.push("workspace = ?");
       vals.push(b.workspace.trim());
@@ -874,7 +901,12 @@ export function createApp(
       sets.push("archived = ?");
       vals.push(b.archived ? 1 : 0);
     }
-    if (sets.length === 0) return c.json({ error: "缺少 workspace/title/archived" }, 400);
+    // 会话级模型(M3):providerId 为 null 表示跟随全局,此时一并清空 model
+    if (b.providerId === null || (typeof b.providerId === "string" && b.providerId.trim())) {
+      sets.push("provider_id = ?", "model = ?");
+      vals.push(b.providerId ? b.providerId.trim() : null, b.providerId && typeof b.model === "string" && b.model.trim() ? b.model.trim() : null);
+    }
+    if (sets.length === 0) return c.json({ error: "缺少 workspace/title/archived/providerId" }, 400);
     const r = db
       .prepare(`UPDATE sessions SET ${sets.join(", ")} WHERE id = ?`)
       .run(...vals, c.req.param("id"));
@@ -1075,7 +1107,7 @@ export function createApp(
 
   app.get("/admin/export", (c) => {
     const sessions = db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>;
-    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, usage, error, created_at FROM messages ORDER BY id").all();
+    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, usage, error, model, created_at FROM messages ORDER BY id").all();
     const docs = db.prepare("SELECT * FROM docs ORDER BY created_at").all();
     const todos = db.prepare("SELECT * FROM todos ORDER BY created_at").all();
     const facts = db.prepare("SELECT * FROM facts WHERE deleted_at IS NULL ORDER BY valid_from").all();
@@ -1122,7 +1154,10 @@ export function createApp(
     const add = { sessions: 0, docs: 0, todos: 0, facts: 0, messages: 0 };
     try {
       db.exec("BEGIN");
-      const insSession = db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, archived, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      const insSession = db.prepare(
+        "INSERT INTO sessions (id, title, mode, workspace, created_at, archived, updated_at, provider_id, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      );
+      const str = (v: unknown) => (typeof v === "string" && v ? v : null);
       const hasSession = db.prepare("SELECT 1 FROM sessions WHERE id = ?");
       const sessionIds = new Set<string>();
       for (const r of (d.sessions ?? []) as Array<Record<string, unknown>>) {
@@ -1130,11 +1165,12 @@ export function createApp(
         sessionIds.add(r.id);
         if (hasSession.get(r.id)) { skip.sessions++; continue; }
         // 旧导出包没有 updated_at:先留空,消息导入后按最后一条消息回填
-        insSession.run(r.id, String(r.title ?? "导入会话"), String(r.mode ?? "chat"), String(r.workspace ?? ""), String(r.created_at ?? now()), r.archived ? 1 : 0, typeof r.updated_at === "string" ? r.updated_at : null);
+        // provider_id 在本机不存在时 /chat 自动回退全局模型
+        insSession.run(r.id, String(r.title ?? "导入会话"), String(r.mode ?? "chat"), String(r.workspace ?? ""), String(r.created_at ?? now()), r.archived ? 1 : 0, typeof r.updated_at === "string" ? r.updated_at : null, str(r.provider_id), str(r.model));
         add.sessions++;
       }
       const insMsg = db.prepare(
-        "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       );
       // 消息无稳定 id,重复导入同一导出包时按 (session_id, role, content, created_at) 去重,避免二次落库
       const hasMsg = db.prepare("SELECT 1 FROM messages WHERE session_id = ? AND role = ? AND content = ? AND created_at = ?");
@@ -1155,7 +1191,7 @@ export function createApp(
         // usage 同样只接受可解析的 JSON;旧导出包没有该字段
         const usageJson = typeof r.usage === "string" && parseUsage(r.usage) ? r.usage : null;
         const error = typeof r.error === "string" && r.error ? r.error.slice(0, 500) : null;
-        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, error, created);
+        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, error, str(r.model)?.slice(0, 200) ?? null, created);
         add.messages++;
       }
       db.exec(

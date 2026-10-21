@@ -56,7 +56,7 @@ describe("会话重命名/归档(PATCH /sessions/:id、GET /sessions)", () => {
     const s = await newSession(app, { title: "旧标题" });
     const res = await patch(app, s.id, { title: "   " });
     expect(res.status).toBe(400);
-    expect((await res.json()) as { error: string }).toMatchObject({ error: "缺少 workspace/title/archived" });
+    expect((await res.json()) as { error: string }).toMatchObject({ error: "缺少 workspace/title/archived/providerId" });
     expect((await list(app))[0]?.title).toBe("旧标题");
   });
 

@@ -76,9 +76,11 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   if (!last || last.role !== "assistant") return ms;
   let userId: number | null = null;
   let messageId: number | null = null;
+  let model: string | null = null;
   for (const ev of queue) {
     if ("type" in ev) {
       if (ev.type === "meta" && ev.userMessageId != null) userId = ev.userMessageId;
+      if (ev.type === "meta" && ev.model) model = ev.model;
       if (ev.type === "cancelled") {
         if (ev.userMessageId != null) userId = ev.userMessageId;
         if (ev.messageId != null) messageId = ev.messageId;
@@ -91,6 +93,7 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   const next = [...ms];
   let msg = applyQueue(last, queue);
   if (messageId != null && msg.id == null) msg = { ...msg, id: messageId };
+  if (model && !msg.model) msg = { ...msg, model };
   next[ai] = msg;
   if (userId != null) {
     for (let i = ai - 1; i >= 0; i--) {
@@ -233,7 +236,10 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const send = useCallback(
-    async (text: string, o?: { regenerate?: boolean; context?: string; refs?: RefPayload[] }) => {
+    async (
+      text: string,
+      o?: { regenerate?: boolean; context?: string; refs?: RefPayload[]; providerId?: string; model?: string },
+    ) => {
       if (!text || busy) return;
       if (!o?.regenerate) {
         setMessages((ms) => [
@@ -252,6 +258,8 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
           onEvent,
           context: o?.context,
           refs: o?.refs,
+          providerId: o?.providerId,
+          model: o?.model,
         }),
       );
     },
@@ -267,11 +275,15 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
     if (runIdRef.current) requestCancel(runIdRef.current, ac);
   }, [requestCancel]);
 
-  const regenerate = useCallback(() => {
-    const lastUser = [...messages].reverse().find((m) => m.role === "user");
-    if (!lastUser || busy) return;
-    void send(lastUser.content, { regenerate: true });
-  }, [messages, busy, send]);
+  // override:本次换用指定模型重新生成(不改变会话的模型设置)
+  const regenerate = useCallback(
+    (override?: { providerId: string; model: string }) => {
+      const lastUser = [...messages].reverse().find((m) => m.role === "user");
+      if (!lastUser || busy) return;
+      void send(lastUser.content, { regenerate: true, ...override });
+    },
+    [messages, busy, send],
+  );
 
   return { messages, setMessages, send, stop, regenerate, busy };
 }
