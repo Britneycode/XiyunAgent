@@ -635,7 +635,7 @@ export function Composer(props: {
             >
               <div className="flex items-center gap-2 border-b border-line px-3.5 py-1.5 text-xs text-muted">
                 <PenLine size={13} strokeWidth={1.75} className="shrink-0 text-accent" aria-hidden />
-                <span className="min-w-0 flex-1 truncate">正在编辑消息 · 发送后将替换该条及其后的对话</span>
+                <span className="min-w-0 flex-1 truncate">正在编辑消息 · 发送后作为新版本,原版本可用 ‹ › 切回</span>
                 <Button variant="ghost" size="xs" onClick={props.onCancelEdit}>
                   取消
                   <Kbd>Esc</Kbd>
@@ -706,7 +706,7 @@ export function Composer(props: {
           }}
           placeholder={
             editing
-              ? "编辑消息,Enter 重新生成"
+              ? "编辑消息,Enter 发送新版本"
               : props.busy
                 ? "正在生成… 可以继续输入下一条"
                 : "输入消息,@ 引用上下文,/ 使用命令"

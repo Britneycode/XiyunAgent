@@ -77,10 +77,12 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   let userId: number | null = null;
   let messageId: number | null = null;
   let model: string | null = null;
+  let trim: UIMessage["trim"];
   for (const ev of queue) {
     if ("type" in ev) {
       if (ev.type === "meta" && ev.userMessageId != null) userId = ev.userMessageId;
       if (ev.type === "meta" && ev.model) model = ev.model;
+      if (ev.type === "meta" && ev.trim) trim = ev.trim;
       if (ev.type === "cancelled") {
         if (ev.userMessageId != null) userId = ev.userMessageId;
         if (ev.messageId != null) messageId = ev.messageId;
@@ -94,6 +96,7 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   let msg = applyQueue(last, queue);
   if (messageId != null && msg.id == null) msg = { ...msg, id: messageId };
   if (model && !msg.model) msg = { ...msg, model };
+  if (trim && !msg.trim) msg = { ...msg, trim };
   next[ai] = msg;
   if (userId != null) {
     for (let i = ai - 1; i >= 0; i--) {
@@ -113,6 +116,22 @@ export function attachBase(ms: UIMessage[], userMessageId: number | null): UIMes
   return [...base, { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() }];
 }
 
+// 生成结束后用服务端的消息列表补上版本信息(F6:重新生成 / 编辑后出现的 "2/2")。
+// 只更新 parentId / siblings / trim,其余字段与 localKey 保持不变;没有变化的消息沿用原对象,不触发重渲染。纯函数。
+export function mergeTree(ms: UIMessage[], server: ChatMessage[]): UIMessage[] {
+  const byId = new Map(server.flatMap((m) => (m.id != null ? [[m.id, m] as const] : [])));
+  const same = (a?: number[], b?: number[]) => (a ?? []).join(",") === (b ?? []).join(",");
+  let changed = false;
+  const next = ms.map((m) => {
+    const s = m.id != null ? byId.get(m.id) : undefined;
+    if (!s) return m;
+    if (same(m.siblings, s.siblings) && (m.parentId ?? null) === (s.parentId ?? null) && !!m.trim === !!s.trim) return m;
+    changed = true;
+    return { ...m, parentId: s.parentId, siblings: s.siblings, trim: s.trim ?? m.trim };
+  });
+  return changed ? next : ms;
+}
+
 // 流结束时收尾末条 assistant:被停止的标记 aborted(全空则移除),否则只结束 streaming。纯函数。
 export function finalizeLast(ms: UIMessage[], o: { cancelled: boolean; error?: string }): UIMessage[] {
   const last = ms[ms.length - 1];
@@ -130,6 +149,7 @@ export function finalizeLast(ms: UIMessage[], o: { cancelled: boolean; error?: s
 export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void; onSessionChanged?: () => void }) {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false); // 首次加载完成(搜索定位据此判断消息是否在当前分支上)
   const abortRef = useRef<AbortController | null>(null);
   const runIdRef = useRef<string | null>(null);
   const stopRef = useRef(false); // 已请求停止:meta 晚到时补发 cancel
@@ -207,9 +227,14 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
           setBusy(false);
         }
         optsRef.current?.onSessionChanged?.();
+        // 补上版本信息:重新生成 / 编辑后,新消息显示 "2/2" 并可切回旧版本
+        void api
+          .messages(session.id)
+          .then((list) => setMessages((ms) => mergeTree(ms, list)))
+          .catch(() => {});
       }
     },
-    [enqueue, flush, requestCancel],
+    [enqueue, flush, requestCancel, session.id],
   );
 
   // 进入会话:加载历史;有运行中的后台生成时续订并回放(F1)
@@ -219,6 +244,7 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
       const run = await api.activeRun(session.id).catch(() => null);
       const ms = (await api.messages(session.id)).filter((m) => m.role !== "system");
       if (!alive) return;
+      setLoaded(true);
       if (run?.status !== "running") {
         setMessages(ms);
         return;
@@ -238,15 +264,31 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
   const send = useCallback(
     async (
       text: string,
-      o?: { regenerate?: boolean; context?: string; refs?: RefPayload[]; providerId?: string; model?: string },
+      o?: {
+        regenerate?: boolean;
+        context?: string;
+        refs?: RefPayload[];
+        providerId?: string;
+        model?: string;
+        editOf?: number; // 编辑该 user 消息:它之后的内容从界面移走(服务端作为旧版本保留)
+      },
     ) => {
       if (!text || busy) return;
       if (!o?.regenerate) {
-        setMessages((ms) => [
-          ...ms,
-          { role: "user", content: text, localKey: nextKey() },
-          { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() },
-        ]);
+        // 引用即时显示为气泡上方的标签,不必等刷新
+        const refBlocks: ChatBlock[] | undefined = o?.refs?.length
+          ? o.refs.map((r, i) => ({ id: `ref${i + 1}`, kind: "ref", refType: r.refType, label: r.label, excerpt: r.excerpt }))
+          : undefined;
+        setMessages((ms) => {
+          const idx = o?.editOf != null ? ms.findIndex((m) => m.id === o.editOf) : -1;
+          // 编辑时没带新引用:沿用原消息的引用(与服务端一致)
+          const blocks = refBlocks ?? (idx >= 0 ? ms[idx]!.blocks?.filter((b) => b.kind === "ref") : undefined);
+          return [
+            ...(idx >= 0 ? ms.slice(0, idx) : ms),
+            { role: "user", content: text, blocks: blocks?.length ? blocks : undefined, localKey: nextKey() },
+            { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() },
+          ];
+        });
       } else {
         setMessages((ms) => {
           const trimmed = ms[ms.length - 1]?.role === "assistant" ? ms.slice(0, -1) : ms;
@@ -260,10 +302,21 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
           refs: o?.refs,
           providerId: o?.providerId,
           model: o?.model,
+          editOf: o?.editOf,
         }),
       );
     },
     [busy, consume, session.id],
+  );
+
+  // F6:切换到另一个版本(兄弟消息)或搜索命中的分支
+  const switchTo = useCallback(
+    async (messageId: number) => {
+      if (busy) return;
+      const r = await api.setHead(session.id, messageId);
+      setMessages(r.messages.filter((m) => m.role !== "system"));
+    },
+    [busy, session.id],
   );
 
   // 停止:请服务端中止(半截落库后流自然结束);已发出 cancel 但 3s 内没结束,就断开本地连接兜底。
@@ -285,5 +338,5 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
     [messages, busy, send],
   );
 
-  return { messages, setMessages, send, stop, regenerate, busy };
+  return { messages, setMessages, send, stop, regenerate, switchTo, busy, loaded };
 }

@@ -6,7 +6,8 @@ export type StreamEvent =
   | { type: "block_delta"; id: string; delta: string }
   | { type: "block_end"; id: string; block: ChatBlock }
   | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
-  | { type: "meta"; userMessageId: number | null; runId?: string; model?: string | null } // 首个事件:本轮 user 消息的落库 id、后台运行 id 与所用模型
+  // 首个事件:本轮 user 消息的落库 id、后台运行 id、所用模型;trim = 历史超出上下文预算时的裁剪情况(F4)
+  | { type: "meta"; userMessageId: number | null; runId?: string; model?: string | null; trim?: { dropped: number; summary: boolean } }
   | { type: "cancelled"; messageId: number | null; userMessageId: number | null } // 被停止:半截已落库(无内容时 messageId 为 null)
   | { type: "title"; title: string } // 新会话自动命名完成(模型起的标题)
   | { delta: string; id?: string }
@@ -47,8 +48,12 @@ export const api = {
   },
   createSession: (body?: Partial<SessionMeta>) => req<SessionMeta>("/sessions", { method: "POST", body: JSON.stringify(body ?? {}) }),
   deleteSession: (id: string) => req(`/sessions/${id}`, { method: "DELETE" }),
-  truncateFrom: (sessionId: string, messageId: number) =>
-    req(`/sessions/${sessionId}/messages/${messageId}/truncate`, { method: "POST" }),
+  // F6:切换到包含 messageId 的分支(兄弟版本 / 搜索命中),返回切换后的消息列表
+  setHead: (sessionId: string, messageId: number) =>
+    req<{ headId: number; messages: ChatMessage[] }>(`/sessions/${sessionId}/head`, {
+      method: "POST",
+      body: JSON.stringify({ messageId }),
+    }),
   branchSession: (sessionId: string, body: { messageId?: number; title?: string }) =>
     req<SessionMeta>(`/sessions/${sessionId}/branch`, { method: "POST", body: JSON.stringify(body) }),
   messages: (id: string) => req<ChatMessage[]>(`/sessions/${id}/messages`),
@@ -264,19 +269,27 @@ export async function streamChat(
   signal?: AbortSignal,
   regenerate = false,
   // opts.onEvent 不为空时,所有事件原样透传(含块事件);否则退回旧 onDelta 行为
-  opts?: { onEvent?: (ev: StreamEvent) => void; context?: string; refs?: RefPayload[]; providerId?: string; model?: string },
+  opts?: {
+    onEvent?: (ev: StreamEvent) => void;
+    context?: string;
+    refs?: RefPayload[];
+    providerId?: string;
+    model?: string;
+    editOf?: number; // 编辑该 user 消息:作为它的新版本发送(F6)
+  },
 ): Promise<void> {
   const post = () =>
     fetch(`${base}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // regenerate=true 时 server 不再落库 user 消息(该消息此前已入库),并覆盖上一条 assistant 回复
+      // regenerate=true 时 server 不再落库 user 消息(该消息此前已入库),新回复作为上一条回复的兄弟版本
       body: JSON.stringify({
         sessionId, message, regenerate,
         context: opts?.context,
         refs: opts?.refs,
         providerId: opts?.providerId,
         model: opts?.model,
+        editOf: opts?.editOf,
       }),
       signal: signal ?? null,
     });

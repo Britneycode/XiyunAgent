@@ -1,20 +1,15 @@
-import type { TokenUsage } from "@xiyun/shared";
+import { estimateTokens, type TokenUsage } from "@xiyun/shared";
 import type { UIMessage } from "./useChatStream.ts";
 
 // Token 计数分两层:
 // 1. 实测:模型在流末返回 usage(服务端经 SSE 下发并随消息落库),以此为基线;
 // 2. 估算:基线之后新增的内容(新消息、引用、当前输入),以及模型不返回 usage 时的全部内容。
 // 估算经验值:CJK 字符约 1 token/字;其余字符(英文、代码、空白、标点)约 4 字符/token。界面以 "≈" 标注估算值。
-const CJK = /[\u2E80-\u9FFF\uA960-\uA97F\uAC00-\uD7FF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/g;
+// 估算函数与服务端上下文预算(F4)共用同一实现
+export { estimateTokens };
 
 // 每条消息的角色与分隔符开销(OpenAI chat 格式约 3–4 token)
 export const MESSAGE_OVERHEAD = 4;
-
-export function estimateTokens(text: string): number {
-  if (!text) return 0;
-  const cjk = text.match(CJK)?.length ?? 0;
-  return Math.ceil(cjk + (text.length - cjk) / 4);
-}
 
 // 历史消息正文:流式块模式下 content 可能为空,回退到文本块拼接
 function messageText(m: UIMessage): string {

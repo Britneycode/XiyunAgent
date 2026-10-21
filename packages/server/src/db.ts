@@ -72,6 +72,28 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
     const mc = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
     if (!mc.includes("model")) db.exec("ALTER TABLE messages ADD COLUMN model TEXT");
   },
+  // v11:消息树(F6)与上下文管理(F4)。
+  // messages.parent_id(父消息,首条 NULL)/ sessions.head_id(当前分支末条);老会话按 id 顺序回填成单链。
+  // messages.ref_context(user 消息的引用上下文原文,之后几轮继续带入)/ messages.ctx_trim(assistant 生成时的历史裁剪 JSON);
+  // sessions.summary / summary_upto_id(超出预算的早先消息的滚动摘要,覆盖到哪条消息)
+  (db) => {
+    const mc = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!mc.includes("parent_id")) db.exec("ALTER TABLE messages ADD COLUMN parent_id INTEGER");
+    if (!mc.includes("ref_context")) db.exec("ALTER TABLE messages ADD COLUMN ref_context TEXT");
+    if (!mc.includes("ctx_trim")) db.exec("ALTER TABLE messages ADD COLUMN ctx_trim TEXT");
+    const sc = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!sc.includes("head_id")) db.exec("ALTER TABLE sessions ADD COLUMN head_id INTEGER");
+    if (!sc.includes("summary")) db.exec("ALTER TABLE sessions ADD COLUMN summary TEXT");
+    if (!sc.includes("summary_upto_id")) db.exec("ALTER TABLE sessions ADD COLUMN summary_upto_id INTEGER");
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+      UPDATE messages SET parent_id = (
+        SELECT MAX(m2.id) FROM messages m2 WHERE m2.session_id = messages.session_id AND m2.id < messages.id
+      ) WHERE parent_id IS NULL;
+      UPDATE sessions SET head_id = (SELECT MAX(id) FROM messages WHERE messages.session_id = sessions.id)
+      WHERE head_id IS NULL;
+    `);
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

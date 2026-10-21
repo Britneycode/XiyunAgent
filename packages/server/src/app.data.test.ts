@@ -32,7 +32,7 @@ describe("数据导出", () => {
     expect(res.status).toBe(200);
     const pack = (await res.json()) as { kind: string; version: number; data: Record<string, unknown[]> };
     expect(pack.kind).toBe("xiyun-export");
-    expect(pack.version).toBe(1);
+    expect(pack.version).toBe(2);
     expect(pack.data.sessions).toHaveLength(1);
     expect(pack.data.messages).toHaveLength(1);
     expect(pack.data.docs).toHaveLength(1);

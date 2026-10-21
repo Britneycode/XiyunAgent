@@ -88,7 +88,8 @@ export type ChatBlock =
       target?: { workspace?: string; path?: string }; // 服务端填写
     }
   | { id: string; kind: "text"; text: string }
-  | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string }; // 仅 user 消息
+  // 仅 user 消息;文件引用带工作区相对路径与引用时内容的指纹(F4:之后文件变更时提示模型内容可能过时)
+  | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string; path?: string; hash?: string };
 
 // 模型返回的真实 token 用量(OpenAI 兼容 usage 字段归一化后的形态)。
 // promptTokens 含系统提示、记忆、历史与引用上下文;completionTokens 含推理部分。
@@ -110,6 +111,20 @@ export interface ChatMessage {
   usage?: TokenUsage; // 仅 assistant;模型未返回 usage 时缺省
   error?: string; // 仅 assistant:生成出错时保留半截内容,附带错误信息
   model?: string; // 仅 assistant:生成这条回复的模型(M3)
+  // F6 消息树:父消息 id(首条为 null);同一父消息下有多个版本(编辑 / 重新生成)时给出全部版本 id(升序,含自身)
+  parentId?: number | null;
+  siblings?: number[];
+  // F4 仅 assistant:生成时因超出上下文预算未逐字带入的早先消息数,summary = 是否以摘要代替
+  trim?: { dropped: number; summary: boolean };
+}
+
+// Token 估算(前后端共用):CJK 字符约 1 token/字,其余字符约 4 字符/token。
+// 只用于预算与展示,模型返回的实测用量优先。
+const CJK = /[\u2E80-\u9FFF\uA960-\uA97F\uAC00-\uD7FF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/g;
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  const cjk = text.match(CJK)?.length ?? 0;
+  return Math.ceil(cjk + (text.length - cjk) / 4);
 }
 
 export interface Fact {

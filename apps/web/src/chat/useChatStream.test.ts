@@ -7,9 +7,10 @@ let applyQueue: (msg: UIMessage, queue: StreamEvent[]) => UIMessage;
 let applyStream: (ms: UIMessage[], queue: StreamEvent[]) => UIMessage[];
 let attachBase: (ms: UIMessage[], userMessageId: number | null) => UIMessage[];
 let finalizeLast: (ms: UIMessage[], o: { cancelled: boolean; error?: string }) => UIMessage[];
+let mergeTree: (ms: UIMessage[], server: UIMessage[]) => UIMessage[];
 beforeAll(async () => {
   (globalThis as { location?: unknown }).location ??= { protocol: "http:" };
-  ({ applyQueue, applyStream, attachBase, finalizeLast } = await import("./useChatStream.ts"));
+  ({ applyQueue, applyStream, attachBase, finalizeLast, mergeTree } = await import("./useChatStream.ts"));
 });
 
 const empty = (): UIMessage => ({ role: "assistant", content: "", blocks: [], streaming: true });
@@ -140,5 +141,33 @@ describe("F1 后台生成:续订与收尾", () => {
     expect(finalizeLast(streamed, { cancelled: true }).at(-1)).toMatchObject({ aborted: true, streaming: false, content: "半" });
     expect(finalizeLast(base, { cancelled: true })).toHaveLength(1);
     expect(finalizeLast(streamed, { cancelled: false, error: "boom" }).at(-1)).toMatchObject({ error: "boom", streaming: false });
+  });
+});
+
+describe("mergeTree(F6)", () => {
+  it("只补版本信息,保留 localKey 与其余字段;无变化时返回原数组", () => {
+    const ms: UIMessage[] = [
+      { id: 1, role: "user", content: "q", localKey: "local-1" },
+      { id: 3, role: "assistant", content: "新回答", localKey: "local-2", usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+      { role: "assistant", content: "", error: "boom" },
+    ];
+    const server: UIMessage[] = [
+      { id: 1, role: "user", content: "q", parentId: null },
+      { id: 3, role: "assistant", content: "新回答", parentId: 1, siblings: [2, 3] },
+    ];
+    const out = mergeTree(ms, server);
+    expect(out[0]).toBe(ms[0]);
+    expect(out[1]).toMatchObject({ localKey: "local-2", siblings: [2, 3], parentId: 1, usage: ms[1]!.usage });
+    expect(out[2]).toBe(ms[2]);
+    expect(mergeTree(out, server)).toBe(out);
+  });
+});
+
+describe("meta.trim", () => {
+  it("历史裁剪信息写到正在生成的回复上", () => {
+    const ms: UIMessage[] = [{ role: "user", content: "q" }, empty()];
+    const out = applyStream(ms, [{ type: "meta", userMessageId: 5, trim: { dropped: 6, summary: true } }]);
+    expect(out[1]!.trim).toEqual({ dropped: 6, summary: true });
+    expect(out[0]!.id).toBe(5);
   });
 });

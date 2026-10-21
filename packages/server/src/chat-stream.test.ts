@@ -284,7 +284,7 @@ describe("/chat 块协议", () => {
     expect((db.prepare("SELECT COUNT(*) c FROM messages WHERE role = 'assistant'").get() as { c: number }).c).toBe(0);
   });
 
-  it("regenerate 出错:不覆盖完整的旧回答,但会替换上一次出错的半截", async () => {
+  it("regenerate 出错:旧回答作为兄弟版本保留,出错的版本被下一次重试替换", async () => {
     let fail = false;
     const provider: ChatProvider = {
       config: { id: "rg", name: "rg", baseUrl: "http://x", apiKey: "k", model: "m" },
@@ -303,14 +303,19 @@ describe("/chat 块协议", () => {
       }>).map((r) => [r.content, r.error]);
     await (await post(app, { sessionId: s.id, message: "q" })).text();
     fail = true;
-    // 完整回答上 regenerate 失败:旧回答保留
+    // 完整回答上 regenerate 失败:半截作为新版本落库,旧回答仍在
     const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "q", regenerate: true })).text());
-    expect(evs.at(-1)).toMatchObject({ error: "boom", messageId: null });
-    expect(assistants()).toEqual([["完整", null]]);
-    // 新一轮出错留下半截,再 regenerate 失败:半截被新的半截替换,不累积
-    await (await post(app, { sessionId: s.id, message: "q2" })).text();
-    await (await post(app, { sessionId: s.id, message: "q2", regenerate: true })).text();
+    expect(evs.at(-1)).toMatchObject({ error: "boom", messageId: expect.any(Number) });
     expect(assistants()).toEqual([["完整", null], ["半", "boom"]]);
+    const list = (await (await app.request(`/sessions/${s.id}/messages`)).json()) as Array<{ content: string; siblings?: number[] }>;
+    expect(list.map((m) => m.content)).toEqual(["q", "半"]);
+    expect(list[1]!.siblings).toHaveLength(2);
+    // 再次失败:替换出错的版本,不累积
+    await (await post(app, { sessionId: s.id, regenerate: true })).text();
+    expect(assistants()).toEqual([["完整", null], ["半", "boom"]]);
+    fail = false;
+    await (await post(app, { sessionId: s.id, regenerate: true })).text();
+    expect(assistants()).toEqual([["完整", null], ["完整", null]]);
   });
 
   it("regenerate 出错时不删除上一轮 assistant", async () => {
@@ -332,14 +337,16 @@ describe("/chat 块协议", () => {
     expect(rows.map((r) => r.content)).toContain("A1");
   });
 
-  it("regenerate 成功时替换末条 assistant;末条为 user 时不误删更早的 assistant", async () => {
+  it("regenerate 成功时新增兄弟版本;重新生成出错的回复时替换它,不动更早的轮次", async () => {
     // reply 控制每次回复内容;fail 控制下一次流是否报错
     let reply = "A1";
     let fail = false;
+    let seen: string[] = [];
     const provider: ChatProvider = {
       config: { id: "r", name: "r", baseUrl: "http://x", apiKey: "k", model: "m" },
       async *streamChat() {},
-      async *streamEvents() {
+      async *streamEvents(messages) {
+        seen = messages.filter((m) => m.role !== "system").map((m) => m.content);
         if (fail) {
           yield { type: "text", delta: "半" } as ProviderEvent;
           throw new Error("boom");
@@ -350,20 +357,28 @@ describe("/chat 块协议", () => {
     };
     const { app, db } = setup(provider);
     const s = await session(app);
+    const pathOf = async () =>
+      ((await (await app.request(`/sessions/${s.id}/messages`)).json()) as Array<{ id: number; content: string; siblings?: number[] }>);
     // 读掉响应体:不消费 SSE 会让服务端写阻塞,收尾落库晚于断言
     await (await post(app, { sessionId: s.id, message: "q1" })).text();
-    // 末条是 assistant:regenerate 替换它
     reply = "A2";
     await (await post(app, { sessionId: s.id, message: "q1", regenerate: true })).text();
-    expect((db.prepare("SELECT content FROM messages WHERE role = 'assistant' ORDER BY id").all() as Array<{ content: string }>).map((r) => r.content)).toEqual(["A2"]);
+    // 发给模型的历史里没有旧回答,user 不重复
+    expect(seen).toEqual(["q1"]);
+    expect((db.prepare("SELECT content FROM messages WHERE role = 'assistant' ORDER BY id").all() as Array<{ content: string }>).map((r) => r.content)).toEqual(["A1", "A2"]);
+    const p1 = await pathOf();
+    expect(p1.map((m) => m.content)).toEqual(["q1", "A2"]);
+    expect(p1[1]!.siblings).toEqual([p1[1]!.id - 1, p1[1]!.id]);
 
-    // U1/A1(q1)/U2(q2):q2 失败后末条是 user,regenerate 成功时不得删除 A1
+    // q2 出错留下半截;regenerate 成功时替换半截,A2 保留
     fail = true;
     await (await post(app, { sessionId: s.id, message: "q2" })).text();
     fail = false;
     reply = "A3";
     await (await post(app, { sessionId: s.id, message: "q2", regenerate: true })).text();
-    expect((db.prepare("SELECT content FROM messages WHERE role = 'assistant' ORDER BY id").all() as Array<{ content: string }>).map((r) => r.content)).toEqual(["A2", "A3"]);
+    expect(seen).toEqual(["q1", "A2", "q2"]);
+    expect((await pathOf()).map((m) => m.content)).toEqual(["q1", "A2", "q2", "A3"]);
+    expect((db.prepare("SELECT COUNT(*) c FROM messages WHERE content = '半'").get() as { c: number }).c).toBe(0);
     // user 消息不因 regenerate 重复写入
     expect((db.prepare("SELECT COUNT(*) c FROM messages WHERE role = 'user'").get() as { c: number }).c).toBe(2);
   });

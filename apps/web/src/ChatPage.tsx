@@ -1,8 +1,8 @@
 import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { ArrowDown, Check, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
+import { ArrowDown, Check, ChevronLeft, ChevronRight, FoldVertical, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
 import type { ChatBlock, SessionMeta } from "@xiyun/shared";
-import { api } from "./api.ts";
+import type { RefPayload } from "./api.ts";
 import { CopyButton, MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
 import { handleCodeAction } from "./chat/codeActions.ts";
 import { Composer } from "./chat/Composer.tsx";
@@ -36,6 +36,40 @@ interface ItemActions {
   startEdit: (id: number, content: string) => void;
   branch?: (id: number) => void;
   preview?: (p: Preview) => void;
+  switchTo?: (id: number) => void; // 切换到同一位置的另一个版本(F6)
+}
+
+// 版本切换 "‹ 2/3 ›":编辑或重新生成后同一位置有多个版本时显示,生成中不可切换
+function VersionSwitcher({
+  id,
+  siblings,
+  busy,
+  actions,
+}: {
+  id: number;
+  siblings: number[];
+  busy: boolean;
+  actions: RefObject<ItemActions>;
+}) {
+  const i = siblings.indexOf(id);
+  if (i < 0) return null;
+  const go = (d: number) => {
+    const target = siblings[i + d];
+    if (target != null) actions.current?.switchTo?.(target);
+  };
+  return (
+    <div className="flex items-center font-sans text-2xs text-subtle" aria-label={`版本 ${i + 1} / ${siblings.length}`}>
+      <IconButton label="上一个版本" size="xs" disabled={busy || i === 0} onClick={() => go(-1)}>
+        <ChevronLeft size={13} strokeWidth={1.75} />
+      </IconButton>
+      <span className="min-w-[2.25rem] text-center font-mono tabular-nums">
+        {i + 1}/{siblings.length}
+      </span>
+      <IconButton label="下一个版本" size="xs" disabled={busy || i === siblings.length - 1} onClick={() => go(1)}>
+        <ChevronRight size={13} strokeWidth={1.75} />
+      </IconButton>
+    </div>
+  );
 }
 
 type RefBlock = Extract<ChatBlock, { kind: "ref" }>;
@@ -85,25 +119,28 @@ const MessageItem = memo(function MessageItem({
         >
           <StreamingMarkdown text={m.content} className="md-user" />
         </div>
-        <div
-          className={cn(
-            // 浮在消息间距里,不额外占高;pt-1 让悬停区域与气泡相连
-            "absolute right-0 top-full flex h-7 items-center gap-0.5 pt-1 transition-opacity duration-150",
-            editing ? "opacity-100" : "opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100",
-          )}
-        >
-          {editing && <span className="mr-1 text-2xs text-accent">编辑中…</span>}
-          <CopyButton text={m.content} />
-          {canEdit && (
-            <IconButton label="编辑并重新生成" size="xs" onClick={() => actions.current?.startEdit(m.id!, m.content)}>
-              <Pencil size={13} strokeWidth={1.75} />
-            </IconButton>
-          )}
-          {m.id != null && actions.current?.branch && (
-            <IconButton label="分支到新会话" size="xs" onClick={() => actions.current?.branch?.(m.id!)}>
-              <GitBranch size={13} strokeWidth={1.75} />
-            </IconButton>
-          )}
+        {/* 浮在消息间距里,不额外占高;pt-1 让悬停区域与气泡相连。版本切换常显,其余操作悬停时出现 */}
+        <div className="absolute right-0 top-full flex h-7 items-center gap-0.5 pt-1">
+          <div
+            className={cn(
+              "flex items-center gap-0.5 transition-opacity duration-150",
+              editing ? "opacity-100" : "opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100",
+            )}
+          >
+            {editing && <span className="mr-1 text-2xs text-accent">编辑中…</span>}
+            <CopyButton text={m.content} />
+            {canEdit && (
+              <IconButton label="编辑(保留原版本)" size="xs" onClick={() => actions.current?.startEdit(m.id!, m.content)}>
+                <Pencil size={13} strokeWidth={1.75} />
+              </IconButton>
+            )}
+            {m.id != null && actions.current?.branch && (
+              <IconButton label="分支到新会话" size="xs" onClick={() => actions.current?.branch?.(m.id!)}>
+                <GitBranch size={13} strokeWidth={1.75} />
+              </IconButton>
+            )}
+          </div>
+          {m.id != null && m.siblings && <VersionSwitcher id={m.id} siblings={m.siblings} busy={busy} actions={actions} />}
         </div>
       </div>
     );
@@ -136,6 +173,11 @@ const MessageItem = memo(function MessageItem({
       )}
       {done && (hasBody || m.aborted || m.usage) && (
         <div className="-ml-1 flex h-6 items-center gap-0.5 font-sans">
+          {m.id != null && m.siblings && (
+            <div className="mr-1">
+              <VersionSwitcher id={m.id} siblings={m.siblings} busy={busy} actions={actions} />
+            </div>
+          )}
           {m.aborted && (
             <span className="mr-1 inline-flex h-5 items-center gap-1 rounded border border-line bg-surface-2 px-1.5 text-2xs text-muted">
               <Square size={8} strokeWidth={0} fill="currentColor" aria-hidden />
@@ -169,6 +211,19 @@ const MessageItem = memo(function MessageItem({
               {m.model}
             </span>
           )}
+          {m.trim && (
+            <span
+              className="ml-0.5 inline-flex items-center gap-1 px-1 text-2xs text-subtle"
+              title={
+                m.trim.summary
+                  ? `上下文超出预算:更早的 ${m.trim.dropped} 条消息以摘要代替`
+                  : `上下文超出预算:更早的 ${m.trim.dropped} 条消息未带入,摘要生成后会在之后的回复中带入`
+              }
+            >
+              <FoldVertical size={11} strokeWidth={1.75} aria-hidden />
+              {m.trim.summary ? "摘要" : "省略"} {m.trim.dropped} 条
+            </span>
+          )}
           {m.usage ? (
             <UsageBadge usage={m.usage} />
           ) : (
@@ -188,7 +243,7 @@ const MessageItem = memo(function MessageItem({
 });
 
 export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandidatesChanged, onSessionChanged }: ChatPageProps) {
-  const { messages, setMessages, send, stop, regenerate, busy } = useChatStream(session, {
+  const { messages, send, stop, regenerate, switchTo, busy, loaded } = useChatStream(session, {
     onDone: onCandidatesChanged,
     onSessionChanged,
   });
@@ -198,11 +253,19 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
 
   // M7:从搜索结果跳转。消息加载后定位到目标消息(视口上 1/3 处)并短暂高亮
   const [focusReq, consumeFocus] = useFocusRequest(session.id);
+  const switchedFor = useRef<number | null>(null);
   useEffect(() => {
     const scroller = scrollRef.current;
     if (!focusReq || !scroller) return;
     const el = contentRef.current?.querySelector<HTMLElement>(`[data-mid="${focusReq.messageId}"]`);
-    if (!el) return; // 消息还没加载,messages 变化后再试
+    if (!el) {
+      // 已加载但不在当前分支上(旧版本):切到包含它的分支,messages 变化后再定位。还没加载完就等下一次
+      if (loaded && !busy && switchedFor.current !== focusReq.messageId) {
+        switchedFor.current = focusReq.messageId;
+        void switchTo(focusReq.messageId).catch(() => {});
+      }
+      return;
+    }
     release();
     const top = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
     scroller.scrollTo({ top: Math.max(0, top - scroller.clientHeight / 3) });
@@ -211,7 +274,7 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
     el.classList.add("msg-flash");
     setTimeout(() => el.classList.remove("msg-flash"), 2000);
     consumeFocus();
-  }, [focusReq, messages, consumeFocus, release, scrollRef, contentRef]);
+  }, [focusReq, messages, consumeFocus, release, scrollRef, contentRef, loaded, busy, switchTo]);
 
   // 开始生成(发送 / 重新生成 / 编辑重发)时回到底部并恢复贴底
   useEffect(() => {
@@ -224,30 +287,28 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
     setEditText(content);
   };
 
-  const submitEdit = async () => {
+  // 编辑 = 在同一位置发送新版本(F6):原消息与其后的回复保留,可用 "‹ 1/2 ›" 切回
+  const submitEdit = (o?: { context?: string; refs?: RefPayload[] }) => {
     if (editingId == null) return;
     const text = editText.trim();
-    await api.truncateFrom(session.id, editingId).catch(() => {});
+    const id = editingId;
     setEditingId(null);
     setEditText("");
-    setMessages((ms) => {
-      const idx = ms.findIndex((m) => m.id === editingId);
-      return idx >= 0 ? ms.slice(0, idx) : ms;
-    });
-    if (text) void send(text);
+    if (text) void send(text, { ...o, editOf: id });
   };
 
-  const models = useModelOptions();
-  const actions = useRef<ItemActions>({ regenerate, startEdit });
-  actions.current = { regenerate, startEdit, branch: onBranch, preview: onPreview, models: models.options };
-
-  // 复制快捷键的结果提示:底部浮出,1.6s 后消失
+  // 复制快捷键 / 版本切换的结果提示:底部浮出,1.6s 后消失
   const [toast, setToast] = useState<{ text: string; ok: boolean } | null>(null);
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(null), 1600);
     return () => clearTimeout(t);
   }, [toast]);
+  const models = useModelOptions();
+  const actions = useRef<ItemActions>({ regenerate, startEdit });
+  const switchVersion = (id: number) => void switchTo(id).catch(() => setToast({ text: "切换版本失败", ok: false }));
+  actions.current = { regenerate, startEdit, branch: onBranch, preview: onPreview, models: models.options, switchTo: switchVersion };
+
   const copy = (text: string | null, ok: string, empty: string) => {
     if (!text) return setToast({ text: empty, ok: false });
     void navigator.clipboard.writeText(text).then(
@@ -363,7 +424,7 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
           setEditingId(null);
           setEditText("");
         }}
-        onSubmit={(text, o) => (editingId != null ? void submitEdit() : void send(text, o))}
+        onSubmit={(text, o) => (editingId != null ? submitEdit(o) : void send(text, o))}
         onStop={stop}
         onNewSession={onNewSession}
         onCandidatesChanged={onCandidatesChanged}

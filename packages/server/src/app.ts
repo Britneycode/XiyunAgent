@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
-import type { AgentRole, ChatBlock, ChatMessage, ProviderConfig, SessionMeta, TaskStatus, TokenUsage } from "@xiyun/shared";
+import { estimateTokens, type AgentRole, type ChatBlock, type ChatMessage, type ProviderConfig, type SessionMeta, type TaskStatus, type TokenUsage } from "@xiyun/shared";
 import type { ChatProvider, ProviderEvent, ToolDef } from "../../runtime/src/index.ts";
 import { MemoryStore } from "./memory.ts";
 import { ProviderStore } from "./providers.ts";
@@ -20,6 +20,10 @@ import { DATA_DIR, backupDb } from "./db.ts";
 import { DEFAULT_TITLE, generateTitle, heuristicTitle } from "./title.ts";
 import { RunRegistry, type Run } from "./runs.ts";
 import { searchMessages } from "./search.ts";
+import { ancestors, ensureTree, loadTree, pathIds, setHeadId, siblingsOf, switchHead } from "./tree.ts";
+import {
+  contextBudget, fileHash, MESSAGE_OVERHEAD, planHistory, summarize, summaryBatch, withRefContext, type PathMessage,
+} from "./context.ts";
 
 const now = () => new Date().toISOString();
 
@@ -28,8 +32,12 @@ export function createApp(
   db: DatabaseSync,
   memory: MemoryStore,
   providers: ProviderStore,
-  // titleProvider:会话自动命名用的模型,缺省同记忆提取(测试可注入)
-  opts?: { chatProvider?: () => ChatProvider; titleProvider?: () => ChatProvider | undefined },
+  // titleProvider:会话自动命名用的模型;summaryProvider:早先消息的滚动摘要(F4)。缺省同记忆提取(测试可注入)
+  opts?: {
+    chatProvider?: () => ChatProvider;
+    titleProvider?: () => ChatProvider | undefined;
+    summaryProvider?: () => ChatProvider | undefined;
+  },
 ) {
   const app = new Hono();
   // CORS 白名单:只放行本机来源(localhost/127.0.0.1/[::1] 的 http(s),覆盖 vite 5173 与桌面渲染器)。
@@ -93,10 +101,10 @@ export function createApp(
   const queueExtract = (sessionId: string, mode: string, workspace: string) => {
     const provider = memoryProvider();
     if (!provider) return;
-    const history = db
-      .prepare("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 12")
-      .all(sessionId)
-      .reverse() as unknown as ChatMessage[];
+    // 只看当前分支的最近 12 条(F6)
+    const history = rowsByIds(pathIds(loadTree(db, sessionId)).slice(-12)).map(
+      (r) => ({ role: r.role, content: r.content }) as ChatMessage,
+    );
     const existingFacts = memory.list().map((f) => f.content);
     void extractMemories({ provider, memory, history, sessionId, mode, workspace, existingFacts })
       .then((n) => {
@@ -110,6 +118,34 @@ export function createApp(
           JSON.stringify({ sessionId, error: e instanceof Error ? e.message : String(e) }), now(),
         );
       });
+  };
+
+  // F4:滚动摘要。本轮有早先消息超出预算未带入、且摘要还没覆盖到它们时,后台把未覆盖的部分并入摘要。
+  // 一次最多处理 SUMMARY_INPUT_CHARS,剩余的在之后几轮继续补齐;同一会话同时只跑一个
+  const summarizing = new Set<string>();
+  const queueSummary = (
+    sessionId: string,
+    dropped: PathMessage[],
+    prev: { summary: string | null; summary_upto_id: number | null } | null,
+  ) => {
+    const from = prev?.summary_upto_id ?? 0;
+    const pending = dropped.filter((m) => m.id > from);
+    if (!pending.length || summarizing.has(sessionId)) return;
+    const provider = opts?.summaryProvider ? opts.summaryProvider() : memoryProvider();
+    if (!provider) return;
+    const batch = summaryBatch(pending);
+    const upto = batch[batch.length - 1]!.id;
+    summarizing.add(sessionId);
+    void summarize(provider, prev?.summary ?? "", batch)
+      .then((text) => {
+        if (!text) return;
+        db.prepare("UPDATE sessions SET summary = ?, summary_upto_id = ? WHERE id = ?").run(text, upto, sessionId);
+        db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('context.summary', ?, ?)").run(
+          JSON.stringify({ sessionId, upto, messages: batch.length }), now(),
+        );
+      })
+      .catch(() => {})
+      .finally(() => summarizing.delete(sessionId));
   };
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -231,39 +267,73 @@ export function createApp(
     }
   };
 
-  app.get("/sessions/:id/messages", (c) => {
+  // ---- 消息树(F6)----
+  type MsgRow = {
+    id: number; role: string; content: string; blocks: string | null; aborted: number; usage: string | null;
+    error: string | null; model: string | null; parent_id: number | null; ref_context: string | null;
+    ctx_trim: string | null; created_at: string;
+  };
+  // 按给定顺序取消息(路径上的 id);缺失的跳过
+  const rowsByIds = (ids: number[]): MsgRow[] => {
+    if (!ids.length) return [];
     const rows = db
-      .prepare("SELECT id, role, content, blocks, aborted, usage, error, model FROM messages WHERE session_id = ? ORDER BY id")
-      .all(c.req.param("id")) as unknown as Array<{
-      id: number; role: string; content: string; blocks: string | null; aborted: number; usage: string | null;
-      error: string | null; model: string | null;
-    }>;
-    return c.json(
-      rows.map((r) => ({
-        id: r.id,
-        role: r.role,
-        content: r.content,
-        blocks: parseBlocks(r.blocks),
-        aborted: r.aborted ? true : undefined,
-        usage: parseUsage(r.usage),
-        error: r.error ?? undefined,
-        model: r.model ?? undefined,
-      })),
-    );
+      .prepare(
+        `SELECT id, role, content, blocks, aborted, usage, error, model, parent_id, ref_context, ctx_trim, created_at
+         FROM messages WHERE id IN (SELECT value FROM json_each(?))`,
+      )
+      .all(JSON.stringify(ids)) as unknown as MsgRow[];
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    return ids.flatMap((id) => byId.get(id) ?? []);
+  };
+  const parseTrim = (raw: string | null): ChatMessage["trim"] => {
+    if (!raw) return undefined;
+    try {
+      const v = JSON.parse(raw) as { dropped?: unknown; summary?: unknown } | null;
+      return v && typeof v.dropped === "number" && v.dropped > 0 ? { dropped: v.dropped, summary: v.summary === true } : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const refBlocksOf = (raw: string | null) =>
+    (parseBlocks(raw) ?? []).filter((b): b is Extract<ChatBlock, { kind: "ref" }> => b.kind === "ref");
+  const toPathMessage = (r: MsgRow): PathMessage => ({
+    id: r.id,
+    role: r.role as PathMessage["role"],
+    content: r.content,
+    refContext: r.ref_context,
+    refs: r.role === "user" ? refBlocksOf(r.blocks) : undefined,
+    usage: parseUsage(r.usage),
   });
-  // 编辑某条 user 消息:删除该条及其后所有消息,返回被删前的消息(供前端重新发送)。
-  // 用于"编辑并重新生成"——截断历史后由 /chat 重新走一轮。
-  app.post("/sessions/:id/messages/:mid/truncate", (c) => {
+  // 当前分支的消息(会话展示用),带父消息与兄弟版本
+  const listPath = (sessionId: string): ChatMessage[] => {
+    const tree = loadTree(db, sessionId);
+    return rowsByIds(pathIds(tree)).map((r) => ({
+      id: r.id,
+      role: r.role as ChatMessage["role"],
+      content: r.content,
+      blocks: parseBlocks(r.blocks),
+      aborted: r.aborted ? true : undefined,
+      usage: parseUsage(r.usage),
+      error: r.error ?? undefined,
+      model: r.model ?? undefined,
+      parentId: tree.linear ? undefined : (tree.parent.get(r.id) ?? null),
+      siblings: siblingsOf(tree, r.id),
+      trim: parseTrim(r.ctx_trim),
+    }));
+  };
+
+  app.get("/sessions/:id/messages", (c) => c.json(listPath(c.req.param("id"))));
+  // 切换分支:messageId 已在当前路径上则不变,否则切到它所在分支的最新末端;返回切换后的消息列表
+  app.post("/sessions/:id/head", async (c) => {
     const sessionId = c.req.param("id");
-    const mid = Number(c.req.param("mid"));
-    const target = db.prepare("SELECT id, role FROM messages WHERE id = ? AND session_id = ?").get(mid, sessionId) as
-      | { id: number; role: string }
-      | undefined;
-    if (!target) return c.json({ error: "message not found" }, 404);
-    db.prepare("DELETE FROM messages WHERE session_id = ? AND id >= ?").run(sessionId, mid);
-    return c.json({ ok: true });
+    const body = (await c.req.json().catch(() => ({}))) as { messageId?: unknown };
+    if (typeof body.messageId !== "number") return c.json({ error: "缺少 messageId" }, 400);
+    if (runs.active(sessionId)?.status === "running") return c.json({ error: "该会话正在生成,请等待完成或先停止" }, 409);
+    const head = switchHead(db, sessionId, body.messageId);
+    if (head == null) return c.json({ error: "message not found" }, 404);
+    return c.json({ headId: head, messages: listPath(sessionId) });
   });
-  // 分支:把某条消息(含)之前的所有消息复制到一个新会话,返回新会话。
+  // 分支:把某条消息(含)及其祖先(缺省为当前分支全部)复制到一个新会话,返回新会话。
   app.post("/sessions/:id/branch", async (c) => {
     const sessionId = c.req.param("id");
     const body = (await c.req.json().catch(() => ({}))) as { messageId?: number; title?: string };
@@ -271,24 +341,37 @@ export function createApp(
       | { id: string; title: string; mode: string; workspace: string; provider_id: string | null; model: string | null }
       | undefined;
     if (!src) return c.json({ error: "session not found" }, 404);
-    const maxId = typeof body.messageId === "number" ? body.messageId : Number.MAX_SAFE_INTEGER;
-    const msgs = db
-      .prepare("SELECT role, content, blocks, aborted, usage, error, model, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
-      .all(sessionId, maxId) as unknown as Array<{
-      role: string; content: string; blocks: string | null; aborted: number; usage: string | null; error: string | null;
-      model: string | null; created_at: string;
-    }>;
+    const tree = loadTree(db, sessionId);
+    if (typeof body.messageId === "number" && !tree.parent.has(body.messageId))
+      return c.json({ error: "message not found" }, 404);
+    const ids = typeof body.messageId === "number"
+      ? (tree.linear ? tree.ids.filter((id) => id <= body.messageId!) : ancestors(tree, body.messageId))
+      : pathIds(tree);
+    const msgs = rowsByIds(ids);
     const nid = randomUUID();
     const title = (body.title?.trim() || `${src.title}(分支)`).slice(0, 80);
     const ts = now();
-    // 分支沿用原会话的模型选择
-    db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, updated_at, provider_id, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
-      nid, title, src.mode, src.workspace, ts, ts, src.provider_id, src.model,
-    );
-    const ins = db.prepare(
-      "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    );
-    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.error, m.model, m.created_at);
+    // 分支沿用原会话的模型选择;消息按路径复制成单链
+    db.exec("BEGIN");
+    try {
+      db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at, updated_at, provider_id, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
+        nid, title, src.mode, src.workspace, ts, ts, src.provider_id, src.model,
+      );
+      const ins = db.prepare(
+        `INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, parent_id, ref_context, ctx_trim, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      let prev: number | null = null;
+      for (const m of msgs) {
+        const r: { lastInsertRowid: number | bigint } = ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.error, m.model, prev, m.ref_context, m.ctx_trim, m.created_at);
+        prev = Number(r.lastInsertRowid);
+      }
+      setHeadId(db, nid, prev);
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
     return c.json({
       id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts, updatedAt: ts,
       providerId: src.provider_id, model: src.model,
@@ -335,19 +418,21 @@ export function createApp(
       refs?: Array<{ refType: "message" | "doc" | "file"; label: string; excerpt: string; path?: string }>;
       providerId?: string; // 本次请求临时指定模型(如"换个模型重新生成"),优先于会话设置
       model?: string;
+      editOf?: number; // 编辑某条 user 消息:新消息作为它的兄弟版本(F6),原消息与其后的回复都保留
     };
-    if (!body.sessionId || typeof body.message !== "string" || !body.message.trim())
+    const regenerate = body.regenerate === true;
+    if (!body.sessionId || (!regenerate && (typeof body.message !== "string" || !body.message.trim())))
       return c.json({ error: "缺少 sessionId/message" }, 400);
     // 解构为常量,保证闭包内类型收窄不失效
     const sessionId = body.sessionId;
-    const message = body.message;
-    // regenerate=true:对同一 user 消息重新生成——不重复落库 user 消息,并替换上一条 assistant 回复
-    const regenerate = body.regenerate === true;
-    // context 只进入模型消息,refs 只作为展示块落库(D5)
-    const context = typeof body.context === "string" ? body.context : "";
-    const refs = Array.isArray(body.refs) ? body.refs : [];
+    // context 进入模型消息并随 user 消息落库(之后几轮继续带入,F4);refs 作为展示块落库(D5)
+    let context = typeof body.context === "string" ? body.context : "";
+    let refs = Array.isArray(body.refs) ? body.refs : [];
     const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
-      | { id: string; workspace: string; mode: string; title: string; provider_id: string | null; model: string | null }
+      | {
+          id: string; workspace: string; mode: string; title: string; provider_id: string | null; model: string | null;
+          summary: string | null; summary_upto_id: number | null;
+        }
       | undefined;
     if (!session) return c.json({ error: "session not found" }, 404);
     // 模型优先级(M3 / D-021):请求指定 > 会话设置 > 全局激活(D-013)> main 角色兜底
@@ -361,6 +446,41 @@ export function createApp(
     const busyMsg = "该会话正在生成,请等待完成或先停止";
     if (runs.active(sessionId)?.status === "running") return c.json({ error: busyMsg }, 409);
 
+    // F6:确定本轮在消息树上的位置。parentId = 本轮 user 消息的父消息(历史到此为止)
+    const tree = ensureTree(db, sessionId);
+    let parentId: number | null = tree.head;
+    let message = typeof body.message === "string" ? body.message : "";
+    // regenerate:沿用当前分支末尾的 user 消息(原文与引用上下文都取库里的);新回复作为兄弟版本
+    let regenUserId: number | null = null;
+    // 被重新生成的旧回复;出错的旧回复会被新回复替换,不累积失败版本
+    let prevReply: { id: number; error: string | null } | null = null;
+    let editBlocks: string | null = null;
+    if (regenerate) {
+      const head = tree.head == null ? undefined : (db.prepare("SELECT id, role, error FROM messages WHERE id = ?").get(tree.head) as
+        | { id: number; role: string; error: string | null } | undefined);
+      const uid = head?.role === "assistant" ? (tree.parent.get(head.id) ?? null) : (head?.id ?? null);
+      const user = uid == null ? undefined : (db.prepare("SELECT id, role, content, blocks, ref_context FROM messages WHERE id = ?").get(uid) as
+        | { id: number; role: string; content: string; blocks: string | null; ref_context: string | null } | undefined);
+      if (!user || user.role !== "user") return c.json({ error: "没有可重新生成的消息" }, 400);
+      if (head?.role === "assistant") prevReply = { id: head.id, error: head.error };
+      regenUserId = user.id;
+      parentId = tree.parent.get(user.id) ?? null;
+      message = user.content;
+      if (!context) context = user.ref_context ?? "";
+      if (!refs.length) refs = refBlocksOf(user.blocks).map(({ refType, label, excerpt, path }) => ({ refType, label, excerpt, path }));
+    } else if (typeof body.editOf === "number") {
+      const orig = db.prepare("SELECT id, role, blocks, ref_context FROM messages WHERE id = ? AND session_id = ?").get(body.editOf, sessionId) as
+        | { id: number; role: string; blocks: string | null; ref_context: string | null } | undefined;
+      if (!orig || orig.role !== "user") return c.json({ error: "要编辑的消息不存在" }, 404);
+      parentId = tree.parent.get(orig.id) ?? null;
+      // 编辑只改文字:没带新引用时沿用原消息的引用
+      if (!refs.length && !context) {
+        context = orig.ref_context ?? "";
+        editBlocks = orig.blocks;
+        refs = refBlocksOf(orig.blocks).map(({ refType, label, excerpt, path }) => ({ refType, label, excerpt, path }));
+      }
+    }
+
     // 规则层:引用的文件参与匹配 .mdc globs 与目录级 AGENTS.md / CLAUDE.md(D-019)
     const refFiles = refs.flatMap((r) => (r.refType === "file" && typeof r.path === "string" ? [r.path] : []));
     const rules = loadRuleFiles(session.workspace, { dataDir: DATA_DIR, mode: session.mode, homeDir: homedir(), files: refFiles });
@@ -372,10 +492,6 @@ export function createApp(
     // 无主题词的泛化提问("我上次学到哪了")召回为空时,回退到最近的有效记忆。
     if (facts.length === 0) facts = memory.recent(5, scopes);
     const memories = facts.map((f) => `- ${f.content}`);
-    const history = db
-      .prepare("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 20")
-      .all(sessionId)
-      .reverse() as unknown as ChatMessage[];
 
     const isCode = session.mode === "code";
     const isWork = session.mode === "work";
@@ -397,19 +513,32 @@ export function createApp(
       .filter(Boolean)
       .join("\n\n");
 
-    if (regenerate) {
-      // 历史里摘掉最后一条 assistant,避免旧答案影响重新生成
-      const last = history[history.length - 1];
-      if (last?.role === "assistant") history.pop();
-      // 末尾是与本次相同的 user 时也弹出,避免同一句话出现两次
-      const lastUser = history[history.length - 1];
-      if (lastUser?.role === "user" && lastUser.content === message) history.pop();
+    // F4:历史 = 从根到 parentId 的分支路径,按 token 预算从新到旧装入;装不下的早先消息用滚动摘要代替
+    const modelMessage = context ? withRefContext(message, context) : message;
+    const path = parentId == null ? [] : rowsByIds(ancestors(tree, parentId)).map(toPathMessage);
+    const budget =
+      contextBudget({ contextLength: provider.config.contextLength, maxTokens: provider.config.params?.maxTokens }) -
+      estimateTokens(system) - estimateTokens(modelMessage) - 2 * MESSAGE_OVERHEAD;
+    // 引用过的文件现在内容变了:带入历史时提示模型
+    const staleFiles = (m: PathMessage) =>
+      !session.workspace
+        ? []
+        : (m.refs ?? []).flatMap((r) =>
+            r.refType === "file" && r.path && r.hash && fileHash(session.workspace, r.path) !== r.hash ? [r.label] : [],
+          );
+    let plan = planHistory(path, budget, staleFiles);
+    const summaryValid =
+      !!session.summary && session.summary_upto_id != null && path.some((m) => m.id === session.summary_upto_id);
+    let systemText = system;
+    if (plan.dropped.length && summaryValid) {
+      const section = `# 早先对话摘要\n(更早的消息未逐字带入,以下为压缩摘要;与之后的消息冲突时以之后的为准)\n${session.summary}`;
+      systemText = `${system}\n\n${section}`;
+      plan = planHistory(path, budget - estimateTokens(section) - 2, staleFiles);
     }
-
-    const modelMessage = context ? `${message}\n\n# 引用上下文\n${context}` : message;
+    const trim = plan.dropped.length ? { dropped: plan.dropped.length, summary: summaryValid } : null;
     const messages: ChatMessage[] = [
-      { role: "system", content: system },
-      ...history,
+      { role: "system", content: systemText },
+      ...plan.history,
       { role: "user", content: modelMessage },
     ];
 
@@ -422,17 +551,22 @@ export function createApp(
     // 模型起标题的异步结果(成功覆盖时为新标题);流还开着就推给客户端
     let titlePending: Promise<string | null> | null = null;
     if (!regenerate) {
+      // 文件引用记下当前内容指纹,之后带入历史时据此判断是否已变更
+      const blocks =
+        editBlocks ??
+        (refs.length
+          ? JSON.stringify(
+              refs.map((r2, i) => {
+                const hash = r2.refType === "file" && r2.path && session.workspace ? fileHash(session.workspace, r2.path) : undefined;
+                return { id: `ref${i + 1}`, kind: "ref", ...r2, ...(hash ? { hash } : {}) };
+              }),
+            )
+          : null);
       const r = db
-        .prepare("INSERT INTO messages (session_id, role, content, blocks, created_at) VALUES (?, 'user', ?, ?, ?)")
-        .run(
-          sessionId,
-          message,
-          refs.length
-            ? JSON.stringify(refs.map((r2, i) => ({ id: `ref${i + 1}`, kind: "ref", ...r2 })))
-            : null,
-          now(),
-        );
+        .prepare("INSERT INTO messages (session_id, role, content, blocks, parent_id, ref_context, created_at) VALUES (?, 'user', ?, ?, ?, ?, ?)")
+        .run(sessionId, message, blocks, parentId, context || null, now());
       userMessageId = Number(r.lastInsertRowid);
+      setHeadId(db, sessionId, userMessageId);
       touchSession(sessionId);
       // 自动命名:仍是默认标题时,先落启发式标题,较长的消息再异步请模型起短标题(只覆盖启发式标题,不动用户改过的)
       if (session.title === DEFAULT_TITLE) {
@@ -452,10 +586,7 @@ export function createApp(
         }
       }
     } else {
-      const prev = db
-        .prepare("SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1")
-        .get(sessionId) as { id: number } | undefined;
-      userMessageId = prev?.id ?? null;
+      userMessageId = regenUserId;
     }
 
     // D2:工具定义默认不下发,需显式开启环境变量且 Provider 声明 tools 能力
@@ -480,7 +611,7 @@ export function createApp(
     const ac = run.ac;
     const send = (obj: unknown) => run.emit(obj);
     // 先下发已落库的 user 消息 id 与 runId:中断或出错时客户端也能立即编辑 / 分支,断线后可凭 runId 续订
-    send({ type: "meta", userMessageId, runId: run.id, model: modelName });
+    send({ type: "meta", userMessageId, runId: run.id, model: modelName, ...(trim ? { trim } : {}) });
     // 运行结束后 emit 自动忽略,标题晚到时只落库
     void titlePending?.then((title) => {
       if (title) send({ type: "title", title });
@@ -665,6 +796,7 @@ export function createApp(
         );
         void send({ done: true, messageId, userMessageId });
         queueExtract(sessionId, session.mode, session.workspace);
+        if (plan.dropped.length) queueSummary(sessionId, plan.dropped, summaryValid ? session : null);
         // 标题通常早于回复完成;还没好时最多再等 1.5s,超时则只落库,下次刷新列表可见
         if (titlePending) await Promise.race([titlePending, new Promise((r) => setTimeout(r, 1500))]);
       } catch (e) {
@@ -685,22 +817,16 @@ export function createApp(
         }
         outcome = "error";
         // 出错时保留已生成的半截并标记 error,刷新后仍可见、可重试;
-        // 例外:regenerate 失败不覆盖一条完整的旧回答(宁可保留旧答案)
+        // regenerate 出错时旧回答作为兄弟版本保留,不会被覆盖
         const error = (e instanceof Error ? e.message : "provider error").slice(0, 500);
         closeUnfinishedTools("生成出错");
         const content = textOf(blocks);
         let messageId: number | null = null;
         if (content || blocks.length) {
-          const last = db
-            .prepare("SELECT role, aborted, error FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1")
-            .get(sessionId) as { role: string; aborted: number; error: string | null } | undefined;
-          const keepPrevious = regenerate && last?.role === "assistant" && !last.aborted && last.error == null;
-          if (!keepPrevious) {
-            try {
-              messageId = persist({ content, blocks, aborted: false, error });
-            } catch {
-              // 落库失败不影响把错误告诉客户端
-            }
+          try {
+            messageId = persist({ content, blocks, aborted: false, error });
+          } catch {
+            // 落库失败不影响把错误告诉客户端
           }
         }
         void send({ error, messageId, userMessageId });
@@ -715,20 +841,21 @@ export function createApp(
           .join("");
       }
 
-      // regenerate 只在会话末条确实是 assistant 时替换;U1/A1/U2 出错重试不得删 A1。
-      // 删除与插入同一事务,避免删成功但插入失败丢历史。
+      // 新回复挂在本轮 user 消息下并成为分支末端(F6)。regenerate 时旧回复作为兄弟版本保留,
+      // 只有出错的旧回复(且没有后续消息)被替换;删除与插入同一事务,避免删成功但插入失败丢历史。
       function persist(input: { content: string; blocks: ChatBlock[]; aborted: boolean; error?: string }): number | null {
         if (input.aborted && !input.content && input.blocks.length === 0) return null;
         db.exec("BEGIN");
         try {
-          if (regenerate) {
-            db.prepare(
-              "DELETE FROM messages WHERE id = (SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1) AND role = 'assistant'",
-            ).run(sessionId);
+          if (prevReply?.error != null) {
+            db.prepare("DELETE FROM messages WHERE id = ? AND NOT EXISTS (SELECT 1 FROM messages c WHERE c.parent_id = ?)").run(
+              prevReply.id, prevReply.id,
+            );
           }
           const r = db
             .prepare(
-              "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?)",
+              `INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, parent_id, ctx_trim, created_at)
+               VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               sessionId,
@@ -738,11 +865,15 @@ export function createApp(
               usage ? JSON.stringify(usage) : null,
               input.error ?? null,
               modelName,
+              userMessageId,
+              trim ? JSON.stringify(trim) : null,
               now(),
             );
+          const id = Number(r.lastInsertRowid);
+          setHeadId(db, sessionId, id);
           db.exec("COMMIT");
           touchSession(sessionId);
-          return Number(r.lastInsertRowid);
+          return id;
         } catch (e) {
           db.exec("ROLLBACK");
           throw e;
@@ -799,10 +930,9 @@ export function createApp(
     if (!session) return c.json({ error: "session not found" }, 404);
     const provider = memoryProvider();
     if (!provider) return c.json({ error: "no provider configured" }, 400);
-    const history = db
-      .prepare("SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 12")
-      .all(session.id)
-      .reverse() as unknown as ChatMessage[];
+    const history = rowsByIds(pathIds(loadTree(db, session.id)).slice(-12)).map(
+      (r) => ({ role: r.role, content: r.content }) as ChatMessage,
+    );
     const n = await extractMemories({
       provider, memory, history,
       sessionId: session.id, mode: session.mode, workspace: session.workspace,
@@ -1103,11 +1233,14 @@ export function createApp(
   // ---- 数据导入导出(优化阶段 5)----
   // 导出会话+消息+资料+待办+记忆事实。不含 API Key、运行时任务和审计正文。
   const EXPORT_KIND = "xiyun-export";
-  const EXPORT_VERSION = 1;
+  // v2(F6):消息带 id / parent_id(消息树)与 ref_context / ctx_trim;会话带 head_id 与摘要。v1 包按单链导入
+  const EXPORT_VERSION = 2;
 
   app.get("/admin/export", (c) => {
     const sessions = db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>;
-    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, usage, error, model, created_at FROM messages ORDER BY id").all();
+    const messages = db
+      .prepare("SELECT id, parent_id, session_id, role, content, blocks, aborted, usage, error, model, ref_context, ctx_trim, created_at FROM messages ORDER BY id")
+      .all();
     const docs = db.prepare("SELECT * FROM docs ORDER BY created_at").all();
     const todos = db.prepare("SELECT * FROM todos ORDER BY created_at").all();
     const facts = db.prepare("SELECT * FROM facts WHERE deleted_at IS NULL ORDER BY valid_from").all();
@@ -1160,24 +1293,40 @@ export function createApp(
       const str = (v: unknown) => (typeof v === "string" && v ? v : null);
       const hasSession = db.prepare("SELECT 1 FROM sessions WHERE id = ?");
       const sessionIds = new Set<string>();
+      const newSessions = new Set<string>();
       for (const r of (d.sessions ?? []) as Array<Record<string, unknown>>) {
         if (typeof r.id !== "string") continue;
         sessionIds.add(r.id);
         if (hasSession.get(r.id)) { skip.sessions++; continue; }
+        newSessions.add(r.id);
         // 旧导出包没有 updated_at:先留空,消息导入后按最后一条消息回填
         // provider_id 在本机不存在时 /chat 自动回退全局模型
         insSession.run(r.id, String(r.title ?? "导入会话"), String(r.mode ?? "chat"), String(r.workspace ?? ""), String(r.created_at ?? now()), r.archived ? 1 : 0, typeof r.updated_at === "string" ? r.updated_at : null, str(r.provider_id), str(r.model));
         add.sessions++;
       }
       const insMsg = db.prepare(
-        "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        `INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, model, parent_id, ref_context, ctx_trim, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
-      // 消息无稳定 id,重复导入同一导出包时按 (session_id, role, content, created_at) 去重,避免二次落库
-      const hasMsg = db.prepare("SELECT 1 FROM messages WHERE session_id = ? AND role = ? AND content = ? AND created_at = ?");
+      // 消息无全局唯一 id,重复导入同一导出包时按 (session_id, role, content, created_at) 去重,避免二次落库
+      const hasMsg = db.prepare("SELECT id FROM messages WHERE session_id = ? AND role = ? AND content = ? AND created_at = ?");
+      // 包内 id → 本库 id(v2 消息树);v1 包没有 id / parent_id,按会话内顺序串成单链
+      const idMap = new Map<number, number>();
+      const lastOf = new Map<string, number>();
       for (const r of (d.messages ?? []) as Array<Record<string, unknown>>) {
         if (typeof r.session_id !== "string" || !sessionIds.has(r.session_id)) continue;
         const role = String(r.role ?? "user"), content = String(r.content ?? ""), created = String(r.created_at ?? now());
-        if (hasMsg.get(r.session_id, role, content, created)) continue;
+        const oldId = typeof r.id === "number" ? r.id : null;
+        const parent =
+          oldId == null
+            ? (lastOf.get(r.session_id) ?? null)
+            : typeof r.parent_id === "number" ? (idMap.get(r.parent_id) ?? null) : null;
+        const dup = hasMsg.get(r.session_id, role, content, created) as { id: number } | undefined;
+        if (dup) {
+          if (oldId != null) idMap.set(oldId, dup.id);
+          lastOf.set(r.session_id, dup.id);
+          continue;
+        }
         // 非合法 JSON 的 blocks 存 NULL,避免把坏数据带进来
         let blocks: string | null = null;
         if (typeof r.blocks === "string") {
@@ -1191,8 +1340,23 @@ export function createApp(
         // usage 同样只接受可解析的 JSON;旧导出包没有该字段
         const usageJson = typeof r.usage === "string" && parseUsage(r.usage) ? r.usage : null;
         const error = typeof r.error === "string" && r.error ? r.error.slice(0, 500) : null;
-        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, error, str(r.model)?.slice(0, 200) ?? null, created);
+        const trimJson = typeof r.ctx_trim === "string" && parseTrim(r.ctx_trim) ? r.ctx_trim : null;
+        const res = insMsg.run(
+          r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, error, str(r.model)?.slice(0, 200) ?? null,
+          parent, str(r.ref_context), trimJson, created,
+        );
+        const nid = Number(res.lastInsertRowid);
+        if (oldId != null) idMap.set(oldId, nid);
+        lastOf.set(r.session_id, nid);
         add.messages++;
+      }
+      // 新导入的会话:head 指向包里记录的分支末端(映射后),缺省为最后一条;摘要覆盖点同样映射
+      const setHead = db.prepare("UPDATE sessions SET head_id = ?, summary = ?, summary_upto_id = ? WHERE id = ?");
+      for (const r of (d.sessions ?? []) as Array<Record<string, unknown>>) {
+        if (typeof r.id !== "string" || !newSessions.has(r.id)) continue;
+        const head = (typeof r.head_id === "number" ? idMap.get(r.head_id) : undefined) ?? lastOf.get(r.id) ?? null;
+        const upto = typeof r.summary_upto_id === "number" ? idMap.get(r.summary_upto_id) : undefined;
+        setHead.run(head, upto != null ? str(r.summary) : null, upto ?? null, r.id);
       }
       db.exec(
         `UPDATE sessions SET updated_at = COALESCE((SELECT MAX(created_at) FROM messages WHERE messages.session_id = sessions.id), created_at)
