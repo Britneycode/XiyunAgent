@@ -85,6 +85,9 @@ describe("db 迁移与备份(阶段 7)", () => {
     const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(cols).toContain("blocks");
     expect(cols).toContain("aborted");
+    // 后续迁移的列(v6 usage / v7 error)一并补齐
+    expect(cols).toContain("usage");
+    expect(cols).toContain("error");
     expect(Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version)).toBe(SCHEMA_VERSION);
     db.close();
     rmSync(dir, { recursive: true, force: true });

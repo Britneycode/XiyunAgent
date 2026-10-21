@@ -213,7 +213,16 @@ describe("/chat 块协议", () => {
     ]);
   });
 
-  it("出错时只发 error 尾行,不落 assistant", async () => {
+  it("首个事件下发 user 消息的落库 id,done 带回 assistant id", async () => {
+    const { app, db } = setup(fakeProvider([{ type: "text", delta: "答" }, { type: "finish", reason: "stop" }]));
+    const s = await session(app);
+    const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "hi" })).text());
+    const ids = db.prepare("SELECT id, role FROM messages ORDER BY id").all() as Array<{ id: number; role: string }>;
+    expect(evs[0]).toEqual({ type: "meta", userMessageId: ids[0]!.id });
+    expect(evs.at(-1)).toEqual({ done: true, messageId: ids[1]!.id, userMessageId: ids[0]!.id });
+  });
+
+  it("出错时落半截并标记 error,error 事件带回落库 id,GET messages 返回 error", async () => {
     const failing: ChatProvider = {
       config: { id: "f2", name: "f2", baseUrl: "http://x", apiKey: "k", model: "m" },
       async *streamChat() { throw new Error("boom"); },
@@ -225,9 +234,76 @@ describe("/chat 块协议", () => {
     const { app, db } = setup(failing);
     const s = await session(app);
     const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "q" })).text());
-    expect(evs.at(-1)?.error).toBe("boom");
     expect(evs.some((e) => e.done === true)).toBe(false);
+    const row = db.prepare("SELECT id, content, aborted, error FROM messages WHERE role = 'assistant'").get() as {
+      id: number; content: string; aborted: number; error: string;
+    };
+    expect(row).toMatchObject({ content: "半", aborted: 0, error: "boom" });
+    const userId = (db.prepare("SELECT id FROM messages WHERE role = 'user'").get() as { id: number }).id;
+    expect(evs.at(-1)).toEqual({ error: "boom", messageId: row.id, userMessageId: userId });
+    const list = (await (await app.request(`/sessions/${s.id}/messages`)).json()) as Array<{ role: string; error?: string }>;
+    expect(list.find((m) => m.role === "assistant")?.error).toBe("boom");
+    expect(list.find((m) => m.role === "user")?.error).toBeUndefined();
+  });
+
+  it("出错时未结束的工具卡片标记为出错", async () => {
+    const failing: ChatProvider = {
+      config: { id: "f3", name: "f3", baseUrl: "http://x", apiKey: "k", model: "m" },
+      async *streamChat() {},
+      async *streamEvents() {
+        yield { type: "tool_start", id: "c1", index: 0, name: "read_file" } as ProviderEvent;
+        yield { type: "tool_args", id: "c1", delta: "{\"pa" } as ProviderEvent;
+        throw new Error("boom");
+      },
+    };
+    const { app, db } = setup(failing);
+    const s = await session(app);
+    await (await post(app, { sessionId: s.id, message: "q" })).text();
+    const row = db.prepare("SELECT blocks, error FROM messages WHERE role = 'assistant'").get() as { blocks: string; error: string };
+    expect(JSON.parse(row.blocks)).toEqual([expect.objectContaining({ kind: "tool", status: "error", note: "生成出错" })]);
+    expect(row.error).toBe("boom");
+  });
+
+  it("出错前没有任何内容时只发 error,不落 assistant", async () => {
+    const failing: ChatProvider = {
+      config: { id: "f4", name: "f4", baseUrl: "http://x", apiKey: "k", model: "m" },
+      async *streamChat() {},
+      async *streamEvents() { throw new Error("HTTP 401"); },
+    };
+    const { app, db } = setup(failing);
+    const s = await session(app);
+    const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "q" })).text());
+    expect(evs.at(-1)).toMatchObject({ error: "HTTP 401", messageId: null });
     expect((db.prepare("SELECT COUNT(*) c FROM messages WHERE role = 'assistant'").get() as { c: number }).c).toBe(0);
+  });
+
+  it("regenerate 出错:不覆盖完整的旧回答,但会替换上一次出错的半截", async () => {
+    let fail = false;
+    const provider: ChatProvider = {
+      config: { id: "rg", name: "rg", baseUrl: "http://x", apiKey: "k", model: "m" },
+      async *streamChat() {},
+      async *streamEvents() {
+        yield { type: "text", delta: fail ? "半" : "完整" } as ProviderEvent;
+        if (fail) throw new Error("boom");
+        yield { type: "finish", reason: "stop" } as ProviderEvent;
+      },
+    };
+    const { app, db } = setup(provider);
+    const s = await session(app);
+    const assistants = () =>
+      (db.prepare("SELECT content, error FROM messages WHERE role = 'assistant' ORDER BY id").all() as Array<{
+        content: string; error: string | null;
+      }>).map((r) => [r.content, r.error]);
+    await (await post(app, { sessionId: s.id, message: "q" })).text();
+    fail = true;
+    // 完整回答上 regenerate 失败:旧回答保留
+    const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "q", regenerate: true })).text());
+    expect(evs.at(-1)).toMatchObject({ error: "boom", messageId: null });
+    expect(assistants()).toEqual([["完整", null]]);
+    // 新一轮出错留下半截,再 regenerate 失败:半截被新的半截替换,不累积
+    await (await post(app, { sessionId: s.id, message: "q2" })).text();
+    await (await post(app, { sessionId: s.id, message: "q2", regenerate: true })).text();
+    expect(assistants()).toEqual([["完整", null], ["半", "boom"]]);
   });
 
   it("regenerate 出错时不删除上一轮 assistant", async () => {

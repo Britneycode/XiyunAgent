@@ -33,6 +33,11 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
     const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
     if (!cols.includes("usage")) db.exec("ALTER TABLE messages ADD COLUMN usage TEXT");
   },
+  // v7:messages.error(生成出错时保留的半截回复所带的错误信息;正常消息为 NULL)
+  (db) => {
+    const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cols.includes("error")) db.exec("ALTER TABLE messages ADD COLUMN error TEXT");
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -73,6 +78,7 @@ export function openDb(file = join(DATA_DIR, "app.db")): DatabaseSync {
       blocks TEXT,
       aborted INTEGER NOT NULL DEFAULT 0,
       usage TEXT,
+      error TEXT,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS facts (

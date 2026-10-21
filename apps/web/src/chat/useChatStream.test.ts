@@ -4,9 +4,10 @@ import type { UIMessage } from "./useChatStream.ts";
 
 // api.ts 顶层读取 location,node 环境下先补一个最小桩再动态导入
 let applyQueue: (msg: UIMessage, queue: StreamEvent[]) => UIMessage;
+let applyStream: (ms: UIMessage[], queue: StreamEvent[]) => UIMessage[];
 beforeAll(async () => {
   (globalThis as { location?: unknown }).location ??= { protocol: "http:" };
-  ({ applyQueue } = await import("./useChatStream.ts"));
+  ({ applyQueue, applyStream } = await import("./useChatStream.ts"));
 });
 
 const empty = (): UIMessage => ({ role: "assistant", content: "", blocks: [], streaming: true });
@@ -57,5 +58,53 @@ describe("applyQueue", () => {
     for (const ev of [...STREAM, { type: "usage", usage } as StreamEvent]) step = applyQueue(step, [ev]);
     expect(step).toEqual(once);
     expect(once.usage).toBe(usage);
+  });
+});
+
+describe("applyStream:落库 id 回填", () => {
+  // 已持久化的上一轮 + 本轮刚发出的 user / assistant(都还没有 id)
+  const base = (): UIMessage[] => [
+    { id: 1, role: "user", content: "旧问" },
+    { id: 2, role: "assistant", content: "旧答" },
+    { role: "user", content: "新问", localKey: "local-1" },
+    { role: "assistant", content: "", blocks: [], streaming: true, localKey: "local-2" },
+  ];
+
+  it("meta 事件在生成中就给本轮 user 消息回填 id", () => {
+    const out = applyStream(base(), [{ type: "meta", userMessageId: 3 }, { delta: "答", id: "t1" }]);
+    expect(out[2]).toMatchObject({ id: 3, content: "新问", localKey: "local-1" });
+    expect(out[3]?.id).toBeUndefined();
+    expect(out[3]?.content).toBe("答");
+  });
+
+  it("done 事件回填 assistant id,不改动更早的消息", () => {
+    const out = applyStream(base(), [{ delta: "答" }, { done: true, messageId: 4, userMessageId: 3 }]);
+    expect(out.map((m) => m.id)).toEqual([1, 2, 3, 4]);
+    expect(out[3]).toMatchObject({ content: "答", localKey: "local-2" });
+  });
+
+  it("error 事件带回半截的落库 id;未落库(null)时保持无 id", () => {
+    const saved = applyStream(base(), [{ delta: "半" }, { error: "boom", messageId: 4, userMessageId: 3 }]);
+    expect(saved.map((m) => m.id)).toEqual([1, 2, 3, 4]);
+    const unsaved = applyStream(base(), [{ error: "boom", messageId: null, userMessageId: 3 }]);
+    expect(unsaved.map((m) => m.id)).toEqual([1, 2, 3, undefined]);
+  });
+
+  it("regenerate:user 已有 id 时不被覆盖", () => {
+    const ms: UIMessage[] = [
+      { id: 1, role: "user", content: "问" },
+      { role: "assistant", content: "", blocks: [], streaming: true },
+    ];
+    const out = applyStream(ms, [{ type: "meta", userMessageId: 99 }, { done: true, messageId: 5, userMessageId: 99 }]);
+    expect(out.map((m) => m.id)).toEqual([1, 5]);
+  });
+
+  it("纯函数:不修改输入;末条不是 assistant 时原样返回", () => {
+    const ms = base();
+    const snapshot = structuredClone(ms);
+    applyStream(ms, [{ type: "meta", userMessageId: 3 }, { done: true, messageId: 4 }]);
+    expect(ms).toEqual(snapshot);
+    const userLast: UIMessage[] = [{ role: "user", content: "q" }];
+    expect(applyStream(userLast, [{ done: true, messageId: 1 }])).toBe(userLast);
   });
 });

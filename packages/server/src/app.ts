@@ -179,9 +179,10 @@ export function createApp(
 
   app.get("/sessions/:id/messages", (c) => {
     const rows = db
-      .prepare("SELECT id, role, content, blocks, aborted, usage FROM messages WHERE session_id = ? ORDER BY id")
+      .prepare("SELECT id, role, content, blocks, aborted, usage, error FROM messages WHERE session_id = ? ORDER BY id")
       .all(c.req.param("id")) as unknown as Array<{
       id: number; role: string; content: string; blocks: string | null; aborted: number; usage: string | null;
+      error: string | null;
     }>;
     return c.json(
       rows.map((r) => ({
@@ -191,6 +192,7 @@ export function createApp(
         blocks: parseBlocks(r.blocks),
         aborted: r.aborted ? true : undefined,
         usage: parseUsage(r.usage),
+        error: r.error ?? undefined,
       })),
     );
   });
@@ -216,9 +218,10 @@ export function createApp(
     if (!src) return c.json({ error: "session not found" }, 404);
     const maxId = typeof body.messageId === "number" ? body.messageId : Number.MAX_SAFE_INTEGER;
     const msgs = db
-      .prepare("SELECT role, content, blocks, aborted, usage, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
+      .prepare("SELECT role, content, blocks, aborted, usage, error, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
       .all(sessionId, maxId) as unknown as Array<{
-      role: string; content: string; blocks: string | null; aborted: number; usage: string | null; created_at: string;
+      role: string; content: string; blocks: string | null; aborted: number; usage: string | null; error: string | null;
+      created_at: string;
     }>;
     const nid = randomUUID();
     const title = (body.title?.trim() || `${src.title}(分支)`).slice(0, 80);
@@ -227,9 +230,9 @@ export function createApp(
       nid, title, src.mode, src.workspace, ts,
     );
     const ins = db.prepare(
-      "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     );
-    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.created_at);
+    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.usage, m.error, m.created_at);
     return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts });
   });
 
@@ -362,6 +365,8 @@ export function createApp(
         writing = writing.then(() => stream.writeSSE({ data: JSON.stringify(obj) })).catch(() => {});
         return writing;
       };
+      // 先下发已落库的 user 消息 id:中断或出错时客户端也能立即编辑 / 分支这条消息
+      void send({ type: "meta", userMessageId });
 
       const blocks: ChatBlock[] = [];
       const toolBlocks = new Map<string, Extract<ChatBlock, { kind: "tool" }>>();
@@ -429,11 +434,11 @@ export function createApp(
       };
 
       // 中断收尾:没等到 tool_end 的调用标记为 error 并补发 block_end,避免客户端卡片停在 pending
-      const closeUnfinishedTools = () => {
+      const closeUnfinishedTools = (note = "已中断") => {
         for (const [id, b] of toolBlocks) {
           if (finishedTools.has(id)) continue;
           b.status = "error";
-          b.note = "已中断";
+          b.note = note;
           finishedTools.add(id);
           void send({ type: "block_end", id, block: b });
         }
@@ -548,8 +553,26 @@ export function createApp(
           if (content || blocks.length) persist({ content, blocks, aborted: true });
           return;
         }
-        // 不把异常原文(可能含请求信息)直接外发,也不落 assistant
-        void send({ error: e instanceof Error ? e.message : "provider error" });
+        // 出错时保留已生成的半截并标记 error,刷新后仍可见、可重试;
+        // 例外:regenerate 失败不覆盖一条完整的旧回答(宁可保留旧答案)
+        const error = (e instanceof Error ? e.message : "provider error").slice(0, 500);
+        closeUnfinishedTools("生成出错");
+        const content = textOf(blocks);
+        let messageId: number | null = null;
+        if (content || blocks.length) {
+          const last = db
+            .prepare("SELECT role, aborted, error FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1")
+            .get(sessionId) as { role: string; aborted: number; error: string | null } | undefined;
+          const keepPrevious = regenerate && last?.role === "assistant" && !last.aborted && last.error == null;
+          if (!keepPrevious) {
+            try {
+              messageId = persist({ content, blocks, aborted: false, error });
+            } catch {
+              // 落库失败不影响把错误告诉客户端
+            }
+          }
+        }
+        void send({ error, messageId, userMessageId });
       } finally {
         // 客户端已断开时 writeSSE 可能永久挂起,不再等待,让响应流直接关闭
         if (!ac.signal.aborted) await writing;
@@ -564,7 +587,7 @@ export function createApp(
 
       // regenerate 只在会话末条确实是 assistant 时替换;U1/A1/U2 出错重试不得删 A1。
       // 删除与插入同一事务,避免删成功但插入失败丢历史。
-      function persist(input: { content: string; blocks: ChatBlock[]; aborted: boolean }): number | null {
+      function persist(input: { content: string; blocks: ChatBlock[]; aborted: boolean; error?: string }): number | null {
         if (input.aborted && !input.content && input.blocks.length === 0) return null;
         db.exec("BEGIN");
         try {
@@ -575,7 +598,7 @@ export function createApp(
           }
           const r = db
             .prepare(
-              "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?)",
+              "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
             )
             .run(
               sessionId,
@@ -583,6 +606,7 @@ export function createApp(
               input.blocks.length ? JSON.stringify(input.blocks) : null,
               input.aborted ? 1 : 0,
               usage ? JSON.stringify(usage) : null,
+              input.error ?? null,
               now(),
             );
           db.exec("COMMIT");
@@ -942,7 +966,7 @@ export function createApp(
 
   app.get("/admin/export", (c) => {
     const sessions = db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>;
-    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, usage, created_at FROM messages ORDER BY id").all();
+    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, usage, error, created_at FROM messages ORDER BY id").all();
     const docs = db.prepare("SELECT * FROM docs ORDER BY created_at").all();
     const todos = db.prepare("SELECT * FROM todos ORDER BY created_at").all();
     const facts = db.prepare("SELECT * FROM facts WHERE deleted_at IS NULL ORDER BY valid_from").all();
@@ -1000,7 +1024,7 @@ export function createApp(
         add.sessions++;
       }
       const insMsg = db.prepare(
-        "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (session_id, role, content, blocks, aborted, usage, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       );
       // 消息无稳定 id,重复导入同一导出包时按 (session_id, role, content, created_at) 去重,避免二次落库
       const hasMsg = db.prepare("SELECT 1 FROM messages WHERE session_id = ? AND role = ? AND content = ? AND created_at = ?");
@@ -1020,7 +1044,8 @@ export function createApp(
         }
         // usage 同样只接受可解析的 JSON;旧导出包没有该字段
         const usageJson = typeof r.usage === "string" && parseUsage(r.usage) ? r.usage : null;
-        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, created);
+        const error = typeof r.error === "string" && r.error ? r.error.slice(0, 500) : null;
+        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, usageJson, error, created);
         add.messages++;
       }
       const simple = (table: string, cols: string[], rows: unknown[] | undefined, key: keyof typeof skip) => {

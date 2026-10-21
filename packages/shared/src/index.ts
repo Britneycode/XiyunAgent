@@ -58,6 +58,7 @@ export interface ChatMessage {
   blocks?: ChatBlock[];
   aborted?: boolean;
   usage?: TokenUsage; // 仅 assistant;模型未返回 usage 时缺省
+  error?: string; // 仅 assistant:生成出错时保留半截内容,附带错误信息
 }
 
 export interface Fact {

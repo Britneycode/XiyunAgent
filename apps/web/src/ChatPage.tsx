@@ -113,13 +113,16 @@ const MessageItem = memo(function MessageItem({
         <div role="alert" className="flex items-start gap-2.5 rounded-lg border border-err/25 bg-err/5 px-3 py-2.5 font-sans">
           <TriangleAlert size={15} strokeWidth={1.75} className="mt-0.5 shrink-0 text-err" aria-hidden />
           <div className="min-w-0 flex-1">
-            <p className="text-ui font-medium text-err">生成失败</p>
+            <p className="text-ui font-medium text-err">{hasBody ? "生成出错,已保留已生成的内容" : "生成失败"}</p>
             <p className="mt-0.5 break-words font-mono text-xs text-muted">{m.error}</p>
           </div>
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => actions.current?.regenerate()}>
-            <RotateCcw size={13} strokeWidth={1.75} />
-            重试
-          </Button>
+          {/* 重试即重新生成最后一轮,只对末条有意义;历史中的出错气泡只展示原因 */}
+          {isLast && (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => actions.current?.regenerate()}>
+              <RotateCcw size={13} strokeWidth={1.75} />
+              重试
+            </Button>
+          )}
         </div>
       )}
       {done && (hasBody || m.aborted || m.usage) && (
@@ -223,7 +226,7 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
             ) : (
               messages.map((m, i) => (
                 <MessageItem
-                  key={m.id ?? `tmp-${i}`}
+                  key={m.localKey ?? m.id ?? `tmp-${i}`}
                   m={m}
                   isLast={i === messages.length - 1}
                   busy={busy}

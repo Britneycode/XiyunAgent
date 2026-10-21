@@ -68,3 +68,6 @@ Composer 的 @ 引用(文件/文档)内容只注入当次 /chat 请求的 contex
 
 Qoder 风格重构(feat/qoder-workbench-ui)只替换视图层:API、SSE 协议、`useChatStream` 对外接口与各页业务逻辑保持不变。Code/Work 页把"变更 / 终端 / 资料 / 待办"面板通过 `layout/inspectorBridge.tsx` 的 InspectorPortal 渲染进右侧检查器的对应 tab,状态仍归页面所有(切换 tab 不丢输入,未挂载时不请求 Diff)。流式 Markdown 按顶层块切分并逐块 memo(`chat/StreamingMarkdown.tsx`),只有尾块随增量重渲染;未闭合代码块与完成态共用同一外框和限高,闭合时不跳动。Markdown 代码块是静态 HTML,复制 / 换行 / 展开 / 送预览通过事件委托(`chat/codeActions.ts`)把状态写在 DOM 上。取舍:Portal 让面板与页面状态同生命周期,代价是检查器内容依赖页面挂载;代码块不走 React 组件,换来流式时零额外渲染,代价是按钮状态不进 React state。
 
+## D-018:生成出错保留半截,Provider 错误可读且首 token 前自动重试(2026-10-21)
+
+/chat 在 Provider 报错(非用户中断)时,已产出的内容按 D-014 的方式落库,但标记 `error`(messages v7 迁移新增 `error` 列,分支/导出/导入携带),SSE 的 error 事件带回 `messageId` 与 `userMessageId`;出错前没有任何内容时不落 assistant。例外:regenerate 失败时,若末条是一条完整回答(非中断、非出错),不覆盖它,宁可保留旧答案;末条本身是出错半截时照常替换,不累积。SSE 首个事件 `{type:"meta", userMessageId}` 下发本轮 user 消息 id,前端 `applyStream` 在 meta/done/error 时把落库 id 回填到气泡(新发出的消息无需刷新即可编辑、分支;气泡用 `localKey` 作 React key,回填 id 不重挂载)。runtime 抛 `ProviderError`:状态码 + 中文原因提示 + 服务端原文(API Key / Bearer 凭据脱敏,HTML 错误页只取标题,截断 300 字);只在拿到响应流之前重试 408/429/5xx/529 与网络层错误,默认 2 次指数退避,遵守 Retry-After(超过 20s 不等直接报错),额度耗尽不重试;流式读取 5 分钟无数据主动断开;HTTP 200 后流内下发的 error 对象抛错而非静默结束成空回复。取舍:流开始后不重试,避免重复计费与内容错乱,由用户在出错气泡上点「重试」;中断(用户停止)时客户端收不到 done,assistant 半截的 id 仍需刷新后才有(user 消息 id 已由 meta 事件提前拿到)。

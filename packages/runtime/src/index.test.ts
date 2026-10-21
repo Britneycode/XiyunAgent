@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createOpenAIProvider, normalizeUsage, type ProviderEvent } from "./index.ts";
+import { createOpenAIProvider, normalizeUsage, ProviderError, type ProviderEvent } from "./index.ts";
 
 const config = {
   id: "p1", name: "test", baseUrl: "https://example.test/v1", apiKey: "k", model: "m",
@@ -225,5 +225,120 @@ describe("token 用量(usage)", () => {
     expect(normalizeUsage({ prompt_tokens: 5, completion_tokens: -1 })).toEqual({
       promptTokens: 5, completionTokens: 0, totalTokens: 5,
     });
+  });
+});
+
+describe("错误透传与重试", () => {
+  const ok = () => sse([line({ choices: [{ delta: { content: "ok" } }] }), "data: [DONE]\n\n"]);
+  const drain = async (p: ReturnType<typeof createOpenAIProvider>, signal?: AbortSignal) => {
+    const out: string[] = [];
+    for await (const d of p.streamChat([{ role: "user", content: "hi" }], { signal })) out.push(d);
+    return out.join("");
+  };
+  const fast = { retryBaseMs: 0 };
+
+  it("429 / 5xx 在首 token 前自动重试,成功后正常输出", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("busy", { status: 429, headers: { "retry-after": "0" } }))
+      .mockResolvedValueOnce(new Response("bad gateway", { status: 502 }))
+      .mockResolvedValueOnce(ok());
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await drain(createOpenAIProvider({ ...config, baseUrl: "https://retry.test/v1" }, fast))).toBe("ok");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("重试耗尽后抛出带原因提示与状态码的错误", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { message: "overloaded" } }), { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const p = createOpenAIProvider({ ...config, baseUrl: "https://down503.test/v1" }, fast);
+    await expect(drain(p)).rejects.toThrow("模型服务暂时不可用(HTTP 503:overloaded)");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("401 不重试;服务端原文透出且 API Key 被脱敏", async () => {
+    const key = "sk-secret1234567890";
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { message: `Incorrect API key provided: ${key}`, code: "invalid_api_key" } }), { status: 401 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const err = await drain(createOpenAIProvider({ ...config, apiKey: key, baseUrl: "https://auth.test/v1" }, fast)).catch((e) => e as Error);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).status).toBe(401);
+    expect(err.message).toContain("鉴权失败");
+    expect(err.message).toContain("Incorrect API key provided");
+    expect(err.message).not.toContain(key);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("额度耗尽(429 insufficient_quota)不重试", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ error: { message: "You exceeded your current quota", code: "insufficient_quota" } }), { status: 429 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(drain(createOpenAIProvider({ ...config, baseUrl: "https://quota.test/v1" }, fast))).rejects.toThrow("账户额度不足");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("Retry-After 超过上限时不等待,直接报错", async () => {
+    const fetchMock = vi.fn(async () => new Response("slow down", { status: 429, headers: { "retry-after": "120" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(drain(createOpenAIProvider({ ...config, baseUrl: "https://ra.test/v1" }, fast))).rejects.toThrow("限流");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("网络层失败重试后给出可读原因", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(drain(createOpenAIProvider({ ...config, baseUrl: "https://net.test/v1" }, fast))).rejects.toThrow(
+      "无法连接模型服务(ECONNREFUSED)",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("退避等待期间中断立即结束,不再发起请求", async () => {
+    const fetchMock = vi.fn(async () => new Response("busy", { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const ac = new AbortController();
+    const p = drain(createOpenAIProvider({ ...config, baseUrl: "https://abort.test/v1" }, { retryBaseMs: 10_000 }), ac.signal);
+    setTimeout(() => ac.abort(), 10);
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("HTML 错误页只保留标题", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>", { status: 502 })));
+    const p = createOpenAIProvider({ ...config, baseUrl: "https://html.test/v1" }, { retries: 0 });
+    await expect(drain(p)).rejects.toThrow("模型服务暂时不可用(HTTP 502:502 Bad Gateway)");
+  });
+
+  it("HTTP 200 后流内下发 error 对象时抛错,而不是静默结束", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => sse([
+      line({ choices: [{ delta: { content: "半" } }] }),
+      line({ error: { message: "upstream timeout", code: 504 } }),
+    ])));
+    const out: string[] = [];
+    const run = async () => {
+      for await (const d of createOpenAIProvider({ ...config, baseUrl: "https://mid.test/v1" }).streamChat([{ role: "user", content: "hi" }])) out.push(d);
+    };
+    await expect(run()).rejects.toThrow("模型服务在生成中返回错误(upstream timeout)");
+    expect(out).toEqual(["半"]);
+  });
+
+  it("流式读取空闲超时后断开并报错", async () => {
+    // 发出一个分片后不再有任何数据,也不关闭连接
+    const hang = new Response(
+      new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(line({ choices: [{ delta: { content: "先" } }] })));
+        },
+      }),
+      { status: 200 },
+    );
+    vi.stubGlobal("fetch", vi.fn(async () => hang));
+    const p = createOpenAIProvider({ ...config, baseUrl: "https://idle.test/v1" }, { idleTimeoutMs: 30 });
+    await expect(drain(p)).rejects.toThrow("没有返回数据");
   });
 });

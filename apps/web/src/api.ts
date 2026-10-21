@@ -6,9 +6,11 @@ export type StreamEvent =
   | { type: "block_delta"; id: string; delta: string }
   | { type: "block_end"; id: string; block: ChatBlock }
   | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
+  | { type: "meta"; userMessageId: number | null } // 首个事件:本轮 user 消息的落库 id
   | { delta: string; id?: string }
-  | { error: string }
-  | { done: true; messageId?: number; userMessageId?: number };
+  // 出错时 server 已落库的半截 assistant 带 messageId(未落库为 null)
+  | { error: string; messageId?: number | null; userMessageId?: number | null }
+  | { done: true; messageId?: number | null; userMessageId?: number | null };
 
 export interface RefPayload {
   refType: "message" | "doc" | "file";
@@ -169,10 +171,11 @@ export async function streamChat(
       } catch {
         continue; // 坏 JSON 跳过
       }
-      if ("error" in ev && ev.error) throw new Error(ev.error);
+      // error 事件也先透传:其中的落库 id 要回填到气泡,随后再抛出
       if (opts?.onEvent) opts.onEvent(ev);
       // 旧调用方只收未带 type 的 delta,块事件(type 字段)不下漏到消息文本
       else if (!("type" in ev) && "delta" in ev && ev.delta) onDelta(ev.delta);
+      if ("error" in ev && ev.error) throw new Error(ev.error);
     }
   }
 }

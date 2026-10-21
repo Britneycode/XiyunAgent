@@ -3,9 +3,13 @@ import type { ChatBlock, ChatMessage, SessionMeta } from "@xiyun/shared";
 import { api, streamChat, type RefPayload, type StreamEvent } from "../api.ts";
 
 export interface UIMessage extends ChatMessage {
-  error?: string;
   streaming?: boolean;
+  // 本地创建的气泡的稳定 key:回填落库 id 后 React key 不变,气泡不会重新挂载
+  localKey?: string;
 }
+
+let localSeq = 0;
+const nextKey = () => `local-${++localSeq}`;
 
 // 把块事件应用到本地消息:block 开块,block_delta 追加,block_end 用快照覆盖
 function applyEvent(blocks: ChatBlock[], ev: StreamEvent): ChatBlock[] {
@@ -64,6 +68,37 @@ export function applyQueue(msg: UIMessage, queue: StreamEvent[]): UIMessage {
   return { ...msg, content, blocks: blocks.length ? blocks : undefined, usage };
 }
 
+// 把一批流式事件应用到消息列表:内容事件写进末条 assistant;meta / done / error 携带的落库 id
+// 回填到本轮的 user 与 assistant 气泡,新发出的消息无需刷新即可编辑、分支。纯函数。
+export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] {
+  const ai = ms.length - 1;
+  const last = ms[ai];
+  if (!last || last.role !== "assistant") return ms;
+  let userId: number | null = null;
+  let messageId: number | null = null;
+  for (const ev of queue) {
+    if ("type" in ev) {
+      if (ev.type === "meta" && ev.userMessageId != null) userId = ev.userMessageId;
+    } else if ("done" in ev || "error" in ev) {
+      if (ev.userMessageId != null) userId = ev.userMessageId;
+      if (ev.messageId != null) messageId = ev.messageId;
+    }
+  }
+  const next = [...ms];
+  let msg = applyQueue(last, queue);
+  if (messageId != null && msg.id == null) msg = { ...msg, id: messageId };
+  next[ai] = msg;
+  if (userId != null) {
+    for (let i = ai - 1; i >= 0; i--) {
+      const m = next[i]!;
+      if (m.role !== "user") continue;
+      if (m.id == null) next[i] = { ...m, id: userId };
+      break;
+    }
+  }
+  return next;
+}
+
 export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void }) {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -86,13 +121,7 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
     const queue = pendingRef.current;
     pendingRef.current = [];
     if (!queue.length) return;
-    setMessages((ms) => {
-      const last = ms[ms.length - 1];
-      if (!last || last.role !== "assistant") return ms;
-      const copy = [...ms];
-      copy[copy.length - 1] = applyQueue(last, queue);
-      return copy;
-    });
+    setMessages((ms) => applyStream(ms, queue));
   }, []);
 
   const enqueue = useCallback(
@@ -115,13 +144,13 @@ export function useChatStream(session: SessionMeta, opts?: { onDone?: () => void
       if (!o?.regenerate) {
         setMessages((ms) => [
           ...ms,
-          { role: "user", content: text },
-          { role: "assistant", content: "", blocks: [], streaming: true },
+          { role: "user", content: text, localKey: nextKey() },
+          { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() },
         ]);
       } else {
         setMessages((ms) => {
           const trimmed = ms[ms.length - 1]?.role === "assistant" ? ms.slice(0, -1) : ms;
-          return [...trimmed, { role: "assistant", content: "", blocks: [], streaming: true }];
+          return [...trimmed, { role: "assistant", content: "", blocks: [], streaming: true, localKey: nextKey() }];
         });
       }
       try {
