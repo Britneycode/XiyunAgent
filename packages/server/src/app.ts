@@ -4,10 +4,11 @@ import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { AgentRole, ChatMessage, ProviderConfig, SessionMeta, TaskStatus } from "@xiyun/shared";
+import type { AgentRole, ChatBlock, ChatMessage, ProviderConfig, SessionMeta, TaskStatus } from "@xiyun/shared";
+import type { ChatProvider, ProviderEvent, ToolDef } from "../../runtime/src/index.ts";
 import { MemoryStore } from "./memory.ts";
 import { ProviderStore } from "./providers.ts";
-import { loadRuleFiles } from "./workspace.ts";
+import { assertInside, loadRuleFiles } from "./workspace.ts";
 import { extractMemories } from "./extract.ts";
 import { runMemoryTool } from "./memchat.ts";
 import { WorkStore } from "./docs.ts";
@@ -18,7 +19,13 @@ import { DATA_DIR, backupDb } from "./db.ts";
 
 const now = () => new Date().toISOString();
 
-export function createApp(db: DatabaseSync, memory: MemoryStore, providers: ProviderStore) {
+// opts.chatProvider 仅用于测试注入;缺省仍走 ProviderStore。
+export function createApp(
+  db: DatabaseSync,
+  memory: MemoryStore,
+  providers: ProviderStore,
+  opts?: { chatProvider?: () => ChatProvider },
+) {
   const app = new Hono();
   // CORS 白名单:只放行本机来源(localhost/127.0.0.1/[::1] 的 http(s),覆盖 vite 5173 与桌面渲染器)。
   // 无 Origin 头(非浏览器/curl/Electron 主进程)不写 ACAO 也照常放行;外部来源与 "null"(file:// 沙箱页面)
@@ -146,11 +153,32 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
     db.prepare("DELETE FROM messages WHERE session_id = ?").run(c.req.param("id"));
     return c.json({ ok: true });
   });
+  // 损坏的 blocks JSON 按纯文本降级为 undefined,不让整个接口 500
+  const parseBlocks = (raw: string | null) => {
+    if (!raw) return undefined;
+    try {
+      const v = JSON.parse(raw) as unknown;
+      return Array.isArray(v) ? (v as ChatBlock[]) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   app.get("/sessions/:id/messages", (c) => {
     const rows = db
-      .prepare("SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id")
-      .all(c.req.param("id")) as unknown as ChatMessage[];
-    return c.json(rows);
+      .prepare("SELECT id, role, content, blocks, aborted FROM messages WHERE session_id = ? ORDER BY id")
+      .all(c.req.param("id")) as unknown as Array<{
+      id: number; role: string; content: string; blocks: string | null; aborted: number;
+    }>;
+    return c.json(
+      rows.map((r) => ({
+        id: r.id,
+        role: r.role,
+        content: r.content,
+        blocks: parseBlocks(r.blocks),
+        aborted: r.aborted ? true : undefined,
+      })),
+    );
   });
   // 编辑某条 user 消息:删除该条及其后所有消息,返回被删前的消息(供前端重新发送)。
   // 用于"编辑并重新生成"——截断历史后由 /chat 重新走一轮。
@@ -174,40 +202,53 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
     if (!src) return c.json({ error: "session not found" }, 404);
     const maxId = typeof body.messageId === "number" ? body.messageId : Number.MAX_SAFE_INTEGER;
     const msgs = db
-      .prepare("SELECT role, content, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
-      .all(sessionId, maxId) as unknown as Array<{ role: string; content: string; created_at: string }>;
+      .prepare("SELECT role, content, blocks, aborted, created_at FROM messages WHERE session_id = ? AND id <= ? ORDER BY id")
+      .all(sessionId, maxId) as unknown as Array<{
+      role: string; content: string; blocks: string | null; aborted: number; created_at: string;
+    }>;
     const nid = randomUUID();
     const title = (body.title?.trim() || `${src.title}(分支)`).slice(0, 80);
     const ts = now();
     db.prepare("INSERT INTO sessions (id, title, mode, workspace, created_at) VALUES (?, ?, ?, ?, ?)").run(
       nid, title, src.mode, src.workspace, ts,
     );
-    const ins = db.prepare("INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)");
-    for (const m of msgs) ins.run(nid, m.role, m.content, m.created_at);
+    const ins = db.prepare(
+      "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    for (const m of msgs) ins.run(nid, m.role, m.content, m.blocks, m.aborted, m.created_at);
     return c.json({ id: nid, title, mode: src.mode, workspace: src.workspace, createdAt: ts });
   });
 
   // ---- Chat:规则文件 + 相关记忆 + 历史,流式回复,落库 ----
   app.post("/chat", async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { sessionId?: string; message?: string; regenerate?: boolean };
+    const body = (await c.req.json().catch(() => ({}))) as {
+      sessionId?: string;
+      message?: string;
+      regenerate?: boolean;
+      context?: string;
+      refs?: Array<{ refType: "message" | "doc" | "file"; label: string; excerpt: string }>;
+    };
     if (!body.sessionId || typeof body.message !== "string" || !body.message.trim())
       return c.json({ error: "缺少 sessionId/message" }, 400);
     // 解构为常量,保证闭包内类型收窄不失效
     const sessionId = body.sessionId;
     const message = body.message;
-    // regenerate=true:对同一 user 消息重新生成——不重复落库 user 消息,并删掉上一条 assistant 回复
+    // regenerate=true:对同一 user 消息重新生成——不重复落库 user 消息,并替换上一条 assistant 回复
     const regenerate = body.regenerate === true;
+    // context 只进入模型消息,refs 只作为展示块落库(D5)
+    const context = typeof body.context === "string" ? body.context : "";
+    const refs = Array.isArray(body.refs) ? body.refs : [];
     const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
       | { id: string; workspace: string; mode: string }
       | undefined;
     if (!session) return c.json({ error: "session not found" }, 404);
-    // 优先按 main 角色选模型,无角色标记时退回当前激活 Provider
-    const provider = providers.registry().byRole("main") ?? providers.activeProvider();
+    // D1:激活 Provider 优先,角色兜底——模型下拉才能生效
+    const provider = opts?.chatProvider?.() ?? providers.activeProvider() ?? providers.registry().byRole("main");
     if (!provider) return c.json({ error: "no provider configured" }, 400);
 
     const rules = loadRuleFiles(session.workspace, { dataDir: DATA_DIR, mode: session.mode });
     const scopes = ["global", session.mode, session.workspace];
-    // 自然语言记忆指令("记住X"/"忘掉X"):先执行增删,结果注入上下文由回复确认。
+    // 记忆链路只用用户原话:引用上下文不参与记忆指令与检索(D5)
     const memNote = await runMemoryTool({ provider, memory, message: message, scopes, scope: session.mode });
     let facts = memory.search(message, 5, scopes);
     // 无主题词的泛化提问("我上次学到哪了")召回为空时,回退到最近的有效记忆。
@@ -242,38 +283,294 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
       // 历史里摘掉最后一条 assistant,避免旧答案影响重新生成
       const last = history[history.length - 1];
       if (last?.role === "assistant") history.pop();
+      // 末尾是与本次相同的 user 时也弹出,避免同一句话出现两次
+      const lastUser = history[history.length - 1];
+      if (lastUser?.role === "user" && lastUser.content === message) history.pop();
     }
 
-    const messages: ChatMessage[] = [{ role: "system", content: system }, ...history, { role: "user", content: message }];
+    const modelMessage = context ? `${message}\n\n# 引用上下文\n${context}` : message;
+    const messages: ChatMessage[] = [
+      { role: "system", content: system },
+      ...history,
+      { role: "user", content: modelMessage },
+    ];
 
-    if (regenerate) {
-      db.prepare(
-        "DELETE FROM messages WHERE id = (SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1)",
-      ).run(sessionId);
+    // user 落库:content 只存原话,refs 作为 ref 块(D5)
+    let userMessageId: number | null = null;
+    if (!regenerate) {
+      const r = db
+        .prepare("INSERT INTO messages (session_id, role, content, blocks, created_at) VALUES (?, 'user', ?, ?, ?)")
+        .run(
+          sessionId,
+          message,
+          refs.length
+            ? JSON.stringify(refs.map((r2, i) => ({ id: `ref${i + 1}`, kind: "ref", ...r2 })))
+            : null,
+          now(),
+        );
+      userMessageId = Number(r.lastInsertRowid);
     } else {
-      db.prepare("INSERT INTO messages (session_id, role, content, created_at) VALUES (?, 'user', ?, ?)").run(
-        sessionId, message, now(),
-      );
+      const prev = db
+        .prepare("SELECT id FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1")
+        .get(sessionId) as { id: number } | undefined;
+      userMessageId = prev?.id ?? null;
     }
+
+    // D2:工具定义默认不下发,需显式开启环境变量且 Provider 声明 tools 能力
+    const READONLY_TOOLS: ToolDef[] = [
+      {
+        name: "list_files",
+        description: "列出工作区内的文件(相对路径)",
+        parameters: { type: "object", properties: { path: { type: "string", description: "子目录,默认 ." } } },
+      },
+      {
+        name: "read_file",
+        description: "读取工作区内的文件内容",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      },
+    ];
+    const exposeTools =
+      provider.config.capabilities?.includes("tools") && process.env.XIYUN_EXPOSE_TOOLS === "1" && !!session.workspace;
+    const tools = exposeTools ? READONLY_TOOLS : undefined;
 
     return streamSSE(c, async (stream) => {
-      let full = "";
-      try {
-        for await (const delta of provider.streamChat(messages)) {
-          full += delta;
-          await stream.writeSSE({ data: JSON.stringify({ delta }) });
+      const ac = new AbortController();
+      // stream.onAbort 只在部分适配器触发;真实 HTTP 中断由请求信号透出,两者都接
+      stream.onAbort(() => ac.abort());
+      // 若在准备上下文期间客户端就已断开,信号已 aborted,监听不会再触发,先补一次
+      if (c.req.raw.signal.aborted) ac.abort();
+      c.req.raw.signal.addEventListener("abort", () => ac.abort(), { once: true });
+
+      // SSE 写按序入队、不阻塞状态机:客户端停止读取时 writeSSE 会一直挂着,
+      // 若 await 它,中断后状态机再也拿不到控制权;stream.close() 会等待队列写完。
+      let writing: Promise<unknown> = Promise.resolve();
+      const send = (obj: unknown) => {
+        writing = writing.then(() => stream.writeSSE({ data: JSON.stringify(obj) })).catch(() => {});
+        return writing;
+      };
+
+      const blocks: ChatBlock[] = [];
+      const toolBlocks = new Map<string, Extract<ChatBlock, { kind: "tool" }>>();
+      // 已收到 tool_end 的调用;中断时据此区分已结束与半截的工具
+      const finishedTools = new Set<string>();
+      // open 记录已入列块的下标,关闭时原地更新,避免同一段内容入列两次
+      let open: { kind: "text" | "thinking" | "tool"; id: string; text: string; t0: number; idx: number } | null = null;
+      let seq = 0;
+      let finishReason: string | null = null;
+
+      const closeOpen = () => {
+        const b = open;
+        if (!b) return;
+        open = null;
+        if (b.kind === "thinking") {
+          const block: ChatBlock = { id: b.id, kind: "thinking", text: b.text, durationMs: Date.now() - b.t0 };
+          blocks[b.idx] = block;
+          void send({ type: "block_end", id: b.id, block });
+        } else if (b.kind === "text") {
+          const block: ChatBlock = { id: b.id, kind: "text", text: b.text };
+          blocks[b.idx] = block;
+          void send({ type: "block_end", id: b.id, block });
         }
-        db.prepare("INSERT INTO messages (session_id, role, content, created_at) VALUES (?, 'assistant', ?, ?)").run(
-          sessionId, full, now(),
-        );
+      };
+
+      const ensureText = () => {
+        if (open?.kind === "text") return open;
+        closeOpen();
+        seq += 1;
+        const block: ChatBlock = { id: `t${seq}`, kind: "text", text: "" };
+        const idx = blocks.push(block) - 1;
+        open = { kind: "text", id: block.id, text: "", t0: Date.now(), idx };
+        void send({ type: "block", id: block.id, block: { kind: "text" } });
+        return open;
+      };
+
+      const finishTool = (id: string) => {
+        const b = toolBlocks.get(id);
+        if (!b) return;
+        try {
+          b.args = JSON.parse(b.rawArgs || "{}") as unknown;
+          b.status = "pending";
+        } catch (e) {
+          b.argsError = e instanceof Error ? e.message : "参数解析失败";
+          b.status = "error";
+        }
+        // target 由服务端填写:工作区来自 session,路径必须落在工作区内
+        if (session.workspace) {
+          b.target = { workspace: session.workspace };
+          const p = (b.args as { path?: unknown } | undefined)?.path;
+          if (typeof p === "string") {
+            try {
+              assertInside(session.workspace, p);
+              b.target.path = p;
+            } catch {
+              // 越界路径不填 target.path
+            }
+          }
+        }
+        finishedTools.add(id);
+        if (open?.kind === "tool" && open.id === id) open = null;
+        void send({ type: "block_end", id, block: b });
+      };
+
+      // 中断收尾:没等到 tool_end 的调用标记为 error 并补发 block_end,避免客户端卡片停在 pending
+      const closeUnfinishedTools = () => {
+        for (const [id, b] of toolBlocks) {
+          if (finishedTools.has(id)) continue;
+          b.status = "error";
+          b.note = "已中断";
+          finishedTools.add(id);
+          void send({ type: "block_end", id, block: b });
+        }
+        open = null;
+      };
+
+      let it: AsyncIterator<ProviderEvent> | null = null;
+      try {
+        const iter: AsyncIterable<ProviderEvent> = provider.streamEvents
+          ? provider.streamEvents(messages, { signal: ac.signal, tools })
+          : (async function* () {
+              for await (const d of provider.streamChat(messages, { signal: ac.signal })) {
+                yield { type: "text", delta: d } as ProviderEvent;
+              }
+            })();
+        it = iter[Symbol.asyncIterator]();
+
+        // 与中断竞速:Provider 不响应 signal 时也能立即收尾落库,不把流挂死
+        const interrupted = new Promise<{ aborted: true }>((resolve) => {
+          const onAbort = () => resolve({ aborted: true });
+          if (ac.signal.aborted) onAbort();
+          else ac.signal.addEventListener("abort", onAbort, { once: true });
+        });
+        for (;;) {
+          // 已中断时不再等待 Provider
+          const step = ac.signal.aborted
+            ? ({ aborted: true } as const)
+            : await Promise.race([it.next(), interrupted]);
+          if ("aborted" in step) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+          if (step.done) break;
+          const ev = step.value;
+          if (ev.type === "text") {
+            const o = ensureText();
+            o.text += ev.delta;
+            const cur = blocks[o.idx];
+            if (cur?.kind === "text") cur.text = o.text;
+            void send({ delta: ev.delta, id: o.id });
+          } else if (ev.type === "thinking") {
+            if (open?.kind !== "thinking") {
+              closeOpen();
+              seq += 1;
+              const idx = blocks.push({ id: `r${seq}`, kind: "thinking", text: "" }) - 1;
+              open = { kind: "thinking", id: `r${seq}`, text: "", t0: Date.now(), idx };
+              void send({ type: "block", id: open.id, block: { kind: "thinking" } });
+            }
+            open.text += ev.delta;
+            const cur = blocks[open.idx];
+            if (cur?.kind === "thinking") cur.text = open.text;
+            void send({ type: "block_delta", id: open.id, delta: ev.delta });
+          } else if (ev.type === "tool_start") {
+            closeOpen();
+            const block: Extract<ChatBlock, { kind: "tool" }> = {
+              id: ev.id, kind: "tool", name: ev.name, rawArgs: "", status: "pending",
+            };
+            toolBlocks.set(ev.id, block);
+            const idx = blocks.push(block) - 1;
+            open = { kind: "tool", id: ev.id, text: "", t0: Date.now(), idx };
+            void send({ type: "block", id: ev.id, block: { kind: "tool", name: ev.name, status: "pending" } });
+          } else if (ev.type === "tool_args") {
+            const b = toolBlocks.get(ev.id);
+            if (b) b.rawArgs += ev.delta;
+            void send({ type: "block_delta", id: ev.id, delta: ev.delta });
+          } else if (ev.type === "tool_end") {
+            const b = toolBlocks.get(ev.id);
+            if (b) b.rawArgs = ev.args;
+            finishTool(ev.id);
+          } else if (ev.type === "finish") {
+            finishReason = ev.reason;
+          }
+        }
+
+        closeOpen();
+
+        // 仅 tool_calls 且无正文时兜底,保证 content 非空
+        const hasText = blocks.some((b) => b.kind === "text" && b.text.trim());
+        if (finishReason === "tool_calls" && !hasText) {
+          seq += 1;
+          const id = `t${seq}`;
+          const note = "（模型请求调用工具，当前版本不执行工具。）";
+          const block: ChatBlock = { id, kind: "text", text: note };
+          blocks.push(block);
+          void send({ type: "block", id, block: { kind: "text" } });
+          void send({ delta: note, id });
+          void send({ type: "block_end", id, block });
+        }
+
+        if (ac.signal.aborted) {
+          // 中断时为未结束的工具补 error/note
+          closeUnfinishedTools();
+          const content = textOf(blocks);
+          // 全空则什么都不落,避免留下空 assistant 行
+          if (content || blocks.length) persist({ content, blocks, aborted: true });
+          return;
+        }
+        const content = textOf(blocks);
+        const messageId = persist({ content, blocks, aborted: false });
         db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('chat', ?, ?)").run(
-          JSON.stringify({ sessionId: sessionId, user: message, assistant: full }), now(),
+          JSON.stringify({ sessionId, user: message, assistant: content }), now(),
         );
-        await stream.writeSSE({ data: JSON.stringify({ done: true }) });
+        void send({ done: true, messageId, userMessageId });
         queueExtract(sessionId, session.mode, session.workspace);
       } catch (e) {
-        // 不把异常原文(可能含请求信息)直接外发
-        await stream.writeSSE({ data: JSON.stringify({ error: e instanceof Error ? e.message : "provider error" }) });
+        // 中断后不再消费 Provider;主动关闭迭代器,让上游连接释放
+        if (ac.signal.aborted) void it?.return?.();
+        closeOpen();
+        if (ac.signal.aborted) {
+          closeUnfinishedTools();
+          const content = textOf(blocks);
+          if (content || blocks.length) persist({ content, blocks, aborted: true });
+          return;
+        }
+        // 不把异常原文(可能含请求信息)直接外发,也不落 assistant
+        void send({ error: e instanceof Error ? e.message : "provider error" });
+      } finally {
+        // 客户端已断开时 writeSSE 可能永久挂起,不再等待,让响应流直接关闭
+        if (!ac.signal.aborted) await writing;
+      }
+
+      function textOf(list: ChatBlock[]): string {
+        return list
+          .filter((b): b is Extract<ChatBlock, { kind: "text" }> => b.kind === "text")
+          .map((b) => b.text)
+          .join("");
+      }
+
+      // regenerate 只在会话末条确实是 assistant 时替换;U1/A1/U2 出错重试不得删 A1。
+      // 删除与插入同一事务,避免删成功但插入失败丢历史。
+      function persist(input: { content: string; blocks: ChatBlock[]; aborted: boolean }): number | null {
+        if (input.aborted && !input.content && input.blocks.length === 0) return null;
+        db.exec("BEGIN");
+        try {
+          if (regenerate) {
+            db.prepare(
+              "DELETE FROM messages WHERE id = (SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1) AND role = 'assistant'",
+            ).run(sessionId);
+          }
+          const r = db
+            .prepare(
+              "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, 'assistant', ?, ?, ?, ?)",
+            )
+            .run(
+              sessionId,
+              input.content,
+              input.blocks.length ? JSON.stringify(input.blocks) : null,
+              input.aborted ? 1 : 0,
+              now(),
+            );
+          db.exec("COMMIT");
+          return Number(r.lastInsertRowid);
+        } catch (e) {
+          db.exec("ROLLBACK");
+          throw e;
+        }
       }
     });
   });
@@ -472,9 +769,16 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
     return c.json(r);
   });
   app.post("/tools/git/diff", async (c) => {
-    const b = (await c.req.json()) as { workspace: string };
-    const r = await shellExec({ workspace: b.workspace, command: "git diff HEAD" });
-    return c.json(r);
+    const b = (await c.req.json().catch(() => ({}))) as { workspace: string };
+    try {
+      const r = await shellExec({ workspace: b.workspace, command: "git diff HEAD" });
+      // shellExec 对非零退出码不抛错(如非 git 目录),这里统一转为 400;
+      // stderr 可能带整段 git usage,只取首行作为错误信息
+      if (r.exitCode !== 0) throw new Error(r.stderr.trim().split("\n")[0] || `git diff 失败:exit ${r.exitCode}`);
+      return c.json(r);
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : "diff failed" }, 400);
+    }
   });
   app.post("/tools/git/preview", async (c) => {
     const b = (await c.req.json()) as { workspace: string };
@@ -618,7 +922,7 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
 
   app.get("/admin/export", (c) => {
     const sessions = db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>;
-    const messages = db.prepare("SELECT session_id, role, content, created_at FROM messages ORDER BY id").all();
+    const messages = db.prepare("SELECT session_id, role, content, blocks, aborted, created_at FROM messages ORDER BY id").all();
     const docs = db.prepare("SELECT * FROM docs ORDER BY created_at").all();
     const todos = db.prepare("SELECT * FROM todos ORDER BY created_at").all();
     const facts = db.prepare("SELECT * FROM facts WHERE deleted_at IS NULL ORDER BY valid_from").all();
@@ -675,14 +979,26 @@ export function createApp(db: DatabaseSync, memory: MemoryStore, providers: Prov
         insSession.run(r.id, String(r.title ?? "导入会话"), String(r.mode ?? "chat"), String(r.workspace ?? ""), String(r.created_at ?? now()), r.archived ? 1 : 0);
         add.sessions++;
       }
-      const insMsg = db.prepare("INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)");
+      const insMsg = db.prepare(
+        "INSERT INTO messages (session_id, role, content, blocks, aborted, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      );
       // 消息无稳定 id,重复导入同一导出包时按 (session_id, role, content, created_at) 去重,避免二次落库
       const hasMsg = db.prepare("SELECT 1 FROM messages WHERE session_id = ? AND role = ? AND content = ? AND created_at = ?");
       for (const r of (d.messages ?? []) as Array<Record<string, unknown>>) {
         if (typeof r.session_id !== "string" || !sessionIds.has(r.session_id)) continue;
         const role = String(r.role ?? "user"), content = String(r.content ?? ""), created = String(r.created_at ?? now());
         if (hasMsg.get(r.session_id, role, content, created)) continue;
-        insMsg.run(r.session_id, role, content, created);
+        // 非合法 JSON 的 blocks 存 NULL,避免把坏数据带进来
+        let blocks: string | null = null;
+        if (typeof r.blocks === "string") {
+          try {
+            JSON.parse(r.blocks);
+            blocks = r.blocks;
+          } catch {
+            blocks = null;
+          }
+        }
+        insMsg.run(r.session_id, role, content, blocks, r.aborted ? 1 : 0, created);
         add.messages++;
       }
       const simple = (table: string, cols: string[], rows: unknown[] | undefined, key: keyof typeof skip) => {

@@ -1,119 +1,58 @@
 import { useEffect, useRef, useState } from "react";
-import { marked } from "marked";
-import type { ChatMessage } from "@xiyun/shared";
-import { api, streamChat } from "./api.ts";
+import type { SessionMeta } from "@xiyun/shared";
+import { api } from "./api.ts";
+import { MessageBody, RefChips, type Preview } from "./chat/blocks.tsx";
+import { Composer } from "./chat/Composer.tsx";
+import { useChatStream } from "./chat/useChatStream.ts";
+import { renderMarkdown as renderMarkdownSafe } from "./chat/markdown.ts";
 
-const escapeHtml = (s: string) =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+export interface ChatPageProps {
+  session: SessionMeta;
+  onBranch?: (messageId: number) => void;
+  onPreview?: (p: Preview) => void;
+  onNewSession?: () => void;
+  onCandidatesChanged?: () => void;
+}
 
-marked.use({
-  renderer: {
-    code({ text, lang }) {
-      if (typeof hljs !== "undefined" && lang && hljs.getLanguage(lang)) {
-        return `<pre><code class="hljs">${hljs.highlight(text, { language: lang }).value}</code></pre>`;
-      }
-      return `<pre><code class="hljs">${escapeHtml(text)}</code></pre>`;
-    },
-  },
-});
+export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandidatesChanged }: ChatPageProps) {
+  const { messages, setMessages, send, stop, regenerate, busy } = useChatStream(session, {
+    onDone: onCandidatesChanged,
+  });
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editText, setEditText] = useState("");
+  const scroller = useRef<HTMLDivElement>(null);
 
-export function ChatPage({ sessionId, onBranch }: { sessionId: string; onBranch?: (messageId: number) => void }) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
-
+  // 仅在接近底部时自动滚动;瞬时定位避免 smooth 造成抖动
   useEffect(() => {
-    void api.messages(sessionId).then((ms) => setMessages(ms.filter((m) => m.role !== "system")));
-  }, [sessionId]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = scroller.current;
+    if (!el) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
-  useEffect(() => {
-    if (typeof renderMathInElement === "undefined") return;
-    document.querySelectorAll<HTMLElement>(".msg-body").forEach((el) =>
-      renderMathInElement(el, {
-        delimiters: [
-          { left: "$$", right: "$$", display: true },
-          { left: "\\[", right: "\\]", display: true },
-          { left: "\\(", right: "\\)", display: false },
-        ],
-        throwOnError: false,
-      }),
-    );
-  }, [messages]);
-
-  const send = async (text: string, regenerate = false) => {
-    if (!text || busy) return;
-    setInput("");
-    setBusy(true);
-    abortRef.current = new AbortController();
-    if (!regenerate)
-      setMessages((ms) => [...ms, { role: "user", content: text }, { role: "assistant", content: "" }]);
-    else setMessages((ms) => [...ms, { role: "assistant", content: "" }]);
-    try {
-      await streamChat(sessionId, text, (delta) => {
-        setMessages((ms) => {
-          const copy = [...ms];
-          const last = copy[copy.length - 1];
-          copy[copy.length - 1] = { ...last, content: last.content + delta };
-          return copy;
-        });
-      }, abortRef.current.signal, regenerate);
-    } catch (e) {
-      if (!abortRef.current.signal.aborted) {
-        setMessages((ms) => {
-          const copy = [...ms];
-          copy[copy.length - 1] = { role: "assistant", content: `出错:${e instanceof Error ? e.message : e}` };
-          return copy;
-        });
-      } else {
-        // 用户主动停止:删掉空气泡,保留已流出的内容
-        setMessages((ms) => {
-          const copy = [...ms];
-          const last = copy[copy.length - 1];
-          if (last?.role === "assistant" && !last.content) copy.pop();
-          return copy;
-        });
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // 重新生成/重试:丢弃本地最后一条 assistant 气泡,对同一 user 消息重发(regenerate=true 让 server 不重复落库 user 消息)
-  const regenerate = () => {
-    const lastUser = [...messages].reverse().find((m) => m.role === "user");
-    if (!lastUser || busy) return;
-    setMessages((ms) => (ms[ms.length - 1]?.role === "assistant" ? ms.slice(0, -1) : ms));
-    void send(lastUser.content, true);
-  };
-
-  // 复制消息内容到剪贴板
-  const copyMsg = (content: string, e: React.MouseEvent<HTMLButtonElement>) => {
-    void navigator.clipboard.writeText(content).then(() => {
-      const btn = e.currentTarget;
-      btn.textContent = "✓";
-      setTimeout(() => (btn.textContent = "⧉"), 1200);
+  // 代码块复制:事件委托
+  const onCopyClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-copy]");
+    if (!btn) return;
+    const code = btn.closest(".code-block")?.querySelector("code");
+    if (!code) return;
+    void navigator.clipboard.writeText(code.textContent ?? "").then(() => {
+      btn.textContent = "已复制";
+      setTimeout(() => (btn.textContent = "复制"), 1200);
     });
   };
 
-  // 编辑 user 消息:把内容放回输入框,并截断该条及其后消息(用户重新发送即重生成)
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const startEdit = (m: ChatMessage) => {
+  const startEdit = (id: number, content: string) => {
     if (busy) return;
-    setInput(m.content);
-    setEditingId(m.id ?? null);
+    setEditingId(id);
+    setEditText(content);
   };
+
   const submitEdit = async () => {
     if (editingId == null) return;
-    const text = input.trim();
-    await api.truncateFrom(sessionId, editingId).catch(() => {});
+    const text = editText.trim();
+    await api.truncateFrom(session.id, editingId).catch(() => {});
     setEditingId(null);
-    // 截断后本地也删掉该条及之后的消息,再重新发送
+    setEditText("");
     setMessages((ms) => {
       const idx = ms.findIndex((m) => m.id === editingId);
       return idx >= 0 ? ms.slice(0, idx) : ms;
@@ -124,30 +63,49 @@ export function ChatPage({ sessionId, onBranch }: { sessionId: string; onBranch?
   // Esc 停止生成
   useEffect(() => {
     if (!busy) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && abortRef.current?.abort();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && stop();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy]);
-
-  const lastIsAssistant = messages[messages.length - 1]?.role === "assistant";
-  const lastIsError = lastIsAssistant && messages[messages.length - 1].content.startsWith("出错:");
+  }, [busy, stop]);
 
   return (
     <>
-      <div className="chat-messages">
+      <div className="chat-messages" ref={scroller} onClick={onCopyClick}>
         {messages.length === 0 && <div className="empty">这个会话还没有消息。</div>}
         {messages.map((m, i) => (
-          <div className={`msg ${m.role}`} key={m.id ?? i}>
-            <div className="msg-body" dangerouslySetInnerHTML={{ __html: marked.parse(m.content, { async: false }) }} />
+          <div className={`msg ${m.role}`} key={m.id ?? `tmp-${i}`}>
+            {m.role === "user" && m.blocks?.some((b) => b.kind === "ref") && (
+              <RefChips refs={m.blocks.filter((b) => b.kind === "ref") as never} />
+            )}
+            {m.role === "user" ? (
+              <div className="msg-body" dangerouslySetInnerHTML={{ __html: renderMarkdownSafe(m.content) }} />
+            ) : (
+              <MessageBody
+                content={m.content}
+                blocks={m.blocks}
+                streaming={m.streaming}
+                onPreview={onPreview}
+              />
+            )}
+            {m.aborted && <div className="msg-note mono">已中断</div>}
+            {m.error && (
+              <div className="msg-error mono">
+                {m.error}
+                <button type="button" onClick={regenerate}>重试</button>
+              </div>
+            )}
             {!busy && m.content && (
               <div className="msg-actions">
-                <button title="复制" onClick={(e) => copyMsg(m.content, e)}>⧉</button>
+                <button
+                  title="复制"
+                  onClick={() => void navigator.clipboard.writeText(m.content)}
+                >⧉</button>
                 {m.role === "assistant" && i === messages.length - 1 && (
                   <button title="重新生成" onClick={regenerate}>↻</button>
                 )}
                 {m.role === "user" && m.id != null && (
                   <>
-                    <button title="编辑并重新生成" onClick={() => startEdit(m)}>✎</button>
+                    <button title="编辑并重新生成" onClick={() => startEdit(m.id!, m.content)}>✎</button>
                     {onBranch && <button title="分支到新会话" onClick={() => onBranch(m.id!)}>⑂</button>}
                   </>
                 )}
@@ -155,51 +113,20 @@ export function ChatPage({ sessionId, onBranch }: { sessionId: string; onBranch?
             )}
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
-      <div className="chat-input-wrap">
-        {editingId != null && (
-          <div className="editing-bar">
-            正在编辑消息,发送后将替换该条及其后的对话
-            <button onClick={() => { setEditingId(null); setInput(""); }}>取消编辑</button>
-          </div>
-        )}
-        <div className="chat-input">
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !busy) {
-                e.preventDefault();
-                if (editingId != null) void submitEdit();
-                else {
-                  const text = input.trim();
-                  if (text) void send(text);
-                }
-              }
-            }}
-            placeholder={editingId != null ? "编辑消息,Enter 重新生成" : "输入消息,Enter 发送,Shift+Enter 换行,Esc 停止"}
-            disabled={busy}
-          />
-          {busy ? (
-            <>
-              <span className="hint">生成中…(Esc 停止)</span>
-              <button className="danger" onClick={() => abortRef.current?.abort()}>停止</button>
-            </>
-          ) : (
-            <>
-              {lastIsAssistant && messages.length > 0 && editingId == null && (
-                <button onClick={regenerate} title="对同一问题重新生成回答">
-                  {lastIsError ? "重试" : "重新生成"}
-                </button>
-              )}
-              <button className="primary" onClick={() => (editingId != null ? void submitEdit() : void send(input.trim()))}>
-                发送
-              </button>
-            </>
-          )}
-        </div>
-      </div>
+      <Composer
+        session={session}
+        busy={busy}
+        editingId={editingId}
+        editText={editText}
+        onEditText={setEditText}
+        onCancelEdit={() => { setEditingId(null); setEditText(""); }}
+        onSubmit={(text, o) => (editingId != null ? void submitEdit() : void send(text, o))}
+        onStop={stop}
+        onNewSession={onNewSession}
+        onCandidatesChanged={onCandidatesChanged}
+        messages={messages}
+      />
     </>
   );
 }

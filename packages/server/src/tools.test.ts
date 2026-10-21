@@ -3,6 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { createApp } from "./app.ts";
+import { openDb } from "./db.ts";
+import { MemoryStore } from "./memory.ts";
+import { ProviderStore } from "./providers.ts";
 import {
   classifyCommand, detectShells, gitCommit, gitPreview, gitStatusEntries,
   readTool, shellExec, writeTool,
@@ -222,6 +226,27 @@ describe.skipIf(!gitAvailable)("Git 提交范围(阶段 2)", () => {
     const r = await gitCommit({ workspace: dir, message: "empty", files: ["a.txt"], confirmed: true });
     expect(r.exitCode).not.toBe(0);
     expect(gitLog(dir)).toBe("init");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---- 阶段 3:/tools/git/diff 错误处理 ----
+
+// tools.test.ts 原本只测纯函数,这里按 app.data.test.ts 的方式构造 app
+function setup() {
+  const db = openDb(":memory:");
+  return { app: createApp(db, new MemoryStore(db), new ProviderStore(mkdtempSync(join(tmpdir(), "xiyun-data-")))), db };
+}
+
+describe("/tools/git/diff", () => {
+  it("git diff 在非 git 目录返回 400 而非 500", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "xiyun-nogit-"));
+    const { app } = setup();
+    const res = await app.request("/tools/git/diff", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workspace: dir }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()) as { error: string }).toHaveProperty("error");
     rmSync(dir, { recursive: true, force: true });
   });
 });

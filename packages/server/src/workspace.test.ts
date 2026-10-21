@@ -46,3 +46,18 @@ test("providers: apiKey 不回显明文", () => {
   s.upsert({ id: "p1", name: "t2", baseUrl: "http://x", apiKey: "********", model: "m" });
   assert.equal(s.activeProvider()!.config.apiKey, "sk-secret");
 });
+
+test("providers: listMasked 标记服务端 active,与 activeProvider 同口径", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xy-"));
+  const s = new ProviderStore(dir);
+  s.upsert({ id: "p1", name: "a", baseUrl: "http://x", apiKey: "k1", model: "m" });
+  s.upsert({ id: "p2", name: "b", baseUrl: "http://x", apiKey: "k2", model: "m" });
+  // 首个 upsert 自动成为 active
+  assert.deepEqual(s.listMasked().map((p) => p.active), [true, false]);
+  s.setActive("p2");
+  assert.deepEqual(s.listMasked().map((p) => p.active), [false, true]);
+  // activeProviderId 指向不存在的 id 时回退到列表第一项
+  s.setActive("missing");
+  assert.deepEqual(s.listMasked().map((p) => p.active), [true, false]);
+  assert.equal(s.activeProvider()!.config.id, "p1");
+});

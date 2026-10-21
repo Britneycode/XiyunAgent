@@ -22,6 +22,12 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
     const cols = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((c) => c.name);
     if (!cols.includes("archived")) db.exec("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
   },
+  // v5:messages.blocks(结构化块 JSON)+ messages.aborted(用户中断标记)
+  (db) => {
+    const cols = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cols.includes("blocks")) db.exec("ALTER TABLE messages ADD COLUMN blocks TEXT");
+    if (!cols.includes("aborted")) db.exec("ALTER TABLE messages ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0");
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -59,6 +65,8 @@ export function openDb(file = join(DATA_DIR, "app.db")): DatabaseSync {
       session_id TEXT NOT NULL,
       role TEXT NOT NULL,
       content TEXT NOT NULL,
+      blocks TEXT,
+      aborted INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS facts (
