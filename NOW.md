@@ -84,6 +84,7 @@
 - [x] 阶段 5 缺陷已修复(2026-10-07):`searchDocs` 整句 LIKE 无命中时退化为 3 字滑窗 OR + 按命中片段数排序(与记忆检索兜底一致),自然语言问句可命中并正确定位片段;`POST /chat` 缺 `sessionId`/`message` 返回 400
 - [x] 阶段 6 实测(2026-10-07):目录导入返回 manifest 且不自动启用,缺 SKILL.md/无效 id/无效 version 均 400 拒绝,同 id 升级 v1→v2 保留启用状态,禁用即时生效;`examples/skills/` 3 个示例可导入
 - [x] 阶段 6 缺陷已修复(2026-10-07):ZIP 导入 win32 优先 `C:\Windows\System32\tar.exe`(bsdtar),PATH 命中 GNU tar 时退化加 `--force-local`(GNU tar 会把 `D:/...` 当远程主机)
+- [x] Agent 工作台 UI 手工验收(2026-10-21,spec §5.2 八项):①思考块流式增量与 `durationMs` 由 SSE 直测确认,落库回放自动收起显示「已思考 0.3s」;②工具卡片 `pending`/展开入参/「在预览中查看」联动右栏均通过;③python 与 diff 代码块具备语言标签、复制(点击变「已复制」)、行号、hljs 高亮;④`@` 面板 message+file 双源命中并生成可删除胶囊,`/new`(会话数 +1)、`/export`(下载 md 含思考块引用)、`/memory`(新增 2 条候选)均生效;⑤模型下拉切 DeepSeek 后后端实际走该 Provider;⑥用户上翻后 8 秒流式期间 `scrollTop` 恒为 0 不被抢滚,贴底时自动跟随;⑦旧会话(18 条消息、无 `blocks`)纯文本正常回放;⑧中断显示「已中断」且未闭合围栏回退纯文本、重试重新流式生成、编辑态回填原文且可取消。**验收环境限制**:雷电模拟器自带 Android Browser 打开页面初始渲染正常但发送后白屏(内核过旧),改用桌面 Chrome 完成全部八项;验收临时改动 `data/config.json` 已还原(无 capabilities、模型名回原值、activeProviderId 回 p1)。**遗留 UI 缺陷**:`Composer.tsx:80` 模型下拉初始化取 `ps.find((p) => p.id)` 即列表第一项,未读服务端 activeProvider,导致刷新后下拉显示与实际生效 Provider 不一致(切换功能本身正常)
 - [ ] 可执行插件沙箱(Extension API、运行时权限强制):当前 Skill 仅声明式,`memoryScopes` 只做校验与展示,未做运行时强制
 - [ ] PDF/Office 文档解析(需新增依赖,如 pdf-parse/mammoth;当前 pnpm 供应链策略下安装受限,待用户确认后引入)
 - [x] 打包应用(win-unpacked)冒烟验收:窗口启动、`/health` 200、数据落 `%APPDATA%\XiyunAgent\app.db`(2026-10-06)

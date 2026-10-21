@@ -47,7 +47,7 @@ export function Composer(props: {
   const [files, setFiles] = useState<string[]>([]);
   const [docs, setDocs] = useState<WorkDoc[]>([]);
   const [sourceNote, setSourceNote] = useState("");
-  const [providers, setProviders] = useState<Array<Omit<ProviderConfig, "apiKey"> & { apiKey: string }>>([]);
+  const [providers, setProviders] = useState<Awaited<ReturnType<typeof api.providers>>>([]);
   const [activeId, setActiveId] = useState("");
   const [cmdNote, setCmdNote] = useState("");
 
@@ -77,7 +77,8 @@ export function Composer(props: {
   useEffect(() => {
     void api.providers().then((ps) => {
       setProviders(ps);
-      setActiveId(ps.find((p) => p.id)?.id ?? "");
+      // 以服务端 active 为准,刷新后下拉与实际生效的 Provider 保持一致
+      setActiveId(ps.find((p) => p.active)?.id ?? ps[0]?.id ?? "");
     }).catch(() => {});
   }, []);
 

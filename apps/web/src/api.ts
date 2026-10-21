@@ -46,7 +46,7 @@ export const api = {
   branchSession: (sessionId: string, body: { messageId?: number; title?: string }) =>
     req<SessionMeta>(`/sessions/${sessionId}/branch`, { method: "POST", body: JSON.stringify(body) }),
   messages: (id: string) => req<ChatMessage[]>(`/sessions/${id}/messages`),
-  providers: () => req<Array<Omit<ProviderConfig, "apiKey"> & { apiKey: string }>>("/providers"),
+  providers: () => req<Array<Omit<ProviderConfig, "apiKey"> & { apiKey: string; active: boolean }>>("/providers"),
   saveProvider: (p: ProviderConfig) => req("/providers", { method: "POST", body: JSON.stringify(p) }),
   deleteProvider: (id: string) => req(`/providers/${id}`, { method: "DELETE" }),
   activateProvider: (id: string) => req(`/providers/${id}/activate`, { method: "POST" }),

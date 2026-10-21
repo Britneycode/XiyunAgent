@@ -26,8 +26,12 @@ export class ProviderStore {
     writeFileSync(this.file, JSON.stringify(this.data, null, 2));
   }
 
-  listMasked(): Array<Omit<ProviderConfig, "apiKey"> & { apiKey: string }> {
-    return this.data.providers.map((p) => ({ ...p, apiKey: p.apiKey ? MASK : "" }));
+  listMasked(): Array<Omit<ProviderConfig, "apiKey"> & { apiKey: string; active: boolean }> {
+    // 与 activeProvider() 同口径:activeProviderId 缺失时回退到列表第一项
+    const activeId = this.data.providers.some((p) => p.id === this.data.activeProviderId)
+      ? this.data.activeProviderId
+      : this.data.providers[0]?.id;
+    return this.data.providers.map((p) => ({ ...p, apiKey: p.apiKey ? MASK : "", active: p.id === activeId }));
   }
 
   upsert(p: ProviderConfig): void {
