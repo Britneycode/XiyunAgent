@@ -224,7 +224,7 @@ export function listTool(workspace: string, subdir = "."): string[] {
 // 内部固定 git 命令:argv 直传,不经 classifyCommand 闸,也不经 shell。
 // 为什么不用 shellExec:JSON.stringify 的引号在 PowerShell 下会被解释(路径含 $ 会被插值),
 // argv 直传既无引号歧义也无注入面;此处命令全部由本模块硬编码,不含用户拼接的 shell 片段。
-function gitExec(workspace: string, args: string[], timeoutMs = 30_000): Promise<ShellResult> {
+export function gitExec(workspace: string, args: string[], timeoutMs = 30_000): Promise<ShellResult> {
   const cwd = assertInside(workspace, ".");
   const t0 = Date.now();
   return new Promise((resolve, reject) => {
@@ -322,48 +322,4 @@ export async function gitCommit(opts: {
   if (add.exitCode !== 0)
     throw new ToolError(`git add 失败:${add.stderr.trim() || `exit ${add.exitCode}`}`);
   return gitExec(opts.workspace, ["commit", "-m", opts.message]);
-}
-
-// ---- 子智能体工具矩阵(写角色 vs 只读角色,决策见 DECISIONS.md D-007 权限分层)----
-
-export const ROLE_TOOLS: Record<string, string[]> = {
-  coder: ["files.list", "files.read", "files.write", "shell.exec", "git.status", "git.diff"],
-  tester: ["files.list", "files.read", "shell.exec", "git.status", "git.diff"],
-  reviewer: ["files.list", "files.read", "shell.exec", "git.status", "git.diff"],
-  researcher: ["files.list", "files.read", "shell.exec", "git.status", "git.diff"],
-  tutor: [],
-  memory: [],
-};
-
-// 子智能体内的工具执行:无交互确认通道,只允许 safe 命令;工作区由 PathGuard 限制。
-export async function runTool(
-  name: string,
-  args: Record<string, unknown>,
-  ctx: { workspace: string },
-): Promise<string> {
-  const arg = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : "");
-  switch (name) {
-    case "files.read":
-      return readTool(ctx.workspace, arg("path"));
-    case "files.list":
-      return listTool(ctx.workspace, arg("path") || ".").join("\n");
-    case "files.write": {
-      const r = writeTool(ctx.workspace, arg("path"), String(args.content ?? ""));
-      return `已写入 ${r.path}(${r.bytes}B)`;
-    }
-    case "shell.exec": {
-      const r = await shellExec({ workspace: ctx.workspace, command: arg("command"), timeoutMs: 60_000 });
-      return `exit=${r.exitCode}${r.timedOut ? " (超时)" : ""}\n${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
-    }
-    case "git.status": {
-      const r = await shellExec({ workspace: ctx.workspace, command: "git status --short --branch" });
-      return r.stdout || "(clean)";
-    }
-    case "git.diff": {
-      const r = await shellExec({ workspace: ctx.workspace, command: "git diff HEAD" });
-      return r.stdout || "(no diff)";
-    }
-    default:
-      throw new ToolError(`未知工具:${name}`);
-  }
 }

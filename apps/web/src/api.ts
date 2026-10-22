@@ -5,6 +5,8 @@ export type StreamEvent =
   | { type: "block"; id: string; block: { kind: "text" | "thinking" } | { kind: "tool"; name: string; status: string } }
   | { type: "block_delta"; id: string; delta: string }
   | { type: "block_end"; id: string; block: ChatBlock }
+  // 工具执行中的流式输出(bash 等);按 id 追加到对应块的 output,只保留尾部
+  | { type: "tool_output"; id: string; delta: string }
   | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
   // 首个事件:本轮 user 消息的落库 id、后台运行 id、所用模型;trim = 历史超出上下文预算时的裁剪情况(F4)
   | { type: "meta"; userMessageId: number | null; runId?: string; model?: string | null; trim?: { dropped: number; summary: boolean } }
@@ -121,7 +123,16 @@ export const api = {
     req(`/sessions/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   shells: () => req<ShellInfo[]>("/tools/shells"),
   toolShell: (b: { workspace: string; command: string; shell?: string; confirmed?: boolean }) =>
-    req<ShellResult & { needsConfirm?: boolean }>("/tools/shell", { method: "POST", body: JSON.stringify(b) }),
+    req<ShellResult & { needsConfirm?: boolean; rule?: string; reason?: string }>("/tools/shell", { method: "POST", body: JSON.stringify(b) }),
+  toolShellStream,
+  // 工具确认(B1):awaiting 卡片上点「允许 / 始终允许 / 拒绝」
+  confirmTool: (runId: string, callId: string, decision: "allow" | "always" | "deny") =>
+    req<{ ok: boolean }>(`/runs/${runId}/confirm`, { method: "POST", body: JSON.stringify({ callId, decision }) }),
+  // 权限规则(F7)
+  permissions: (workspace: string) =>
+    req<{ allow: string[]; ask: string[]; deny: string[] }>(`/tools/permissions?workspace=${encodeURIComponent(workspace)}`),
+  allowRule: (workspace: string, rule: string) =>
+    req<{ ok: boolean }>("/tools/permissions/allow", { method: "POST", body: JSON.stringify({ workspace, rule }) }),
   gitStatus: (workspace: string) =>
     req<ShellResult>("/tools/git/status", { method: "POST", body: JSON.stringify({ workspace }) }),
   gitDiff: (workspace: string) =>
@@ -281,6 +292,50 @@ export function subscribeRun(runId: string, onEvent: (ev: StreamEvent) => void, 
 }
 
 export const attachmentUrl = (id: string) => `${base}/attachments/${id}`;
+
+export type ShellStreamEvent =
+  | { type: "output"; stream: "stdout" | "stderr"; data: string }
+  | ({ type: "result" } & ShellResult)
+  | { type: "error"; error: string };
+
+// 流式执行命令(F7):逐块回调输出,最后一条是完整结果。signal 中断时服务端结束进程树
+export async function toolShellStream(
+  b: { workspace: string; command: string; shell?: string; confirmed?: boolean },
+  onEvent: (ev: ShellStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${base}/tools/shell/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(b),
+    signal: signal ?? null,
+  });
+  if (!res.ok) {
+    // 409 带 needsConfirm / rule,交给调用方弹确认条
+    const body = (await res.json().catch(() => ({}))) as { error?: string; needsConfirm?: boolean; rule?: string; reason?: string };
+    throw Object.assign(new Error(body.error ?? `请求失败(${res.status})`), body);
+  }
+  if (!res.body) throw new Error("empty response");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const blocks = buf.split("\n\n");
+    buf = blocks.pop() ?? "";
+    for (const blk of blocks) {
+      const line = blk.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line.slice(5).trim()) as ShellStreamEvent);
+      } catch {
+        // 坏 JSON 跳过
+      }
+    }
+  }
+}
 
 export type ExternalPreview = {
   source: "chatgpt" | "claude";

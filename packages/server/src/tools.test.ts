@@ -72,6 +72,52 @@ describe("shellExec", () => {
   it("git commit 必须 confirmed", async () => {
     await expect(gitCommit({ workspace: ws, message: "x" })).rejects.toMatchObject({ needsConfirm: true });
   });
+
+  it("onData 逐块回调输出(F7)", async () => {
+    const chunks: string[] = [];
+    const r = await shellExec({
+      workspace: ws,
+      command: "echo streaming-ok",
+      onData: (chunk, stream) => {
+        if (stream === "stdout") chunks.push(chunk);
+      },
+    });
+    expect(r.exitCode).toBe(0);
+    expect(chunks.join("")).toContain("streaming-ok");
+  });
+
+  it("输出只保留最后 200KB", async () => {
+    // 生成 300KB 输出,尾部标记应保留、头部应被丢弃
+    const cmd = process.platform === "win32"
+      ? "powershell -NoProfile -Command \"'x' * 300000; 'TAIL-MARK'\""
+      : "python3 -c \"print('x'*300000); print('TAIL-MARK')\"";
+    const r = await shellExec({ workspace: ws, command: cmd, confirmed: true, timeoutMs: 60_000 });
+    expect(r.stdout.length).toBeLessThanOrEqual(200 * 1024);
+    expect(r.stdout).toContain("TAIL-MARK");
+  }, 60_000);
+
+  it("signal 中断时结束进程树并以 AbortError 拒绝", async () => {
+    const ac = new AbortController();
+    const p = shellExec({
+      workspace: ws,
+      command: process.platform === "win32" ? "powershell -NoProfile -Command \"Start-Sleep 30\"" : "sleep 30",
+      confirmed: true,
+      signal: ac.signal,
+    });
+    setTimeout(() => ac.abort(), 150);
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+  }, 20_000);
+
+  it("空闲超时结束命令", async () => {
+    const r = await shellExec({
+      workspace: ws,
+      command: process.platform === "win32" ? "powershell -NoProfile -Command \"Start-Sleep 5\"" : "sleep 5",
+      confirmed: true,
+      idleMs: 200,
+      timeoutMs: 20_000,
+    });
+    expect(r.timedOut).toBe(true);
+  }, 20_000);
 });
 
 // ---- 阶段 2:Git 提交范围 ----

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GitBranch, GitCompareArrows, SquareTerminal } from "lucide-react";
-import type { GitPreview, SessionMeta, ShellInfo } from "@xiyun/shared";
-import { api } from "./api.ts";
+import type { GitPreview, SessionMeta, ShellInfo, ShellResult } from "@xiyun/shared";
+import { api, type ShellStreamEvent } from "./api.ts";
 import { ChatPage } from "./ChatPage.tsx";
 import type { Preview } from "./chat/blocks.tsx";
 import { ChangesPanel, type CommitOutcome } from "./code/ChangesPanel.tsx";
@@ -65,9 +65,10 @@ export function CodePage({ session, onSessionChanged, onPreview, onBranch, onNew
   const [shells, setShells] = useState<ShellInfo[]>([]);
   const [shell, setShell] = useState("");
   const [cmd, setCmd] = useState("");
-  const [pending, setPending] = useState<{ command: string } | null>(null);
+  const [pending, setPending] = useState<{ command: string; rule?: string; reason?: string } | null>(null);
   const [runs, setRuns] = useState<TerminalRun[]>([]);
   const [running, setRunning] = useState(false);
+  const [liveOutput, setLiveOutput] = useState("");
   const runSeq = useRef(0);
 
   useEffect(() => {
@@ -170,22 +171,51 @@ export function CodePage({ session, onSessionChanged, onPreview, onBranch, onNew
     if (!command.trim()) return;
     setRunning(true);
     setPending(null);
+    setLiveOutput("");
     const id = ++runSeq.current;
     const push = (run: TerminalRun) => setRuns((rs) => [...rs, run].slice(-MAX_RUNS));
+    let streamed = "";
     try {
-      const r = await api.toolShell({ workspace, command, shell, confirmed });
-      push({ id, command, result: r });
-      if (!r.needsConfirm) setCmd("");
-      // 命令可能改动了工作区(git add、生成文件等),顺带刷新变更
+      // F7:流式执行,边跑边显示输出
+      let final: ShellResult | null = null;
+      let failure: string | null = null;
+      await api.toolShellStream({ workspace, command, shell, confirmed }, (ev: ShellStreamEvent) => {
+        if (ev.type === "output") {
+          streamed += ev.data;
+          setLiveOutput(streamed.slice(-64 * 1024));
+        } else if (ev.type === "result") {
+          final = {
+            shell: ev.shell, cwd: ev.cwd, command: ev.command, exitCode: ev.exitCode,
+            stdout: ev.stdout, stderr: ev.stderr, durationMs: ev.durationMs, timedOut: ev.timedOut,
+          };
+        } else if (ev.type === "error") failure = ev.error;
+      });
+      if (failure) throw new Error(failure);
+      if (final) {
+        push({ id, command, result: final });
+        setCmd("");
+      }
       void refreshGit(changesVisible);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // 409:需要确认 → 显示确认条
-      if (msg.startsWith("409")) setPending({ command });
+      const err = e as Error & { needsConfirm?: boolean; rule?: string; reason?: string };
+      // 409:需要确认 → 显示确认条(带规则原文)
+      if (err.needsConfirm) setPending({ command, rule: err.rule, reason: err.reason });
       else push({ id, command, error: errorMessage(e) });
     } finally {
       setRunning(false);
+      setLiveOutput("");
     }
+  };
+
+  // 本项目始终允许:先写入规则,再重新执行(此时规则已生效,无需再确认)
+  const alwaysAllow = async () => {
+    if (!pending?.rule) return;
+    try {
+      await api.allowRule(workspace, pending.rule);
+    } catch {
+      // 规则写入失败也让用户继续确认执行
+    }
+    void runCmd(true, pending.command);
   };
 
   const openFile = async (path: string) => {
@@ -287,7 +317,9 @@ export function CodePage({ session, onSessionChanged, onPreview, onBranch, onNew
           pending={pending}
           onRun={() => void runCmd(false)}
           onConfirm={() => pending && void runCmd(true, pending.command)}
+          onAlwaysAllow={() => void alwaysAllow()}
           onCancelPending={() => setPending(null)}
+          liveOutput={liveOutput}
           runs={runs}
           onClear={() => setRuns([])}
         />

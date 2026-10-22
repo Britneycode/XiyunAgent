@@ -2,7 +2,7 @@ import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { ArrowDown, Check, ChevronLeft, ChevronRight, FoldVertical, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
 import type { ChatBlock, SessionMeta } from "@xiyun/shared";
-import type { RefPayload } from "./api.ts";
+import { api, type RefPayload } from "./api.ts";
 import { AttachmentList, CopyButton, MessageBody, RefChips, type AttachmentBlockData, type Preview } from "./chat/blocks.tsx";
 import { handleCodeAction } from "./chat/codeActions.ts";
 import { Composer } from "./chat/Composer.tsx";
@@ -37,6 +37,7 @@ interface ItemActions {
   branch?: (id: number) => void;
   preview?: (p: Preview) => void;
   switchTo?: (id: number) => void; // 切换到同一位置的另一个版本(F6)
+  confirmTool?: (runId: string, callId: string, decision: "allow" | "always" | "deny") => void; // B1
 }
 
 // 版本切换 "‹ 2/3 ›":编辑或重新生成后同一位置有多个版本时显示,生成中不可切换
@@ -160,7 +161,13 @@ const MessageItem = memo(function MessageItem({
 
   return (
     <div data-mid={m.id ?? undefined} className="group/msg flex flex-col gap-2 font-reading">
-      <MessageBody content={m.content} blocks={m.blocks} streaming={m.streaming} onPreview={preview} />
+      <MessageBody
+        content={m.content}
+        blocks={m.blocks}
+        streaming={m.streaming}
+        onPreview={preview}
+        onConfirm={actions.current?.confirmTool}
+      />
       {m.error && (
         <div role="alert" className="flex items-start gap-2.5 rounded-lg border border-err/25 bg-err/5 px-3 py-2.5 font-sans">
           <TriangleAlert size={15} strokeWidth={1.75} className="mt-0.5 shrink-0 text-err" aria-hidden />
@@ -313,7 +320,10 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
   const models = useModelOptions();
   const actions = useRef<ItemActions>({ regenerate, startEdit });
   const switchVersion = (id: number) => void switchTo(id).catch(() => setToast({ text: "切换版本失败", ok: false }));
-  actions.current = { regenerate, startEdit, branch: onBranch, preview: onPreview, models: models.options, switchTo: switchVersion };
+  actions.current = {
+    regenerate, startEdit, branch: onBranch, preview: onPreview, models: models.options, switchTo: switchVersion,
+    confirmTool: (runId, callId, decision) => void api.confirmTool(runId, callId, decision).catch(() => {}),
+  };
 
   const copy = (text: string | null, ok: string, empty: string) => {
     if (!text) return setToast({ text: empty, ok: false });

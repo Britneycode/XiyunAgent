@@ -5,7 +5,7 @@ import type {
 } from "@xiyun/shared";
 import type { ChatProvider, ModelRegistry } from "@xiyun/runtime";
 import type { MemoryStore } from "./memory.ts";
-import { ROLE_TOOLS, runTool } from "./tools.ts";
+import { ALL_TOOLS, BlockBuilder, runAgent, toolsForMode, type AgentTool } from "./agent.ts";
 
 const now = () => new Date().toISOString();
 
@@ -29,32 +29,18 @@ const RESULT_INSTRUCTION = `完成后,在回复末尾输出一个 \`\`\`json 代
 memoryCandidates 只写确有价值、跨会话稳定的事实;没有就留空数组。
 若缺少完成任务所必需的信息,把 status 设为 "partial" 并加 "question":"需要用户补充的问题",任务会暂停等待用户回答。`;
 
-// 阶段 4:code 模式子智能体的工具调用协议(无 function calling 依赖,JSON 块约定)。
-const MAX_TOOL_CALLS = 5;
+// B1:子智能体走原生工具调用(runAgent),不再用 ```tool 文本协议。
+// 各角色可用工具:写角色有全部工具,只读角色去掉写类,辅导/记忆角色不给工具
+const ROLE_TOOL_NAMES: Record<string, string[] | "all"> = {
+  coder: "all",
+  tester: ["read_file", "list_files", "grep", "bash", "git_status", "git_diff"],
+  reviewer: ["read_file", "list_files", "grep", "bash", "git_status", "git_diff"],
+  researcher: ["read_file", "list_files", "grep", "bash", "git_status", "git_diff"],
+  tutor: [],
+  memory: [],
+};
 
-const TOOL_INSTRUCTION = `你可以调用工具完成工作。每次只调用一个,格式:
-\`\`\`tool
-{"tool":"<工具名>","args":{...}}
-\`\`\`
-工具结果会以用户消息返回,可继续调用下一个工具;全部完成后输出最终回复和 \`\`\`json 结果块。
-- files.list {"path":"相对目录,默认 ."} 列出工作区文件
-- files.read {"path":"相对路径"} 读取工作区文件
-- files.write {"path":"相对路径","content":"完整内容"} 写文件(仅 coder)
-- shell.exec {"command":"只读命令"} 执行命令(需要确认的命令会被拒绝)
-- git.status / git.diff 查看仓库状态与未提交改动
-工作区外的路径和危险命令会被直接拒绝。`;
-
-function parseToolCall(text: string): { tool: string; args: Record<string, unknown> } | null {
-  const m = text.match(/```tool\s*([\s\S]*?)```/);
-  if (!m) return null;
-  try {
-    const o = JSON.parse(m[1]) as { tool?: unknown; args?: unknown };
-    if (typeof o.tool !== "string" || !o.tool) return null;
-    return { tool: o.tool, args: typeof o.args === "object" && o.args !== null ? (o.args as Record<string, unknown>) : {} };
-  } catch {
-    return null;
-  }
-}
+const SUBTASK_MAX_STEPS = 12;
 
 function parseResult(raw: string): TaskResult {
   const m = raw.match(/```json\s*([\s\S]*?)```/);
@@ -198,30 +184,43 @@ export class Scheduler {
     return chain.length > 0 ? { chain } : { chain: [], error: `角色 ${task.role} 未绑定模型,且不允许自动回退` };
   }
 
-  // 工具循环:模型输出 ```tool 块则执行并把结果喂回,最多 MAX_TOOL_CALLS 轮。
-  // 子智能体没有确认通道,需要确认/危险命令会被工具层拒绝并以错误文本返回给模型。
+  // 子智能体走 runAgent:无确认通道,写操作由 policy 钩子按角色决定。
+  // coder 的写操作直接放行(等价于原来的 files.write);其余角色的 bash 需要确认时一律拒绝。
   private async converse(
     provider: ChatProvider,
     messages: ChatMessage[],
     signal: AbortSignal,
-    tools: string[],
+    tools: AgentTool[],
     workspace: string,
   ): Promise<string> {
-    for (let i = 0; ; i++) {
+    if (!tools.length) {
       let full = "";
       for await (const delta of provider.streamChat(messages, { signal })) full += delta;
-      const call = i < MAX_TOOL_CALLS && tools.length > 0 ? parseToolCall(full) : null;
-      if (!call || !tools.includes(call.tool)) return full;
-      let out: string;
-      try {
-        out = await runTool(call.tool, call.args, { workspace });
-      } catch (e) {
-        out = `工具调用失败:${e instanceof Error ? e.message : String(e)}`;
-      }
-      this.deps.onEvent?.("task.tool", { tool: call.tool, workspace });
-      messages.push({ role: "assistant", content: full });
-      messages.push({ role: "user", content: `[工具 ${call.tool} 结果]\n${out.slice(0, 8000)}` });
+      return full;
     }
+    if (!provider.streamEvents) {
+      // Provider 不支持原生工具调用时退回纯文本
+      let full = "";
+      for await (const delta of provider.streamChat(messages, { signal })) full += delta;
+      return full;
+    }
+    const builder = new BlockBuilder(() => {});
+    const result = await runAgent({
+      provider,
+      messages,
+      tools,
+      workspace,
+      signal,
+      builder,
+      maxSteps: SUBTASK_MAX_STEPS,
+      policy: (req) => {
+        // coder 的 Edit / Write 放行;bash 与只读角色的写操作一律拒绝
+        if (req.name === "edit_file" || req.name === "write_file") return "allow";
+        return "deny";
+      },
+      onToolEnd: (info) => this.deps.onEvent?.("task.tool", { tool: info.name, workspace, status: info.status }),
+    });
+    return result.finalText;
   }
 
   private async execute(taskId: string, priorSummary?: string, extraContext?: string): Promise<void> {
@@ -240,14 +239,17 @@ export class Scheduler {
     const memories = memory
       .search(task.prompt, 5, [task.mode, task.workspace])
       .map((f) => `- ${f.content}`);
-    // code 模式且角色有工具时,注入工具协议(阶段 4)。
-    const roleTools = task.mode === "code" ? (ROLE_TOOLS[task.role] ?? []) : [];
+    // code 模式且角色有工具时下发工具定义
+    const wanted = task.mode === "code" ? (ROLE_TOOL_NAMES[task.role] ?? []) : [];
+    const roleTools =
+      wanted === "all" ? toolsForMode("code") : ALL_TOOLS.filter((t) => wanted.includes(t.def.name));
     const skillsText = this.deps.skillsFor?.(task.mode, task.role, task.prompt) ?? "";
     const system = [
       ROLE_PRESETS[task.role],
       skillsText && `# 已启用 Skill\n${skillsText}`,
       task.mode === "code" && `工作区:${task.workspace}(所有文件路径相对于该目录)`,
-      roleTools.length > 0 && TOOL_INSTRUCTION,
+      roleTools.length > 0 &&
+        "你可以使用工具读取代码、执行命令和修改文件;完成后输出最终回复和 ```json 结果块。写操作以外的命令可能需要确认,无法确认时会返回拒绝。",
       memories.length && `# 相关记忆\n${memories.join("\n")}`,
       priorSummary && `# 上游任务结果摘要\n${priorSummary}`,
       extraContext && `# 用户补充\n${extraContext}`,

@@ -61,6 +61,17 @@ async function session(app: ReturnType<typeof setup>["app"]) {
   return (await res.json()) as { id: string };
 }
 
+// code 会话需要工作区才会下发工具;用临时目录隔离,避免注入仓库规则
+async function codeSession(app: ReturnType<typeof setup>["app"]) {
+  const workspace = mkdtempSync(join(tmpdir(), "xiyun-code-"));
+  const res = await app.request("/sessions", {
+    method: "POST",
+    headers: json,
+    body: JSON.stringify({ mode: "code", workspace }),
+  });
+  return (await res.json()) as { id: string };
+}
+
 describe("/chat 块协议", () => {
   it("thinking → text → tool → text:事件顺序与落库一致", async () => {
     const { app, db } = setup(fakeProvider([
@@ -73,6 +84,7 @@ describe("/chat 块协议", () => {
     ]));
     const s = await session(app);
     const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "hi" })).text());
+    // 当前会话未开放工具:卡片保持 pending;有正文时不追加兜底文字
     const kinds = evs.filter((e) => e.type === "block").map((e) => (e.block as { kind: string }).kind);
     expect(kinds).toEqual(["thinking", "text", "tool"]);
     expect(evs.some((e) => typeof e.delta === "string" && e.delta === "答")).toBe(true);
@@ -178,7 +190,9 @@ describe("/chat 块协议", () => {
     const s = await session(app);
     const evs = parseSSE(await (await post(app, { sessionId: s.id, message: "hi" })).text());
     const toolEnds = evs.filter((e) => e.type === "block_end" && (e.block as { kind: string }).kind === "tool");
-    expect(toolEnds.map((e) => e.id)).toEqual(["c1", "c2"]);
+    // 块 id 与协议 wireId 分离(各家调用 id 跨步可能重复),这里只校验两个块各自归集正确
+    expect(toolEnds).toHaveLength(2);
+    expect(toolEnds[0]!.id).not.toBe(toolEnds[1]!.id);
     expect((toolEnds[0].block as { name: string; rawArgs: string; status: string })).toMatchObject({
       name: "read_file", rawArgs: "{\"path\":\"b.ts\"}", status: "pending",
     });
@@ -186,10 +200,10 @@ describe("/chat 块协议", () => {
       name: "list_files", rawArgs: "{\"path\":\"src\"}", status: "pending",
     });
     const row = db.prepare("SELECT blocks FROM messages WHERE role = 'assistant'").get() as { blocks: string };
-    const tools = (JSON.parse(row.blocks) as Array<{ kind: string; id: string; rawArgs: string }>).filter((b) => b.kind === "tool");
-    expect(tools.map((b) => [b.id, b.rawArgs])).toEqual([
-      ["c1", "{\"path\":\"b.ts\"}"],
-      ["c2", "{\"path\":\"src\"}"],
+    const tools = (JSON.parse(row.blocks) as Array<{ kind: string; name: string; rawArgs: string }>).filter((b) => b.kind === "tool");
+    expect(tools.map((b) => [b.name, b.rawArgs])).toEqual([
+      ["read_file", "{\"path\":\"b.ts\"}"],
+      ["list_files", "{\"path\":\"src\"}"],
     ]);
   });
 
@@ -383,7 +397,7 @@ describe("/chat 块协议", () => {
     expect((db.prepare("SELECT COUNT(*) c FROM messages WHERE role = 'user'").get() as { c: number }).c).toBe(2);
   });
 
-  it("XIYUN_EXPOSE_TOOLS=1 且声明 tools 能力时才下发只读工具定义", async () => {
+  it("code 会话下发完整工具集(B1)", async () => {
     let seenTools: string[] | undefined;
     const provider = fakeProvider([{ type: "text", delta: "ok" }, { type: "finish", reason: "stop" }], { toolsCap: true });
     const orig = provider.streamEvents!;
@@ -392,20 +406,14 @@ describe("/chat 块协议", () => {
       yield* orig(messages, opts);
     };
     const { app } = setup(provider);
-    const s = await session(app);
+    const s = await codeSession(app);
     await post(app, { sessionId: s.id, message: "a" });
-    expect(seenTools).toBeUndefined();
-    process.env.XIYUN_EXPOSE_TOOLS = "1";
-    try {
-      await post(app, { sessionId: s.id, message: "b" });
-      expect(seenTools).toEqual(["list_files", "read_file"]);
-    } finally {
-      delete process.env.XIYUN_EXPOSE_TOOLS;
-    }
+    expect(seenTools).toEqual([
+      "read_file", "list_files", "grep", "edit_file", "write_file", "bash", "git_status", "git_diff",
+    ]);
   });
 
-  it("门控关闭时不下发 tools", async () => {
-    // 仅声明 tools 能力,不设置 XIYUN_EXPOSE_TOOLS,Provider 不应收到工具定义
+  it("chat 会话不下发工具", async () => {
     let received: unknown = "unset";
     const provider = fakeProvider([{ type: "text", delta: "ok" }, { type: "finish", reason: "stop" }], { toolsCap: true });
     const orig = provider.streamEvents!;
@@ -416,7 +424,26 @@ describe("/chat 块协议", () => {
     const { app } = setup(provider);
     const s = await session(app);
     await post(app, { sessionId: s.id, message: "hi" });
-    expect(received).toBeUndefined(); // 未设置 XIYUN_EXPOSE_TOOLS
+    expect(received).toBeUndefined();
+  });
+
+  it("XIYUN_AGENT=0 时 code 会话也不下发工具", async () => {
+    let received: unknown = "unset";
+    const provider = fakeProvider([{ type: "text", delta: "ok" }, { type: "finish", reason: "stop" }], { toolsCap: true });
+    const orig = provider.streamEvents!;
+    provider.streamEvents = async function* (m, opts) {
+      received = opts?.tools;
+      yield* orig(m, opts);
+    };
+    const { app } = setup(provider);
+    const s = await codeSession(app);
+    process.env.XIYUN_AGENT = "0";
+    try {
+      await post(app, { sessionId: s.id, message: "hi" });
+      expect(received).toBeUndefined();
+    } finally {
+      delete process.env.XIYUN_AGENT;
+    }
   });
 
   it("中断时落半截并标记 aborted", async () => {
@@ -565,5 +592,75 @@ describe("/chat 块协议", () => {
     expect(tail2).toHaveLength(0);
     expect((await app.request("/runs/nope/events")).status).toBe(404);
     expect(await (await app.request("/runs/nope/cancel", { method: "POST" })).json()).toEqual({ ok: false });
+  });
+
+  it("B1:awaiting 块经 SSE 下发,confirm 后变 success 并落库 result", async () => {
+    // 两轮:先请求写文件,确认后第二轮输出正文
+    const rounds: ProviderEvent[][] = [
+      [
+        { type: "tool_start", id: "c1", index: 0, name: "write_file" },
+        { type: "tool_args", id: "c1", delta: "{\"path\":\"a.txt\",\"content\":\"hi\"}" },
+        { type: "tool_end", id: "c1", args: "{\"path\":\"a.txt\",\"content\":\"hi\"}" },
+        { type: "finish", reason: "tool_calls" },
+      ],
+      [
+        { type: "text", delta: "写好了" },
+        { type: "finish", reason: "stop" },
+      ],
+    ];
+    let round = 0;
+    const provider: ChatProvider = {
+      config: { id: "fake", name: "fake", baseUrl: "http://x", apiKey: "k", model: "m", capabilities: ["stream", "tools"] },
+      async *streamChat() {
+        throw new Error("应走 streamEvents");
+      },
+      async *streamEvents() {
+        for (const ev of rounds[Math.min(round++, rounds.length - 1)] ?? []) yield ev;
+      },
+    };
+    const { app, db } = setup(provider);
+    const s = await codeSession(app);
+
+    // 订阅事件流,等 awaiting 出现后提交确认
+    const events: Array<Record<string, unknown>> = [];
+    const resPromise = post(app, { sessionId: s.id, message: "写文件" });
+    // 先拿到 runId
+    let runId = "";
+    for (let i = 0; i < 50 && !runId; i++) {
+      const active = (await (await app.request(`/sessions/${s.id}/active-run`)).json()) as { id: string } | null;
+      if (active) runId = active.id;
+      else await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(runId).toBeTruthy();
+
+    // 轮询直到出现 awaiting 块
+    let callId = "";
+    for (let i = 0; i < 100 && !callId; i++) {
+      const run = (await (await app.request(`/runs/${runId}`)).json()) as { awaiting?: string[] };
+      if (run.awaiting?.length) callId = run.awaiting[0]!;
+      else await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(callId).toBeTruthy();
+
+    const bad = await app.request(`/runs/${runId}/confirm`, {
+      method: "POST", headers: json, body: JSON.stringify({ callId: "nope", decision: "allow" }),
+    });
+    expect(bad.status).toBe(409);
+    const ok = await app.request(`/runs/${runId}/confirm`, {
+      method: "POST", headers: json, body: JSON.stringify({ callId, decision: "allow" }),
+    });
+    expect(ok.status).toBe(200);
+
+    events.push(...parseSSE(await (await resPromise).text()));
+    const toolEnds = events.filter((e) => e.type === "block_end" && (e.block as { kind: string }).kind === "tool");
+    expect(toolEnds.length).toBeGreaterThanOrEqual(2);
+    expect((toolEnds.at(-1)!.block as { status: string }).status).toBe("success");
+    expect(events.some((e) => e.done === true)).toBe(true);
+
+    const row = db.prepare("SELECT blocks FROM messages WHERE role = 'assistant'").get() as { blocks: string };
+    const tools = (JSON.parse(row.blocks) as Array<{ kind: string; status: string; result?: string }>).filter((b) => b.kind === "tool");
+    expect(tools[0]!.status).toBe("success");
+    expect(tools[0]!.result).toContain("a.txt");
+    expect((await app.request(`/runs/nope/confirm`, { method: "POST", headers: json, body: JSON.stringify({ callId, decision: "allow" }) })).status).toBe(404);
   });
 });

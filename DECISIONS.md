@@ -106,3 +106,21 @@ Skill:目录或 ZIP 只有 `SKILL.md` 时,从 frontmatter 的 name / description
 
 外部导入:前端解开官方导出 ZIP(`settings/zip.ts`,只读中央目录,支持 stored / deflate,用浏览器自带 `DecompressionStream`,不支持 ZIP64,此时提示先解压),取层级最浅的 `conversations.json` 原文发给 `POST /admin/import/external/preview`(返回来源、对话数、消息数、重复数、空对话数、时间范围)与 `POST /admin/import/external`(`external.ts`)。按结构识别来源:每项有 `mapping` 是 ChatGPT,有 `chat_messages` 是 Claude,否则 400"无法识别的导出文件"。ChatGPT:mapping 本身是树,只保留 author 为 user / assistant、recipient 为 all、未标记隐藏、content_type 为 text / multimodal_text 的节点,图片部分记为"[图片]";被跳过的节点(系统提示、自定义指令、工具调用与结果、思考)的子节点接到最近的可见祖先上;同角色且是唯一子节点的连续消息合并(一次回复中间夹工具调用时会被拆成多条);`current_node` 映射为 head。Claude:有 `parent_message_uuid` 时按它成树(根哨兵 uuid 视为无父),否则按顺序成单链;sender human / assistant 对应 user / assistant;正文取 content 里的 text 块(跳过 thinking / tool_use),没有则用 text;附件抽取的文本按"[附件:文件名]"并入(单个 2 万字截断),上传的文件记为"[文件:文件名]";`current_leaf_message_uuid` 映射为 head。每个有内容的对话成为一个 Chat 会话(标题、创建时间沿用原对话,更新时间取原对话与最后一条消息的较晚者),v12 迁移给 sessions 加 `external_source` / `external_id` 并建部分唯一索引,同一来源同一对话重复导入直接跳过;整批在一个事务里,失败回滚。导入的消息走已有触发器进入全文索引,不提取记忆(避免一次导入大量历史时消耗模型调用)。取舍:不导入原图与 Claude 的项目 / 知识库;时间戳统一转成 ISO;请求体就是 conversations.json 原文,很大的导出(数百 MB)会占用相应内存,暂不做流式解析。
 
+
+## D-024:Agent 工具循环、权限规则与终端流式输出(2026-10-22)
+
+工具循环:`packages/server/src/agent.ts` 定义 `AgentTool { def; perm; run }`,内置 read_file / list_files / grep / edit_file / write_file / bash / git_status / git_diff 八个工具,按会话模式下发——code 全部,work 只读五项,chat 不给。下发条件从旧的 `XIYUN_EXPOSE_TOOLS=1` 门控改为:模式为 code / work、会话有工作区、Provider 有 `streamEvents`、capabilities 未声明或含 tools、且 `XIYUN_AGENT !== "0"`(保留一个整体关闭开关用于排错)。`runAgent` 逐轮调用 `provider.streamEvents`,收到工具调用后先把 assistant 消息(含 toolCalls 与协议 raw)压入请求,再逐个执行并回传 `role: "tool"` 结果;首步尚无输出却报 400/422 时去掉工具重试一次(网关不支持 function calling);多步用量求和并填 `steps` / `contextTokens`,单步保持原样以免破坏旧测试的精确比较;达到步数上限追加「回复"继续"」提示。
+
+块与流式:`BlockBuilder` 从 app.ts 原有的 closeOpen / ensureText / finishTool 抽出,新增三点——状态每次变化都发 `block_end` 快照(前端按 id 覆盖),`tool_output` 按 80ms 合并节流,块 id 与回传给模型的 wireId 分开保存(各协议调用 id 跨步可能重复,如 Gemini 每步都是 `call_0`,块 id 用全局递增的 `tc<n>`)。
+
+权限:每次工具执行前重新 `loadPermissions` + `decide`,这样「本项目始终允许」写入后立即生效。deny 直接拒绝且不可被 allow 覆盖(`DENY_RE` 优先);ask 时若有确认回调则置 `awaiting`、下发 `runId` / `rule`(suggestRule 给出的建议规则)/ `reason`,挂起等 `POST /runs/:id/confirm`;选 always 时 `addAllowRule` 写入 `<ws>/.xiyun/settings.json`;没有确认通道(子任务)时交给 policy 钩子,默认拒绝并说明当前环境无法确认。子任务里 coder 的 Edit / Write 放行(等价于原 files.write),其余角色的写操作与需要确认的 bash 一律拒绝。
+
+确认通道:`Run.awaitConfirm(callId)` / `confirm(callId, decision)` / `awaiting()`;中断时所有等待中的确认按 `deny` 收尾,避免 agent 循环挂死;确认不设超时。`POST /runs/:id/confirm` 同时接受 `{callId, decision}` 与 `{callId, allow, remember}` 两种写法,run 不存在 404、callId 不在等待中 409。
+
+终端:shellExec 的 `onData` / `signal` 在 E4 已就位,本批新增 `POST /tools/shell/stream`(SSE 逐块推 `{type:"output",stream,data}`,最后一条 `{type:"result"}`),客户端断开时结束进程树;`/tools/shell` 改为先按规则判定,deny 403、ask 且未确认 409 并带回 `rule` / `reason`;新增 `GET /tools/permissions` 与 `POST /tools/permissions/allow`。`gitExec` 从模块私有改为导出,供 git_status / git_diff 使用(argv 直传,不经 shell)。
+
+审计与安全:每次工具执行写一条 `tool.agent` 事件,内容为 `{sessionId, name, 参数摘要(截断 300 字符), status, exitCode}`,**不记录文件内容**;所有路径经 `assertInside` 校验,越界路径不填 `target.path` 并返回错误结果。
+
+前端:ToolBlock 补 awaiting(警告色、自动展开、显示 reason 与将要写入的规则原文、允许 / 本项目始终允许 / 拒绝三个按钮,点击后禁用等服务端 block_end)、running(等宽输出区自动滚动)、rejected 与 result 展示(edit_file 的 diff 按 -/+ 着色,bash 显示 exit 徽标与耗时);删除「当前版本不会自动执行」文案,pending 改为「未执行(当前会话未开放工具)」。终端面板改用流式接口,运行中实时显示输出,确认条增加「本项目始终允许」。
+
+取舍:`toolDigest` 把上一轮的工具调用摘要附在 assistant 内容后(而不是新增字段),这样历史装配与预算计算无需改动;结果回传模型截到 30k(保留开头 40% 与结尾 60%),界面展示截到 10k;流式输出只保留尾部 64KB;子任务步数上限 12、主对话 30。tasks.ts 的旧文本 ```tool 协议与 ROLE_TOOLS / runTool 一并删除,`tools.test.ts` 保留其余用例。

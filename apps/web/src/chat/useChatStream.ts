@@ -33,6 +33,12 @@ function applyEvent(blocks: ChatBlock[], ev: StreamEvent): ChatBlock[] {
   if (ev.type === "block_end") {
     return blocks.map((b) => (b.id === ev.id ? ev.block : b));
   }
+  // 流式输出只保留尾部 64KB,避免长命令把内存和渲染撑爆
+  if (ev.type === "tool_output") {
+    return blocks.map((b) =>
+      b.id === ev.id && b.kind === "tool" ? { ...b, output: `${b.output ?? ""}${ev.delta}`.slice(-64 * 1024) } : b,
+    );
+  }
   return blocks;
 }
 

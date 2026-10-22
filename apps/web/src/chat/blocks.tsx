@@ -152,13 +152,15 @@ export function ThinkingBlock({
 
 // ---------- 工具调用卡片 ----------
 
-type ToolPhase = "running" | "pending" | "success" | "error";
+type ToolPhase = "running" | "pending" | "awaiting" | "success" | "error" | "rejected";
 
 const PHASE: Record<ToolPhase, { label: string; tone: Tone }> = {
   running: { label: "运行中", tone: "accent" },
-  pending: { label: "待执行", tone: "neutral" },
+  pending: { label: "未执行", tone: "neutral" },
+  awaiting: { label: "待确认", tone: "warn" },
   success: { label: "成功", tone: "ok" },
   error: { label: "错误", tone: "err" },
+  rejected: { label: "已拒绝", tone: "neutral" },
 };
 
 const PILL_TONE: Record<Tone, string> = {
@@ -169,8 +171,11 @@ const PILL_TONE: Record<Tone, string> = {
   warn: "text-warn",
 };
 
-// running:参数仍在流式生成(尚未收到 block_end);pending:参数已就绪,等待执行
+// running:参数仍在流式生成或工具执行中;pending:参数已就绪但当前会话没开放工具
 function toolPhase(b: ToolBlockData, live: boolean): ToolPhase {
+  if (b.status === "awaiting") return "awaiting";
+  if (b.status === "rejected") return "rejected";
+  if (b.status === "running") return "running";
   if (b.status === "error") return "error";
   if (b.status === "success") return "success";
   if (live && b.args === undefined && !b.argsError) return "running";
@@ -233,17 +238,29 @@ export function ToolBlock({
   block,
   live = false,
   onPreview,
+  onConfirm,
 }: {
   block: ToolBlockData;
   live?: boolean; // 所属消息仍在流式生成
   onPreview?: (p: Preview) => void;
+  // 确认回调(B1):点击后按钮禁用,等服务的 block_end 更新状态
+  onConfirm?: (runId: string, callId: string, decision: "allow" | "always" | "deny") => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [deciding, setDeciding] = useState(false);
   const bodyId = useId();
   const phase = toolPhase(block, live);
   const Icon = toolIcon(block.name);
   const summary = toolSummary(block);
   const label = block.note || PHASE[phase].label;
+  // awaiting 时自动展开,让用户看清要执行什么
+  useEffect(() => {
+    if (phase === "awaiting") setOpen(true);
+  }, [phase]);
+  // 状态离开 awaiting 后恢复按钮可用
+  useEffect(() => {
+    if (phase !== "awaiting") setDeciding(false);
+  }, [phase]);
   const parsed = block.args !== undefined;
   const argsText = parsed ? JSON.stringify(block.args, null, 2) : block.rawArgs;
   const argsHtml = useMemo(() => (parsed ? highlightJson(argsText) : escapeHtml(argsText)), [parsed, argsText]);
@@ -336,8 +353,88 @@ export function ToolBlock({
                   </p>
                 </Section>
               )}
+              {phase === "awaiting" && (
+                <Section label="需要确认">
+                  <div className="flex flex-col gap-2 rounded-md border border-warn/30 bg-warn/5 px-3 py-2">
+                    {block.reason && <p className="text-xs leading-relaxed text-fg">{block.reason}</p>}
+                    {block.rule && (
+                      <p className="break-all font-mono text-2xs text-subtle">
+                        始终允许将写入:<span className="text-fg">{block.rule}</span>
+                      </p>
+                    )}
+                    <div className="flex flex-wrap gap-1.5 pt-0.5">
+                      <button
+                        type="button"
+                        disabled={deciding || !block.runId || !onConfirm}
+                        onClick={() => {
+                          setDeciding(true);
+                          onConfirm?.(block.runId!, block.id, "allow");
+                        }}
+                        className="rounded-md border border-line bg-surface px-2.5 py-1 text-xs text-fg hover:bg-surface-2 disabled:opacity-50"
+                      >
+                        允许
+                      </button>
+                      <button
+                        type="button"
+                        disabled={deciding || !block.runId || !onConfirm}
+                        onClick={() => {
+                          setDeciding(true);
+                          onConfirm?.(block.runId!, block.id, "always");
+                        }}
+                        className="rounded-md border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs text-accent hover:bg-accent/15 disabled:opacity-50"
+                        title={block.rule ? `写入规则:${block.rule}` : undefined}
+                      >
+                        本项目始终允许
+                      </button>
+                      <button
+                        type="button"
+                        disabled={deciding || !block.runId || !onConfirm}
+                        onClick={() => {
+                          setDeciding(true);
+                          onConfirm?.(block.runId!, block.id, "deny");
+                        }}
+                        className="rounded-md border border-line bg-surface px-2.5 py-1 text-xs text-muted hover:bg-surface-2 disabled:opacity-50"
+                      >
+                        拒绝
+                      </button>
+                      {deciding && <span className="self-center text-2xs text-subtle">已提交,等待执行…</span>}
+                    </div>
+                  </div>
+                </Section>
+              )}
+              {(phase === "running" || (block.output && phase !== "awaiting")) && block.output && (
+                <Section label="输出">
+                  <pre className="max-h-72 overflow-auto rounded-md border border-line bg-code px-3 py-2 font-mono text-xs leading-relaxed text-code-fg">
+                    {block.output}
+                  </pre>
+                </Section>
+              )}
+              {block.result && phase !== "awaiting" && (
+                <Section
+                  label="结果"
+                  action={
+                    block.exitCode !== undefined
+                      ? `exit ${block.exitCode}${block.durationMs !== undefined ? ` · ${formatElapsed(block.durationMs)}` : ""}`
+                      : block.durationMs !== undefined
+                        ? formatElapsed(block.durationMs)
+                        : undefined
+                  }
+                >
+                  <pre
+                    className={cn(
+                      "max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border px-3 py-2 font-mono text-xs leading-relaxed",
+                      phase === "error" ? "border-err/25 bg-err/5 text-err" : "border-line bg-code text-code-fg",
+                    )}
+                  >
+                    {block.result}
+                  </pre>
+                </Section>
+              )}
               {phase === "pending" && (
-                <p className="text-2xs leading-relaxed text-subtle">模型请求调用该工具;当前版本不会自动执行。</p>
+                <p className="text-2xs leading-relaxed text-subtle">未执行(当前会话未开放工具)</p>
+              )}
+              {phase === "rejected" && !block.result && block.note && (
+                <p className="text-2xs leading-relaxed text-subtle">{block.note}</p>
               )}
             </div>
           </motion.div>
@@ -448,11 +545,13 @@ export function MessageBody({
   blocks,
   streaming,
   onPreview,
+  onConfirm,
 }: {
   content: string;
   blocks?: ChatBlock[];
   streaming?: boolean;
   onPreview?: (p: Preview) => void;
+  onConfirm?: (runId: string, callId: string, decision: "allow" | "always" | "deny") => void;
 }) {
   // ref 块只属于用户消息,在气泡上方单独渲染
   const shown = (blocks ?? []).filter((b) => b.kind !== "ref" && b.kind !== "attachment");
@@ -469,7 +568,8 @@ export function MessageBody({
       {shown.map((b, i) => {
         if (b.kind === "thinking")
           return <ThinkingBlock key={b.id} block={b} streaming={live && b.durationMs === undefined} />;
-        if (b.kind === "tool") return <ToolBlock key={b.id} block={b} live={live} onPreview={onPreview} />;
+        if (b.kind === "tool")
+          return <ToolBlock key={b.id} block={b} live={live} onPreview={onPreview} onConfirm={onConfirm} />;
         if (b.kind === "text") {
           if (!b.text) return live && i === last ? <PendingReply key={b.id} /> : null;
           return <StreamingMarkdown key={b.id} text={b.text} streaming={live && i === last} />;

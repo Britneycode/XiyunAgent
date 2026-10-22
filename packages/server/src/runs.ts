@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ToolDecision } from "@xiyun/shared";
 
 // ---- 生成运行注册表(F1 / D-020)----
 // 一次 /chat 生成 = 一个 Run,在服务端后台执行,与 HTTP 连接解耦:
@@ -22,10 +23,46 @@ export class Run {
   private events: RunEvent[] = [];
   private seq = 0;
   private subs = new Set<Sub>();
+  // 等待用户确认的工具调用:callId -> 决议回调
+  private pendingConfirms = new Map<string, (d: ToolDecision) => void>();
 
   readonly sessionId: string;
   constructor(sessionId: string) {
     this.sessionId = sessionId;
+    // 中断时所有等待中的确认按拒绝处理,避免 agent 循环挂死
+    this.ac.signal.addEventListener(
+      "abort",
+      () => {
+        const pending = [...this.pendingConfirms.values()];
+        this.pendingConfirms.clear();
+        for (const resolve of pending) resolve("deny");
+      },
+      { once: true },
+    );
+  }
+
+  // 等待用户决定;不设超时,由中断或 confirm 结束
+  awaitConfirm(callId: string): Promise<ToolDecision> {
+    if (this.ac.signal.aborted) return Promise.resolve("deny");
+    return new Promise<ToolDecision>((resolve) => {
+      this.pendingConfirms.set(callId, (d) => {
+        this.pendingConfirms.delete(callId);
+        resolve(d);
+      });
+    });
+  }
+
+  // 返回 false 表示该 callId 不在等待中(重复提交或已中断)
+  confirm(callId: string, decision: ToolDecision): boolean {
+    const resolve = this.pendingConfirms.get(callId);
+    if (!resolve) return false;
+    this.pendingConfirms.delete(callId);
+    resolve(decision);
+    return true;
+  }
+
+  awaiting(): string[] {
+    return [...this.pendingConfirms.keys()];
   }
 
   emit(obj: unknown): void {
@@ -60,6 +97,7 @@ export class Run {
       id: this.id, sessionId: this.sessionId, status: this.status, userMessageId: this.userMessageId,
       startedAt: new Date(this.startedAt).toISOString(),
       finishedAt: this.finishedAt ? new Date(this.finishedAt).toISOString() : null,
+      awaiting: this.awaiting(),
     };
   }
 }

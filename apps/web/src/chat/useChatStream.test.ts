@@ -171,3 +171,45 @@ describe("meta.trim", () => {
     expect(out[0]!.id).toBe(5);
   });
 });
+
+describe("tool_output 与块覆盖(B1)", () => {
+  it("tool_output 追加到对应工具的 output", () => {
+    const ms: UIMessage[] = [{ role: "user", content: "q" }, empty()];
+    const out = applyStream(ms, [
+      { type: "block", id: "tc1", block: { kind: "tool", name: "bash", status: "running" } },
+      { type: "tool_output", id: "tc1", delta: "line1\n" },
+      { type: "tool_output", id: "tc1", delta: "line2\n" },
+    ]);
+    const tool = out[1]!.blocks?.find((b) => b.kind === "tool") as { output?: string } | undefined;
+    expect(tool?.output).toBe("line1\nline2\n");
+  });
+
+  it("output 只保留尾部 64KB", () => {
+    const ms: UIMessage[] = [{ role: "user", content: "q" }, empty()];
+    const big = "x".repeat(70 * 1024);
+    const out = applyStream(ms, [
+      { type: "block", id: "tc1", block: { kind: "tool", name: "bash", status: "running" } },
+      { type: "tool_output", id: "tc1", delta: big },
+    ]);
+    const tool = out[1]!.blocks?.find((b) => b.kind === "tool") as { output?: string } | undefined;
+    expect(tool?.output?.length).toBe(64 * 1024);
+  });
+
+  it("block_end 按 id 覆盖同一块(状态可从 awaiting 变 success)", () => {
+    const ms: UIMessage[] = [{ role: "user", content: "q" }, empty()];
+    const out = applyStream(ms, [
+      { type: "block", id: "tc1", block: { kind: "tool", name: "write_file", status: "pending" } },
+      {
+        type: "block_end", id: "tc1",
+        block: { id: "tc1", kind: "tool", name: "write_file", rawArgs: "", status: "awaiting", runId: "r1", rule: "Edit(a.txt)" },
+      },
+      {
+        type: "block_end", id: "tc1",
+        block: { id: "tc1", kind: "tool", name: "write_file", rawArgs: "", status: "success", result: "已新建 a.txt" },
+      },
+    ]);
+    const tools = out[1]!.blocks?.filter((b) => b.kind === "tool") ?? [];
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ status: "success", result: "已新建 a.txt" });
+  });
+});

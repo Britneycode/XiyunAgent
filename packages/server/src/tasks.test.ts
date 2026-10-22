@@ -187,19 +187,29 @@ describe("TaskStore/Scheduler", () => {
     expect(store.get(t.id)!.question).toBeNull();
   });
 
-  it("code 模式:coder 用 ```tool 块调用 files.read,结果喂回后继续", async () => {
+  it("code 模式:coder 用原生工具调用 read_file,结果喂回后继续", async () => {
     const ws = mkdtempSync(join(tmpdir(), "xiyun-task-"));
     writeFileSync(join(ws, "x.txt"), "file-content-42");
     let calls = 0;
     const seen: string[][] = [];
     const p: ChatProvider = {
       config: { id: "p1", name: "p1", baseUrl: "", apiKey: "", model: "m1", roles: ["coder"] },
-      async *streamChat(messages: ChatMessage[]) {
+      async *streamChat(_messages: ChatMessage[]) {
+        throw new Error("应走 streamEvents");
+      },
+      async *streamEvents(messages: ChatMessage[]) {
         calls++;
         seen.push(messages.map((m) => m.content));
-        yield calls === 1
-          ? '先读文件\n```tool\n{"tool":"files.read","args":{"path":"x.txt"}}\n```'
-          : JSON_REPLY;
+        if (calls === 1) {
+          yield { type: "text", delta: "先读文件" } as const;
+          yield { type: "tool_start", id: "c1", index: 0, name: "read_file" } as const;
+          yield { type: "tool_args", id: "c1", delta: "{\"path\":\"x.txt\"}" } as const;
+          yield { type: "tool_end", id: "c1", args: "{\"path\":\"x.txt\"}" } as const;
+          yield { type: "finish", reason: "tool_calls" } as const;
+        } else {
+          yield { type: "text", delta: JSON_REPLY } as const;
+          yield { type: "finish", reason: "stop" } as const;
+        }
       },
     };
     const { store, scheduler } = setup([p]);
@@ -208,7 +218,7 @@ describe("TaskStore/Scheduler", () => {
     await waitStatus(store, t.id, ["completed"]);
     expect(calls).toBe(2);
     expect(seen[1].some((m) => m.includes("file-content-42"))).toBe(true); // 工具结果喂回
-    expect(seen[0][0]).toContain("```tool"); // system 含工具协议
+    expect(seen[0][0]).toContain("你可以使用工具"); // system 含工具使用说明
     rmSync(ws, { recursive: true, force: true });
   });
 
@@ -225,6 +235,6 @@ describe("TaskStore/Scheduler", () => {
     const t = store.create({ role: "coder", prompt: "任务", mode: "chat" });
     scheduler.run(t.id);
     await waitStatus(store, t.id, ["completed"]);
-    expect(systems[0]).not.toContain("```tool");
+    expect(systems[0]).not.toContain("你可以使用工具");
   });
 });

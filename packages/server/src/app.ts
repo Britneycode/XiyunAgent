@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
-import { estimateTokens, type AgentRole, type ChatBlock, type ChatMessage, type ProviderConfig, type SessionMeta, type TaskStatus, type TokenUsage } from "@xiyun/shared";
+import { estimateTokens, type AgentRole, type ChatBlock, type ChatMessage, type ProviderConfig, type SessionMeta, type TaskStatus, type TokenUsage, type ToolDecision } from "@xiyun/shared";
 import type { ChatProvider, ProviderEvent, ToolDef } from "../../runtime/src/index.ts";
 import { MemoryStore } from "./memory.ts";
 import { ProviderStore } from "./providers.ts";
@@ -27,6 +27,8 @@ import {
 } from "./context.ts";
 import { AttachmentError, AttachmentStore, MAX_PER_MESSAGE, TEXT_INJECT_CHARS } from "./attachments.ts";
 import { parseExternal, type ExternalConversation, type ExternalSource } from "./external.ts";
+import { BlockBuilder, runAgent, toolDigest, toolsForMode } from "./agent.ts";
+import { addAllowRule, decide, loadPermissions, suggestRule } from "./permissions.ts";
 
 const now = () => new Date().toISOString();
 
@@ -338,15 +340,19 @@ export function createApp(
         return [];
       }
     });
-  const toPathMessage = (r: MsgRow): PathMessage => ({
-    id: r.id,
-    role: r.role as PathMessage["role"],
-    content: r.content,
-    refContext: r.ref_context,
-    refs: r.role === "user" ? refBlocksOf(r.blocks) : undefined,
-    attachments: r.role === "user" ? attachmentBlocksOf(r.blocks) : undefined,
-    usage: parseUsage(r.usage),
-  });
+  const toPathMessage = (r: MsgRow): PathMessage => {
+    // B1:assistant 消息把工具调用摘要附在正文后,否则下一轮模型不知道上一轮做过什么
+    const digest = r.role === "assistant" ? toolDigest(parseBlocks(r.blocks) ?? []) : "";
+    return {
+      id: r.id,
+      role: r.role as PathMessage["role"],
+      content: digest ? `${r.content}\n\n[上一步工具调用] ${digest}` : r.content,
+      refContext: r.ref_context,
+      refs: r.role === "user" ? refBlocksOf(r.blocks) : undefined,
+      attachments: r.role === "user" ? attachmentBlocksOf(r.blocks) : undefined,
+      usage: parseUsage(r.usage),
+    };
+  };
   // 当前分支的消息(会话展示用),带父消息与兄弟版本
   const listPath = (sessionId: string): ChatMessage[] => {
     const tree = loadTree(db, sessionId);
@@ -477,6 +483,22 @@ export function createApp(
   // 唯一的中止入口:断开连接不会停止生成
   app.post("/runs/:id/cancel", (c) => c.json({ ok: runs.cancel(c.req.param("id")) }));
 
+  // B1:工具确认。兼容 { callId, decision } 与 { callId, allow, remember } 两种写法
+  app.post("/runs/:id/confirm", async (c) => {
+    const run = runs.get(c.req.param("id"));
+    if (!run) return c.json({ error: "run not found" }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      callId?: string; decision?: string; allow?: boolean; remember?: boolean;
+    };
+    const callId = typeof body.callId === "string" ? body.callId : "";
+    if (!callId) return c.json({ error: "缺少 callId" }, 400);
+    let decision: ToolDecision;
+    if (body.decision === "allow" || body.decision === "always" || body.decision === "deny") decision = body.decision;
+    else if (typeof body.allow === "boolean") decision = body.allow ? (body.remember ? "always" : "allow") : "deny";
+    else return c.json({ error: "decision 必须是 allow / always / deny" }, 400);
+    return run.confirm(callId, decision) ? c.json({ ok: true }) : c.json({ error: "该调用不在等待确认" }, 409);
+  });
+
   // ---- Chat:规则文件 + 相关记忆 + 历史,流式回复,落库 ----
   app.post("/chat", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -571,6 +593,16 @@ export function createApp(
     // 能力未声明时不拦(按 Provider 实际报错为准);声明了但没有 vision 时不发图片
     const caps = provider.config.capabilities ?? [];
     const vision = caps.length === 0 || caps.includes("vision");
+    // B1:Code / Work 模式下发工具(chat 不给)。capabilities 未声明时按 Provider 实际能力为准;
+    // XIYUN_AGENT=0 可整体关闭 agent 循环(排错用)
+    const agentTools =
+      (session.mode === "code" || session.mode === "work") &&
+      !!session.workspace &&
+      !!provider.streamEvents &&
+      (caps.length === 0 || caps.includes("tools")) &&
+      process.env.XIYUN_AGENT !== "0"
+        ? toolsForMode(session.mode)
+        : [];
     const curImages = attBlocks.filter((a) => a.type === "image");
     if (curImages.length && !vision)
       return c.json({ error: "当前模型未声明图片能力(vision):请换用支持图片的模型,或在设置里为该模型加上 vision" }, 400);
@@ -597,6 +629,22 @@ export function createApp(
         : isWork
           ? `你是 XiyunAgent 的 Work 助手,在工作目录(${session.workspace})中帮助用户整理需求、会议资料、网页调研和待办。结论必须标注来源(文档标题或 URL);外部发送、修改原文件和批量操作只能建议,由用户确认后执行。`
           : "你是 XiyunAgent 的 Chat 助手,帮助用户学习、总结、解释和复习。",
+      // B1:工具使用指引(只在真正下发了工具时出现,避免模型在无工具会话里空谈)
+      agentTools.length > 0 &&
+        (isCode
+          ? [
+              "# 工具使用",
+              "你可以读写文件、搜索、执行命令和查看 git 状态。请遵守:",
+              "1. 修改前先用 read_file / grep 看清现有实现,不要凭猜测改。",
+              "2. 小范围修改优先用 edit_file(精确替换),整份重写才用 write_file。",
+              "3. 改完运行相关测试或命令验证,不要只声称完成。",
+              "4. 写操作和非常用命令可能需要用户确认;被拒绝时不要重复尝试,向用户说明并询问下一步。",
+            ].join("\n")
+          : [
+              "# 可用工具",
+              "你可以用 read_file / list_files / grep 查看工作区内的资料(只读,不会修改文件)。",
+              "需要修改或执行命令时,说明需要用户手动操作。",
+            ].join("\n")),
       memNote && `# 记忆操作\n${memNote}\n请在回复中向用户确认该操作结果。`,
       rules && `# 规则\n${rules}`,
       skillText && `# 已启用 Skill\n${skillText}`,
@@ -689,22 +737,7 @@ export function createApp(
       userMessageId = regenUserId;
     }
 
-    // D2:工具定义默认不下发,需显式开启环境变量且 Provider 声明 tools 能力
-    const READONLY_TOOLS: ToolDef[] = [
-      {
-        name: "list_files",
-        description: "列出工作区内的文件(相对路径)",
-        parameters: { type: "object", properties: { path: { type: "string", description: "子目录,默认 ." } } },
-      },
-      {
-        name: "read_file",
-        description: "读取工作区内的文件内容",
-        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-      },
-    ];
-    const exposeTools =
-      provider.config.capabilities?.includes("tools") && process.env.XIYUN_EXPOSE_TOOLS === "1" && !!session.workspace;
-    const tools = exposeTools ? READONLY_TOOLS : undefined;
+    const tools = agentTools.length ? agentTools.map((t) => t.def) : undefined;
 
     // F1:生成在后台执行,不随本次连接断开而中止;只有 POST /runs/:id/cancel 触发 ac
     run.userMessageId = userMessageId;
@@ -720,176 +753,55 @@ export function createApp(
 
     void (async () => {
 
-      const blocks: ChatBlock[] = [];
-      const toolBlocks = new Map<string, Extract<ChatBlock, { kind: "tool" }>>();
-      // 已收到 tool_end 的调用;中断时据此区分已结束与半截的工具
-      const finishedTools = new Set<string>();
-      // open 记录已入列块的下标,关闭时原地更新,避免同一段内容入列两次
-      let open: { kind: "text" | "thinking" | "tool"; id: string; text: string; t0: number; idx: number } | null = null;
-      let seq = 0;
+      const builder = new BlockBuilder(send);
+      const blocks = builder.blocks;
       let finishReason: string | null = null;
-      // 模型返回的真实用量;中断时通常拿不到(usage 在最后一个分片)
       let usage: TokenUsage | null = null;
 
-      const closeOpen = () => {
-        const b = open;
-        if (!b) return;
-        open = null;
-        if (b.kind === "thinking") {
-          const block: ChatBlock = { id: b.id, kind: "thinking", text: b.text, durationMs: Date.now() - b.t0 };
-          blocks[b.idx] = block;
-          void send({ type: "block_end", id: b.id, block });
-        } else if (b.kind === "text") {
-          const block: ChatBlock = { id: b.id, kind: "text", text: b.text };
-          blocks[b.idx] = block;
-          void send({ type: "block_end", id: b.id, block });
-        }
-      };
-
-      const ensureText = () => {
-        if (open?.kind === "text") return open;
-        closeOpen();
-        seq += 1;
-        const block: ChatBlock = { id: `t${seq}`, kind: "text", text: "" };
-        const idx = blocks.push(block) - 1;
-        open = { kind: "text", id: block.id, text: "", t0: Date.now(), idx };
-        void send({ type: "block", id: block.id, block: { kind: "text" } });
-        return open;
-      };
-
-      const finishTool = (id: string) => {
-        const b = toolBlocks.get(id);
-        if (!b) return;
-        try {
-          b.args = JSON.parse(b.rawArgs || "{}") as unknown;
-          b.status = "pending";
-        } catch (e) {
-          b.argsError = e instanceof Error ? e.message : "参数解析失败";
-          b.status = "error";
-        }
-        // target 由服务端填写:工作区来自 session,路径必须落在工作区内
-        if (session.workspace) {
-          b.target = { workspace: session.workspace };
-          const p = (b.args as { path?: unknown } | undefined)?.path;
-          if (typeof p === "string") {
-            try {
-              assertInside(session.workspace, p);
-              b.target.path = p;
-            } catch {
-              // 越界路径不填 target.path
-            }
-          }
-        }
-        finishedTools.add(id);
-        if (open?.kind === "tool" && open.id === id) open = null;
-        void send({ type: "block_end", id, block: b });
-      };
-
-      // 中断收尾:没等到 tool_end 的调用标记为 error 并补发 block_end,避免客户端卡片停在 pending
-      const closeUnfinishedTools = (note = "已中断") => {
-        for (const [id, b] of toolBlocks) {
-          if (finishedTools.has(id)) continue;
-          b.status = "error";
-          b.note = note;
-          finishedTools.add(id);
-          void send({ type: "block_end", id, block: b });
-        }
-        open = null;
-      };
-
-      let it: AsyncIterator<ProviderEvent> | null = null;
       try {
-        const iter: AsyncIterable<ProviderEvent> = provider.streamEvents
-          ? provider.streamEvents(messages, { signal: ac.signal, tools })
-          : (async function* () {
-              for await (const d of provider.streamChat(messages, { signal: ac.signal })) {
-                yield { type: "text", delta: d } as ProviderEvent;
-              }
-            })();
-        it = iter[Symbol.asyncIterator]();
-
-        // 与中断竞速:Provider 不响应 signal 时也能立即收尾落库,不把流挂死
-        const interrupted = new Promise<{ aborted: true }>((resolve) => {
-          const onAbort = () => resolve({ aborted: true });
-          if (ac.signal.aborted) onAbort();
-          else ac.signal.addEventListener("abort", onAbort, { once: true });
-        });
-        for (;;) {
-          // 已中断时不再等待 Provider
-          const step = ac.signal.aborted
-            ? ({ aborted: true } as const)
-            : await Promise.race([it.next(), interrupted]);
-          if ("aborted" in step) throw Object.assign(new Error("aborted"), { name: "AbortError" });
-          if (step.done) break;
-          const ev = step.value;
-          if (ev.type === "text") {
-            const o = ensureText();
-            o.text += ev.delta;
-            const cur = blocks[o.idx];
-            if (cur?.kind === "text") cur.text = o.text;
-            void send({ delta: ev.delta, id: o.id });
-          } else if (ev.type === "thinking") {
-            if (open?.kind !== "thinking") {
-              closeOpen();
-              seq += 1;
-              const idx = blocks.push({ id: `r${seq}`, kind: "thinking", text: "" }) - 1;
-              open = { kind: "thinking", id: `r${seq}`, text: "", t0: Date.now(), idx };
-              void send({ type: "block", id: open.id, block: { kind: "thinking" } });
+        const result = await runAgent({
+          provider,
+          messages,
+          tools: agentTools,
+          workspace: session.workspace,
+          signal: ac.signal,
+          builder,
+          homeDir: homedir(),
+          maxSteps: 30,
+          // 确认回调:写入 runId 后挂起,等 POST /runs/:id/confirm
+          confirm: async (req) => {
+            const b = builder.tool(req.blockId);
+            if (b) {
+              b.runId = run.id;
+              builder.update(req.blockId);
             }
-            open.text += ev.delta;
-            const cur = blocks[open.idx];
-            if (cur?.kind === "thinking") cur.text = open.text;
-            void send({ type: "block_delta", id: open.id, delta: ev.delta });
-          } else if (ev.type === "tool_start") {
-            closeOpen();
-            const block: Extract<ChatBlock, { kind: "tool" }> = {
-              id: ev.id, kind: "tool", name: ev.name, rawArgs: "", status: "pending",
-            };
-            toolBlocks.set(ev.id, block);
-            const idx = blocks.push(block) - 1;
-            open = { kind: "tool", id: ev.id, text: "", t0: Date.now(), idx };
-            void send({ type: "block", id: ev.id, block: { kind: "tool", name: ev.name, status: "pending" } });
-          } else if (ev.type === "tool_args") {
-            const b = toolBlocks.get(ev.id);
-            if (b) b.rawArgs += ev.delta;
-            void send({ type: "block_delta", id: ev.id, delta: ev.delta });
-          } else if (ev.type === "tool_end") {
-            const b = toolBlocks.get(ev.id);
-            if (b) b.rawArgs = ev.args;
-            finishTool(ev.id);
-          } else if (ev.type === "usage") {
-            usage = ev.usage;
-            void send({ type: "usage", usage });
-          } else if (ev.type === "finish") {
-            finishReason = ev.reason;
-          }
-        }
-
-        closeOpen();
-
-        // 仅 tool_calls 且无正文时兜底,保证 content 非空
-        const hasText = blocks.some((b) => b.kind === "text" && b.text.trim());
-        if (finishReason === "tool_calls" && !hasText) {
-          seq += 1;
-          const id = `t${seq}`;
-          const note = "（模型请求调用工具，当前版本不执行工具。）";
-          const block: ChatBlock = { id, kind: "text", text: note };
-          blocks.push(block);
-          void send({ type: "block", id, block: { kind: "text" } });
-          void send({ delta: note, id });
-          void send({ type: "block_end", id, block });
-        }
+            return run.awaitConfirm(req.blockId);
+          },
+          // 每次工具执行写一条审计事件;只记参数摘要,不记文件内容
+          onToolEnd: (info) => {
+            const summary = JSON.stringify(info.args).slice(0, 300);
+            db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('tool.agent', ?, ?)").run(
+              JSON.stringify({ sessionId, name: info.name, args: summary, status: info.status, exitCode: info.exitCode }), now(),
+            );
+          },
+        });
+        finishReason = result.finishReason;
+        usage = result.usage;
+        builder.closeOpen();
 
         if (ac.signal.aborted) {
-          // 中断时为未结束的工具补 error/note
-          closeUnfinishedTools();
-          const content = textOf(blocks);
-          // 全空则什么都不落,避免留下空 assistant 行
-          const messageId = content || blocks.length ? persist({ content, blocks, aborted: true }) : null;
+          builder.closeUnfinished();
+          const content = builder.textOf();
+          let messageId: number | null = null;
+          try {
+            if (content || blocks.length) messageId = persist({ content, blocks, aborted: true });
+          } catch {
+            // 落库失败也要让客户端收尾
+          }
           send({ type: "cancelled", messageId, userMessageId });
           return;
         }
-        const content = textOf(blocks);
+        const content = builder.textOf();
         const messageId = persist({ content, blocks, aborted: false });
         db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('chat', ?, ?)").run(
           JSON.stringify({ sessionId, user: message, assistant: content }), now(),
@@ -900,12 +812,11 @@ export function createApp(
         // 标题通常早于回复完成;还没好时最多再等 1.5s,超时则只落库,下次刷新列表可见
         if (titlePending) await Promise.race([titlePending, new Promise((r) => setTimeout(r, 1500))]);
       } catch (e) {
-        // 中断后不再消费 Provider;主动关闭迭代器,让上游连接释放
-        if (ac.signal.aborted) void it?.return?.();
-        closeOpen();
+        // 中断后不再消费 Provider;runAgent 内部已关闭迭代器
+        builder.closeOpen();
         if (ac.signal.aborted) {
-          closeUnfinishedTools();
-          const content = textOf(blocks);
+          builder.closeUnfinished();
+          const content = builder.textOf();
           let messageId: number | null = null;
           try {
             if (content || blocks.length) messageId = persist({ content, blocks, aborted: true });
@@ -919,8 +830,8 @@ export function createApp(
         // 出错时保留已生成的半截并标记 error,刷新后仍可见、可重试;
         // regenerate 出错时旧回答作为兄弟版本保留,不会被覆盖
         const error = (e instanceof Error ? e.message : "provider error").slice(0, 500);
-        closeUnfinishedTools("生成出错");
-        const content = textOf(blocks);
+        builder.closeUnfinished("生成出错");
+        const content = builder.textOf();
         let messageId: number | null = null;
         if (content || blocks.length) {
           try {
@@ -932,13 +843,6 @@ export function createApp(
         void send({ error, messageId, userMessageId });
       } finally {
         runs.finish(run, ac.signal.aborted ? "cancelled" : outcome);
-      }
-
-      function textOf(list: ChatBlock[]): string {
-        return list
-          .filter((b): b is Extract<ChatBlock, { kind: "text" }> => b.kind === "text")
-          .map((b) => b.text)
-          .join("");
       }
 
       // 新回复挂在本轮 user 消息下并成为分支末端(F6)。regenerate 时旧回复作为兄弟版本保留,
@@ -1167,15 +1071,79 @@ export function createApp(
       return c.json({ error: e instanceof Error ? e.message : "write failed" }, 400);
     }
   });
+  // F7:先按权限规则判定。deny 直接 403;ask 且未确认返回 409 并给出规则与原因
+  const shellVerdict = (workspace: string, command: string, confirmed?: boolean) => {
+    const rules = loadPermissions(workspace, { homeDir: homedir() });
+    const req = { kind: "Bash" as const, tool: "bash", command };
+    const v = decide(rules, req);
+    if (v.decision === "allow" || confirmed) return { ok: true as const, verdict: v };
+    return { ok: false as const, verdict: v };
+  };
   app.post("/tools/shell", async (c) => {
     const b = (await c.req.json()) as { workspace: string; command: string; shell?: string; confirmed?: boolean };
+    const check = shellVerdict(b.workspace, b.command, b.confirmed);
+    if (!check.ok) {
+      const status = check.verdict.decision === "deny" ? 403 : 409;
+      return c.json(
+        { error: check.verdict.reason, needsConfirm: check.verdict.decision === "ask", rule: suggestRule({ kind: "Bash", tool: "bash", command: b.command }), reason: check.verdict.reason },
+        status,
+      );
+    }
     try {
-      const r = await shellExec(b);
+      const r = await shellExec({ ...b, confirmed: true });
       auditTool("tool.shell", { workspace: b.workspace, shell: r.shell, command: r.command, exitCode: r.exitCode });
       return c.json(r);
     } catch (e) {
       const err = e as Error & { needsConfirm?: boolean };
       return c.json({ error: err.message, needsConfirm: err.needsConfirm === true }, err.needsConfirm ? 409 : 400);
+    }
+  });
+
+  // F7:流式执行。逐块推送输出,最后一条是完整结果;客户端断开时结束进程树
+  app.post("/tools/shell/stream", async (c) => {
+    const b = (await c.req.json()) as { workspace: string; command: string; shell?: string; confirmed?: boolean };
+    const check = shellVerdict(b.workspace, b.command, b.confirmed);
+    if (!check.ok) {
+      const status = check.verdict.decision === "deny" ? 403 : 409;
+      return c.json(
+        { error: check.verdict.reason, needsConfirm: check.verdict.decision === "ask", rule: suggestRule({ kind: "Bash", tool: "bash", command: b.command }), reason: check.verdict.reason },
+        status,
+      );
+    }
+    return streamSSE(c, async (stream) => {
+      const ac = new AbortController();
+      stream.onAbort(() => ac.abort());
+      try {
+        const r = await shellExec({
+          ...b,
+          confirmed: true,
+          signal: ac.signal,
+          onData: (data, s) => void stream.writeSSE({ data: JSON.stringify({ type: "output", stream: s, data }) }),
+        });
+        auditTool("tool.shell", { workspace: b.workspace, shell: r.shell, command: r.command, exitCode: r.exitCode });
+        await stream.writeSSE({ data: JSON.stringify({ type: "result", ...r }) });
+      } catch (e) {
+        if (!ac.signal.aborted)
+          await stream.writeSSE({ data: JSON.stringify({ type: "error", error: e instanceof Error ? e.message : "shell failed" }) });
+      }
+    });
+  });
+
+  // F7:权限规则查询与"本项目始终允许"
+  app.get("/tools/permissions", (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    const rules = loadPermissions(workspace, { homeDir: homedir() });
+    return c.json({ workspace, ...rules });
+  });
+  app.post("/tools/permissions/allow", async (c) => {
+    const b = (await c.req.json()) as { workspace: string; rule: string };
+    if (!b?.workspace || !b.rule?.trim()) return c.json({ error: "缺少 workspace 或 rule" }, 400);
+    try {
+      addAllowRule(b.workspace, b.rule.trim());
+      auditTool("permissions.allow", { workspace: b.workspace, rule: b.rule.trim() });
+      return c.json({ ok: true });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : "写入失败" }, 400);
     }
   });
   app.post("/tools/git/status", async (c) => {
