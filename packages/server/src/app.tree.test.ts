@@ -220,7 +220,9 @@ describe("上下文管理(F4)", () => {
       },
     };
     const { app, db } = setup(provider, summarizer);
-    const s = await newSession(app);
+    // 空工作区:避免仓库根目录的 AGENTS.md 被当作规则注入 system,挤占本轮预算(与本文件其他用例一致)
+    const ws = mkdtempSync(join(tmpdir(), "xiyun-ctx-"));
+    const s = await newSession(app, { workspace: ws });
     for (const q of ["q1", "q2", "q3"]) await chat(app, { sessionId: s.id, message: long(q) });
     expect(summaryCalls).toHaveLength(0);
     const evs = await chat(app, { sessionId: s.id, message: long("q4") });
@@ -246,6 +248,7 @@ describe("上下文管理(F4)", () => {
     expect(meta2.trim?.summary).toBe(true);
     expect(calls.at(-1)![0]!.content).toContain("# 早先对话摘要");
     expect(calls.at(-1)![0]!.content).toContain("早先聊过 q1 到 q3 的话题");
+    rmSync(ws, { recursive: true, force: true });
   });
 
   it("历史足够短时全部带入,不再限制为最近 20 条", async () => {
