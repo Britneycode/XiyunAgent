@@ -5,6 +5,7 @@
   "type": "module",
   "dependencies": {
     "@hono/node-server": "^1.14.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@xiyun/runtime": "workspace:*",
     "@xiyun/shared": "workspace:*",
     "hono": "^4.7.0"

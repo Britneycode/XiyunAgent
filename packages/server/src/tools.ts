@@ -141,7 +141,18 @@ export function shellExec(opts: ShellRunOptions): Promise<ShellResult> {
       idle = setTimeout(stop, idleMs);
     };
     touch();
-    const onAbort = () => killTree(child);
+    // 中断:立刻拒绝,不依赖子进程的 close 事件(进程树可能杀不干净,close 会迟迟不来)。
+    // killTree 仍然调用,负责实际结束进程;后续 close 回调因 settled 被忽略
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    const onAbort = () => {
+      killTree(child);
+      settle(() => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+    };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     const tail = (buf: string, d: string) => {
       const next = buf + d;
@@ -166,17 +177,19 @@ export function shellExec(opts: ShellRunOptions): Promise<ShellResult> {
     };
     child.on("error", (e) => {
       done();
-      reject(new ToolError(`shell 启动失败:${e.message}`));
+      settle(() => reject(new ToolError(`shell 启动失败:${e.message}`)));
     });
     child.on("close", (code) => {
       done();
-      if (opts.signal?.aborted) return reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
-      resolve({
-        shell: sh.id, cwd, command: opts.command,
-        exitCode: code ?? (timedOut ? -1 : 1),
-        stdout, stderr,
-        durationMs: Date.now() - t0, timedOut,
-      });
+      if (opts.signal?.aborted) return settle(() => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+      settle(() =>
+        resolve({
+          shell: sh.id, cwd, command: opts.command,
+          exitCode: code ?? (timedOut ? -1 : 1),
+          stdout, stderr,
+          durationMs: Date.now() - t0, timedOut,
+        }),
+      );
     });
   });
 }

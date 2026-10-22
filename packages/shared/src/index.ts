@@ -95,6 +95,7 @@ export type ChatBlock =
       runId?: string; // 仅 awaiting:确认请求发往该运行(POST /runs/:id/confirm)
       rule?: string; // 仅 awaiting:"本项目始终允许"将写入的规则,如 Bash(npm run *)
       reason?: string; // 仅 awaiting:为什么需要确认
+      checkpoint?: string; // 执行前的快照 sha(L1),可用于回退
     }
   | { id: string; kind: "text"; text: string }
   // 仅 user 消息;文件引用带工作区相对路径与引用时内容的指纹(F4:之后文件变更时提示模型内容可能过时)
@@ -142,6 +143,8 @@ export interface TokenUsage {
 export interface ChatMessage {
   // id 仅持久化消息有(数据库自增主键);流式中的临时气泡没有
   id?: number;
+  // 本轮开始前的工作区快照(L1);只有 user 消息有,用于"回退到这里"
+  checkpointSha?: string;
   // tool 仅出现在发给模型的请求里(agent 循环中的工具结果)
   role: "system" | "user" | "assistant" | "tool";
   content: string;

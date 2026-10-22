@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { ArrowDown, Check, ChevronLeft, ChevronRight, FoldVertical, GitBranch, Pencil, RotateCcw, Square, TriangleAlert } from "lucide-react";
+import { ArrowDown, Check, ChevronLeft, ChevronRight, FoldVertical, GitBranch, Pencil, RotateCcw, Square, TriangleAlert, Undo2 } from "lucide-react";
 import type { ChatBlock, SessionMeta } from "@xiyun/shared";
 import { api, type RefPayload } from "./api.ts";
 import { AttachmentList, CopyButton, MessageBody, RefChips, type AttachmentBlockData, type Preview } from "./chat/blocks.tsx";
@@ -38,6 +38,7 @@ interface ItemActions {
   preview?: (p: Preview) => void;
   switchTo?: (id: number) => void; // 切换到同一位置的另一个版本(F6)
   confirmTool?: (runId: string, callId: string, decision: "allow" | "always" | "deny") => void; // B1
+  rewind?: (messageId: number, checkpointSha: string) => void; // L1
 }
 
 // 版本切换 "‹ 2/3 ›":编辑或重新生成后同一位置有多个版本时显示,生成中不可切换
@@ -144,6 +145,11 @@ const MessageItem = memo(function MessageItem({
             {m.id != null && actions.current?.branch && (
               <IconButton label="分支到新会话" size="xs" onClick={() => actions.current?.branch?.(m.id!)}>
                 <GitBranch size={13} strokeWidth={1.75} />
+              </IconButton>
+            )}
+            {m.id != null && m.checkpointSha && actions.current?.rewind && (
+              <IconButton label="回退到这里" size="xs" onClick={() => actions.current?.rewind?.(m.id!, m.checkpointSha!)}>
+                <Undo2 size={13} strokeWidth={1.75} />
               </IconButton>
             )}
           </div>
@@ -256,7 +262,7 @@ const MessageItem = memo(function MessageItem({
 });
 
 export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandidatesChanged, onSessionChanged }: ChatPageProps) {
-  const { messages, send, stop, regenerate, switchTo, busy, loaded } = useChatStream(session, {
+  const { messages, setMessages, send, stop, regenerate, switchTo, busy, loaded } = useChatStream(session, {
     onDone: onCandidatesChanged,
     onSessionChanged,
   });
@@ -320,9 +326,38 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
   const models = useModelOptions();
   const actions = useRef<ItemActions>({ regenerate, startEdit });
   const switchVersion = (id: number) => void switchTo(id).catch(() => setToast({ text: "切换版本失败", ok: false }));
+
+  // L1:回退。先拉快照差异让用户确认,再执行
+  const [rewindReq, setRewindReq] = useState<{ messageId: number; sha: string; files: Array<{ status: string; path: string }> } | null>(null);
+  const [rewinding, setRewinding] = useState(false);
+  const [undoSha, setUndoSha] = useState<string | null>(null);
+  const openRewind = (messageId: number, sha: string) => {
+    if (busy) return;
+    void api.checkpointDiff(session.id, sha)
+      .then((r) => setRewindReq({ messageId, sha, files: r.files }))
+      .catch(() => setRewindReq({ messageId, sha, files: [] }));
+  };
+  const doRewind = async (code: boolean, chat: boolean) => {
+    if (!rewindReq) return;
+    setRewinding(true);
+    try {
+      const r = await api.rewind(session.id, { messageId: rewindReq.messageId, code, chat });
+      setUndoSha(r.undoSha ?? null);
+      setRewindReq(null);
+      setToast({ text: "已回退", ok: true });
+      // 对话回退后服务端返回新的当前路径,直接替换本地消息
+      if (chat && r.messages) setMessages(r.messages.filter((m) => m.role !== "system"));
+    } catch (e) {
+      setToast({ text: e instanceof Error ? e.message : "回退失败", ok: false });
+    } finally {
+      setRewinding(false);
+    }
+  };
+
   actions.current = {
     regenerate, startEdit, branch: onBranch, preview: onPreview, models: models.options, switchTo: switchVersion,
     confirmTool: (runId, callId, decision) => void api.confirmTool(runId, callId, decision).catch(() => {}),
+    rewind: openRewind,
   };
 
   const copy = (text: string | null, ok: string, empty: string) => {
@@ -361,6 +396,52 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
 
   return (
     <div data-ui className="flex min-h-0 flex-1 flex-col">
+      {rewindReq && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true">
+          <div className="w-full max-w-md rounded-xl border border-line bg-elevated p-4 shadow-pop">
+            <h3 className="text-ui font-medium text-fg">回退到这里</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted">
+              还原代码会把工作区恢复到这条消息发送之前的状态;回退对话会把这之后的消息移出当前分支(仍保留,可切换回来)。
+            </p>
+            {rewindReq.files.length > 0 && (
+              <div className="mt-2 max-h-40 overflow-auto rounded-md border border-line bg-code px-2.5 py-2">
+                <p className="mb-1 font-mono text-2xs text-subtle">将还原 {rewindReq.files.length} 个文件:</p>
+                {rewindReq.files.slice(0, 50).map((f) => (
+                  <p key={f.path} className="break-all font-mono text-2xs text-muted">
+                    <span className="text-subtle">{f.status}</span> {f.path}
+                  </p>
+                ))}
+              </div>
+            )}
+            <div className="mt-3 flex justify-end gap-1.5">
+              <button
+                type="button"
+                disabled={rewinding}
+                onClick={() => setRewindReq(null)}
+                className="rounded-md border border-line bg-surface px-2.5 py-1 text-xs text-muted hover:bg-surface-2"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={rewinding}
+                onClick={() => void doRewind(false, true)}
+                className="rounded-md border border-line bg-surface px-2.5 py-1 text-xs text-fg hover:bg-surface-2 disabled:opacity-50"
+              >
+                只回退对话
+              </button>
+              <button
+                type="button"
+                disabled={rewinding}
+                onClick={() => void doRewind(true, true)}
+                className="rounded-md border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs text-accent hover:bg-accent/15 disabled:opacity-50"
+              >
+                还原代码并回退对话
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div
           ref={scrollRef}
@@ -408,6 +489,22 @@ export function ChatPage({ session, onBranch, onPreview, onNewSession, onCandida
                   <TriangleAlert size={13} strokeWidth={1.75} className="text-warn" aria-hidden />
                 )}
                 {toast.text}
+                {undoSha && (
+                  <button
+                    type="button"
+                    className="ml-1 rounded px-1 text-accent hover:underline"
+                    onClick={() => {
+                      const sha = undoSha;
+                      setUndoSha(null);
+                      void api.rewindUndo(session.id, sha).then(
+                        () => setToast({ text: "已撤销回退", ok: true }),
+                        () => setToast({ text: "撤销失败", ok: false }),
+                      );
+                    }}
+                  >
+                    撤销
+                  </button>
+                )}
               </motion.div>
             )}
           </AnimatePresence>

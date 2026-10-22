@@ -27,7 +27,12 @@ import {
 } from "./context.ts";
 import { AttachmentError, AttachmentStore, MAX_PER_MESSAGE, TEXT_INJECT_CHARS } from "./attachments.ts";
 import { parseExternal, type ExternalConversation, type ExternalSource } from "./external.ts";
-import { BlockBuilder, runAgent, toolDigest, toolsForMode } from "./agent.ts";
+import { BlockBuilder, mcpAgentTools, runAgent, toolDigest, toolsForMode } from "./agent.ts";
+import { CheckpointStore } from "./checkpoints.ts";
+import {
+  applyClaudeDesktopImport, effectiveConfig, isProjectTrusted, loadProjectConfig, loadUserConfig, McpManager,
+  previewClaudeDesktopImport, revokeProjectTrust, saveUserConfig, trustProject,
+} from "./mcp.ts";
 import { addAllowRule, decide, loadPermissions, suggestRule } from "./permissions.ts";
 
 const now = () => new Date().toISOString();
@@ -43,6 +48,8 @@ export function createApp(
     titleProvider?: () => ChatProvider | undefined;
     summaryProvider?: () => ChatProvider | undefined;
     dataDir?: string; // 附件存放目录的上级(缺省 DATA_DIR;测试用临时目录)
+    // L1:工作区快照。缺省按 dataDir 建;测试可注入 skipGuards 跳过 home / 根目录与文件数检查
+    checkpoints?: CheckpointStore;
   },
 ) {
   const app = new Hono();
@@ -54,6 +61,10 @@ export function createApp(
   const taskStore = new TaskStore(db);
   // B2:附件。启动时清理一天前上传、但没有随任何消息发出的附件
   const attachments = new AttachmentStore(db, opts?.dataDir ?? DATA_DIR);
+  // L1:工作区快照(影子仓库,不碰用户的 .git)
+  const checkpoints = opts?.checkpoints ?? new CheckpointStore({ dataDir: opts?.dataDir ?? DATA_DIR });
+  // B3:MCP 客户端(惰性连接,首次用到工具时才启动)
+  const mcp = new McpManager();
   try {
     attachments.prune();
   } catch {
@@ -288,14 +299,14 @@ export function createApp(
   type MsgRow = {
     id: number; role: string; content: string; blocks: string | null; aborted: number; usage: string | null;
     error: string | null; model: string | null; parent_id: number | null; ref_context: string | null;
-    ctx_trim: string | null; created_at: string;
+    ctx_trim: string | null; created_at: string; checkpoint_sha: string | null;
   };
   // 按给定顺序取消息(路径上的 id);缺失的跳过
   const rowsByIds = (ids: number[]): MsgRow[] => {
     if (!ids.length) return [];
     const rows = db
       .prepare(
-        `SELECT id, role, content, blocks, aborted, usage, error, model, parent_id, ref_context, ctx_trim, created_at
+        `SELECT id, role, content, blocks, aborted, usage, error, model, parent_id, ref_context, ctx_trim, checkpoint_sha, created_at
          FROM messages WHERE id IN (SELECT value FROM json_each(?))`,
       )
       .all(JSON.stringify(ids)) as unknown as MsgRow[];
@@ -368,6 +379,7 @@ export function createApp(
       parentId: tree.linear ? undefined : (tree.parent.get(r.id) ?? null),
       siblings: siblingsOf(tree, r.id),
       trim: parseTrim(r.ctx_trim),
+      checkpointSha: r.checkpoint_sha ?? undefined,
     }));
   };
 
@@ -382,6 +394,69 @@ export function createApp(
     if (head == null) return c.json({ error: "message not found" }, 404);
     return c.json({ headId: head, messages: listPath(sessionId) });
   });
+  // L1:回退到某条消息。code=true 还原工作区到该消息的快照(先拍 pre-rewind 以便撤销);
+  // chat=true 把对话 head 退到该消息的父消息,并返回原消息文本供前端填回输入框。
+  app.post("/sessions/:id/rewind", async (c) => {
+    const sessionId = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as { messageId?: unknown; code?: unknown; chat?: unknown };
+    if (typeof body.messageId !== "number") return c.json({ error: "缺少 messageId" }, 400);
+    if (runs.active(sessionId)?.status === "running") return c.json({ error: "该会话正在生成,请等待完成或先停止" }, 409);
+    const session = db.prepare("SELECT workspace FROM sessions WHERE id = ?").get(sessionId) as { workspace: string } | undefined;
+    if (!session) return c.json({ error: "session not found" }, 404);
+    const row = db.prepare("SELECT id, role, content, parent_id, checkpoint_sha FROM messages WHERE id = ? AND session_id = ?").get(
+      body.messageId, sessionId,
+    ) as { id: number; role: string; content: string; parent_id: number | null; checkpoint_sha: string | null } | undefined;
+    if (!row) return c.json({ error: "message not found" }, 404);
+
+    let undoSha: string | null = null;
+    if (body.code === true) {
+      if (!row.checkpoint_sha) return c.json({ error: "该消息没有代码快照" }, 400);
+      if (!session.workspace) return c.json({ error: "会话没有工作区" }, 400);
+      // 先拍当前状态,供"撤销回退"
+      const undo = await checkpoints.snapshot(session.workspace, "pre-rewind");
+      if (!undo) return c.json({ error: "快照不可用(工作区过大或未初始化)" }, 409);
+      const ok = await checkpoints.restore(session.workspace, row.checkpoint_sha);
+      if (!ok) return c.json({ error: "还原失败" }, 500);
+      undoSha = undo.sha;
+      auditTool("checkpoint.rewind", { sessionId, messageId: row.id, to: row.checkpoint_sha, undo: undoSha });
+    }
+    if (body.chat === true) {
+      // 直接设 head 为该消息的父消息(而不是 switchHead——它在消息已在路径上时不会回退)。
+      // 该消息及其后的内容仍在库里,只是不在当前路径上,之后可用版本切换找回。
+      setHeadId(db, sessionId, row.parent_id ?? null);
+    }
+    return c.json({
+      ok: true,
+      undoSha,
+      ...(body.chat === true ? { text: row.content, messages: listPath(sessionId) } : {}),
+    });
+  });
+
+  // L1:撤销回退(把工作区还原到 rewind 之前拍的那份快照)
+  app.post("/sessions/:id/rewind/undo", async (c) => {
+    const sessionId = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as { sha?: unknown };
+    if (typeof body.sha !== "string") return c.json({ error: "缺少 sha" }, 400);
+    const session = db.prepare("SELECT workspace FROM sessions WHERE id = ?").get(sessionId) as { workspace: string } | undefined;
+    if (!session?.workspace) return c.json({ error: "会话没有工作区" }, 400);
+    const ok = await checkpoints.restore(session.workspace, body.sha);
+    if (!ok) return c.json({ error: "撤销失败" }, 500);
+    auditTool("checkpoint.undo", { sessionId, sha: body.sha });
+    return c.json({ ok: true });
+  });
+
+  // L1:快照与当前工作区的差异(确认对话框列出将要还原的文件)
+  app.get("/checkpoints/diff", async (c) => {
+    const sessionId = c.req.query("sessionId") ?? "";
+    const from = c.req.query("from") ?? "";
+    if (!sessionId || !from) return c.json({ error: "缺少 sessionId 或 from" }, 400);
+    const session = db.prepare("SELECT workspace FROM sessions WHERE id = ?").get(sessionId) as { workspace: string } | undefined;
+    if (!session?.workspace) return c.json({ error: "会话没有工作区" }, 400);
+    const files = await checkpoints.diffFiles(session.workspace, from);
+    const patch = await checkpoints.diffText(session.workspace, from);
+    return c.json({ files, patch: patch.slice(0, 200_000) });
+  });
+
   // 分支:把某条消息(含)及其祖先(缺省为当前分支全部)复制到一个新会话,返回新会话。
   app.post("/sessions/:id/branch", async (c) => {
     const sessionId = c.req.param("id");
@@ -595,14 +670,28 @@ export function createApp(
     const vision = caps.length === 0 || caps.includes("vision");
     // B1:Code / Work 模式下发工具(chat 不给)。capabilities 未声明时按 Provider 实际能力为准;
     // XIYUN_AGENT=0 可整体关闭 agent 循环(排错用)
-    const agentTools =
+    const agentEnabled =
       (session.mode === "code" || session.mode === "work") &&
       !!session.workspace &&
       !!provider.streamEvents &&
       (caps.length === 0 || caps.includes("tools")) &&
-      process.env.XIYUN_AGENT !== "0"
-        ? toolsForMode(session.mode)
-        : [];
+      process.env.XIYUN_AGENT !== "0";
+    let agentTools = agentEnabled ? toolsForMode(session.mode) : [];
+    // B3:MCP 工具并入注册表(code / work 默认开放,chat 由设置开关控制——当前仅 code / work)
+    if (agentEnabled) {
+      try {
+        const mcpTools = await mcp.tools(session.workspace);
+        if (mcpTools.length)
+          agentTools = [
+            ...agentTools,
+            ...mcpAgentTools(mcpTools, (server, toolName, args, signal) =>
+              mcp.callTool(session.workspace, server, toolName, args, signal),
+            ),
+          ];
+      } catch {
+        // MCP 不可用不影响内置工具
+      }
+    }
     const curImages = attBlocks.filter((a) => a.type === "image");
     if (curImages.length && !vision)
       return c.json({ error: "当前模型未声明图片能力(vision):请换用支持图片的模型,或在设置里为该模型加上 vision" }, 400);
@@ -710,9 +799,15 @@ export function createApp(
         });
       const all = [...refBlocks, ...attBlocks];
       const blocks = all.length ? JSON.stringify(all) : null;
+      // L1:本轮开始前拍快照,供"回退到这里"。失败不影响对话
+      const cp = session.mode === "code" && session.workspace
+        ? await checkpoints.snapshot(session.workspace, `chat ${new Date().toISOString()}`).catch(() => null)
+        : null;
       const r = db
-        .prepare("INSERT INTO messages (session_id, role, content, blocks, parent_id, ref_context, created_at) VALUES (?, 'user', ?, ?, ?, ?, ?)")
-        .run(sessionId, message, blocks, parentId, context || null, now());
+        .prepare(
+          "INSERT INTO messages (session_id, role, content, blocks, parent_id, ref_context, checkpoint_sha, created_at) VALUES (?, 'user', ?, ?, ?, ?, ?, ?)",
+        )
+        .run(sessionId, message, blocks, parentId, context || null, cp?.sha ?? null, now());
       userMessageId = Number(r.lastInsertRowid);
       setHeadId(db, sessionId, userMessageId);
       touchSession(sessionId);
@@ -776,6 +871,11 @@ export function createApp(
               builder.update(req.blockId);
             }
             return run.awaitConfirm(req.blockId);
+          },
+          // L1:写操作 / 命令执行前拍快照
+          beforeWrite: async ({ name, args }) => {
+            const cp = await checkpoints.snapshot(session.workspace, `${name} ${JSON.stringify(args).slice(0, 120)}`);
+            return cp?.sha ?? null;
           },
           // 每次工具执行写一条审计事件;只记参数摘要,不记文件内容
           onToolEnd: (info) => {
@@ -1260,6 +1360,54 @@ export function createApp(
 
   // ---- Skill(阶段 6):导入不自动启用,禁用后立即不再注入 ----
   app.get("/skills", (c) => c.json(skills.list()));
+
+  // ---- B3:MCP ----
+  app.get("/mcp/servers", async (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    const servers = await mcp.status(workspace);
+    const tools = await mcp.toolList(workspace).catch(() => []);
+    const { projectPending } = effectiveConfig(workspace);
+    return c.json({ servers, tools, projectPending, projectTrusted: workspace ? isProjectTrusted(workspace) : true });
+  });
+  app.get("/mcp/config", (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    return c.json({ user: loadUserConfig(), project: workspace ? loadProjectConfig(workspace) : { mcpServers: {} } });
+  });
+  app.put("/mcp/config", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as { user?: unknown } | null;
+    const cfg = body?.user as { mcpServers?: unknown } | undefined;
+    if (!cfg || typeof cfg !== "object" || typeof cfg.mcpServers !== "object" || cfg.mcpServers === null)
+      return c.json({ error: "格式必须是 { mcpServers: { ... } }" }, 400);
+    for (const [name, sc] of Object.entries(cfg.mcpServers as Record<string, unknown>)) {
+      if (!name.trim()) return c.json({ error: "服务器名不能为空" }, 400);
+      const s = sc as Record<string, unknown>;
+      const remote = s.type === "http" || s.type === "sse";
+      if (remote ? typeof s.url !== "string" : typeof s.command !== "string")
+        return c.json({ error: `${name}:${remote ? "缺少 url" : "缺少 command"}` }, 400);
+    }
+    saveUserConfig(cfg as { mcpServers: Record<string, never> });
+    return c.json({ ok: true });
+  });
+  app.post("/mcp/servers/:name/restart", async (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    const ok = await mcp.restart(workspace, c.req.param("name"));
+    return c.json({ ok });
+  });
+  // 项目级配置信任:首次使用前需批准;内容变化后需重新批准
+  app.post("/mcp/trust", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { workspace?: string; revoke?: boolean };
+    if (!b.workspace) return c.json({ error: "缺少 workspace" }, 400);
+    if (b.revoke) revokeProjectTrust(b.workspace);
+    else trustProject(b.workspace);
+    return c.json({ ok: true, trusted: isProjectTrusted(b.workspace) });
+  });
+  app.post("/mcp/import/claude-desktop/preview", (c) => c.json(previewClaudeDesktopImport()));
+  app.post("/mcp/import/claude-desktop/apply", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { names?: unknown };
+    const names = Array.isArray(b.names) ? b.names.filter((x): x is string => typeof x === "string") : [];
+    if (!names.length) return c.json({ error: "缺少 names" }, 400);
+    return c.json(applyClaudeDesktopImport(names));
+  });
   app.post("/skills/import", async (c) => {
     const b = (await c.req.json()) as { path: string };
     try {

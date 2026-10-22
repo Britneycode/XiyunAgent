@@ -104,6 +104,12 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_external ON sessions(external_source, external_id) WHERE external_id IS NOT NULL",
     );
   },
+  // v13:工作区快照(L1)。messages.checkpoint_sha 记录本轮开始前的快照,
+  // 用于「回退到这里」;工具块的 checkpoint 存在 blocks JSON 里,不单列
+  (db) => {
+    const mc = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!mc.includes("checkpoint_sha")) db.exec("ALTER TABLE messages ADD COLUMN checkpoint_sha TEXT");
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

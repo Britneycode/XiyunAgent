@@ -124,3 +124,21 @@ Skill:目录或 ZIP 只有 `SKILL.md` 时,从 frontmatter 的 name / description
 前端:ToolBlock 补 awaiting(警告色、自动展开、显示 reason 与将要写入的规则原文、允许 / 本项目始终允许 / 拒绝三个按钮,点击后禁用等服务端 block_end)、running(等宽输出区自动滚动)、rejected 与 result 展示(edit_file 的 diff 按 -/+ 着色,bash 显示 exit 徽标与耗时);删除「当前版本不会自动执行」文案,pending 改为「未执行(当前会话未开放工具)」。终端面板改用流式接口,运行中实时显示输出,确认条增加「本项目始终允许」。
 
 取舍:`toolDigest` 把上一轮的工具调用摘要附在 assistant 内容后(而不是新增字段),这样历史装配与预算计算无需改动;结果回传模型截到 30k(保留开头 40% 与结尾 60%),界面展示截到 10k;流式输出只保留尾部 64KB;子任务步数上限 12、主对话 30。tasks.ts 的旧文本 ```tool 协议与 ROLE_TOOLS / runTool 一并删除,`tools.test.ts` 保留其余用例。
+
+## D-025:工作区快照与回退,以及 MCP 客户端(2026-10-22)
+
+工作区快照(L1):每个工作区一个影子仓库 `<dataDir>/checkpoints/<sha1(realpath(ws)) 前16位>.git`,所有命令都用 `--git-dir` / `--work-tree` 指向它,**完全不碰用户自己的 `.git`**(有测试断言用户仓库的 HEAD 与工作区状态在快照前后不变)。`info/exclude` 固定写入 `.git/ node_modules/ .xiyun-wt/ dist/ build/ .next/ target/ .xiyun/`,并设 `core.autocrlf=false`(避免 Windows 上换行配置造成内容漂移)。快照 = `add -A` + `write-tree`,树与 HEAD 相同就复用 HEAD,否则 `commit-tree -p HEAD` + `update-ref HEAD`;超时 30 秒,失败只记审计事件、不影响对话。保护:工作区是用户主目录或磁盘根目录、或文件数超过 2 万时关闭快照并给出原因(`CheckpointStore.ensure` 返回原因,`snapshot` 返回 null)。拍快照的时机:code 模式每轮开始前一次(user 消息落 `messages.checkpoint_sha`,v13 迁移新增),以及 write_file / edit_file / bash 执行前一次(记在工具块的 `checkpoint` 字段)。
+
+回退:`POST /sessions/:id/rewind {messageId, code, chat}`。`code=true` 时先拍一份 `pre-rewind` 快照得到 `undoSha`,再 `read-tree -u --reset <sha>`;**`read-tree` 不会删除快照之后新增的文件**,所以先 `add -A` 并用 `diff --name-only --diff-filter=A` 找出这些路径逐个删除(被忽略的目录不在快照里,因此不受影响)。`chat=true` 把 head 直接设为该消息的父消息——不能用 `switchHead`,它在消息已位于当前路径上时不做任何事。返回 `{ok, undoSha, text, messages}`,前端直接用返回的 messages 替换本地列表。`POST /sessions/:id/rewind/undo {sha}` 撤销回退。`GET /checkpoints/diff?sessionId&from` 列出将要还原的文件与 patch,供确认对话框展示。
+
+`loadTree` 的 head 兜底语义修正:原来"head 为 null 且不是老库"会自动回退到最新一条消息,这会让"回退到第一条消息之前"(head=null)立刻被撤销。改为只在 head **指向已删除消息**时失效;老库(所有消息都没有 parent)仍按 id 顺序取最后一条作为 head。同时 `linear` 收紧为"老库单链"——它只用于让展示层省略 parentId / siblings,head 为 null 的新库是空会话,路径为空,不能当单链。
+
+MCP(B3):依赖 `@modelcontextprotocol/sdk`。配置分两级——用户级 `~/.xiyun/mcp.json`(与 `claude_desktop_config.json` 同格式,另支持 `{type: "http" | "sse", url, headers}`)、项目级 `<ws>/.mcp.json`(Claude Code 格式)。项目级配置**首次使用前必须在设置里批准**,批准结果按"配置内容的 sha256 前 16 位"记到 `~/.xiyun/mcp-trust.json`,配置一改就失效、需要重新批准——这样别人在仓库里塞一个 `.mcp.json` 不会静默执行命令。合并规则:项目级同名覆盖用户级;未信任时整个项目级被忽略。
+
+连接:stdio 用 `StdioClientTransport`,环境变量 = `getDefaultEnvironment()` + 配置的 env(不带 `process.env`,避免泄漏本机密钥);**Windows 下 `npx` / `npm` / `pnpm` / `yarn` / `bunx` 必须包一层 `cmd /c`**,否则 spawn 找不到 `.cmd`。http 用 `StreamableHTTPClientTransport`,失败时回退 `SSEClientTransport` 一次。惰性连接(首次需要工具时才启动),连接超时 30 秒,stderr 保留尾部 8KB 用于排错。工具列表处理 `nextCursor` 分页。工具名规范化为 `mcp__<server>__<tool>`,字符限定 `[a-zA-Z0-9_-]`,超过 64 字符时截断并追加 8 位短哈希(原名与规范名的映射保留在 `McpToolInfo.originalName`)。`callTool` 超时 120 秒、支持 signal 中断;返回内容 text 拼接、image 转 `[图片 mime]` 占位、resource 取 text 或 uri,整体截到 30k。
+
+接入 agent:MCP 工具并入工具注册表,code / work 模式默认开放;权限类型为 `Mcp`,默认需要确认;规则沿用 E3 的 `mcp__github` / `mcp__github__*` / `mcp__github__create_issue`。接口:`GET /mcp/servers`(状态 / 工具数 / 错误 / stderr)、`GET` / `PUT /mcp/config`(写入前校验每个服务器必须有 command 或 url)、`POST /mcp/servers/:name/restart`、`POST /mcp/trust`、`POST /mcp/import/claude-desktop/preview` 与 `/apply`(同名只列冲突、不覆盖)。设置页的「插件」占位替换为 MCP 区块。
+
+两处顺带修复:`shellExec` 中断时原来只 `killTree` 不 settle,进程树杀不干净时 `close` 事件迟迟不来,Promise 会挂住——改为中断立即以 AbortError 拒绝(仍调用 killTree 结束进程),并用 `settled` 标志避免重复 settle。新增 `vitest.config.ts` 设 `fileParallelism: false`:测试会启动真实子进程(git / node / shell)并操作临时目录,并行时互相抢 CPU 与磁盘,表现为随机超时(排查时观察到失败文件在漂移)。
+
+取舍:快照不记录被忽略的目录,所以 `node_modules` 之类的改动无法回退(符合预期);影子仓库每个工作区一份,工作区移动后 key 变化会重新建仓;MCP 的 http 传输不做 OAuth;工具列表在连接后缓存,收到 `notifications/tools/list_changed` 时自动重新拉取;chat 模式默认不开放 MCP 工具。

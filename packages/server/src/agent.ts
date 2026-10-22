@@ -356,6 +356,22 @@ export const ALL_TOOLS: AgentTool[] = [
   readFileTool, listFilesTool, grepTool, editFileTool, writeFileTool, bashTool, gitStatusTool, gitDiffTool,
 ];
 
+// B3:MCP 工具转成 AgentTool。权限类型为 Mcp,默认需要确认;
+// 规则形如 mcp__github__* / mcp__github__create_issue 由 permissions.ts 处理
+export function mcpAgentTools(
+  tools: Array<{ name: string; originalName: string; server: string; description: string; inputSchema: object }>,
+  call: (server: string, toolName: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<string>,
+): AgentTool[] {
+  return tools.map((t) => ({
+    def: { name: t.name, description: t.description || `MCP 工具 ${t.originalName}`, parameters: t.inputSchema },
+    perm: () => ({ kind: "Mcp" as const, tool: t.name }),
+    async run(args, ctx) {
+      const text = await call(t.server, t.originalName, args, ctx.signal);
+      return { text };
+    },
+  }));
+}
+
 const READONLY_NAMES = new Set(["read_file", "list_files", "grep", "git_status", "git_diff"]);
 
 // 按会话模式下发工具:code 全部,work 只读,chat 不给
@@ -557,6 +573,8 @@ export interface RunAgentOptions {
   // 子任务没有确认通道时的兜底:返回 allow / deny
   policy?: (req: ConfirmRequest) => ToolDecision;
   onToolEnd?: (info: { name: string; status: ToolStatus; args: Record<string, unknown>; exitCode?: number }) => void;
+  // L1:写操作或非只读命令执行前拍快照,返回的 sha 记到工具块上
+  beforeWrite?: (info: { name: string; args: Record<string, unknown> }) => Promise<string | null>;
 }
 
 export interface RunAgentResult {
@@ -849,6 +867,23 @@ export async function runAgent(o: RunAgentOptions): Promise<RunAgentResult> {
         }
       } else {
         o.builder.setStatus(c.blockId, "running");
+      }
+
+      // L1:写类工具与可能改文件的命令执行前拍快照
+      const WRITE_TOOLS = new Set(["edit_file", "write_file"]);
+      if (o.beforeWrite && (WRITE_TOOLS.has(c.name) || c.name === "bash")) {
+        try {
+          const sha = await o.beforeWrite({ name: c.name, args: c.args });
+          if (sha) {
+            const tb = o.builder.tool(c.blockId);
+            if (tb) {
+              tb.checkpoint = sha;
+              o.builder.update(c.blockId);
+            }
+          }
+        } catch {
+          // 快照失败不阻塞工具执行
+        }
       }
 
       const t0 = Date.now();

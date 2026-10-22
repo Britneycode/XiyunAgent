@@ -128,6 +128,43 @@ export const api = {
   // 工具确认(B1):awaiting 卡片上点「允许 / 始终允许 / 拒绝」
   confirmTool: (runId: string, callId: string, decision: "allow" | "always" | "deny") =>
     req<{ ok: boolean }>(`/runs/${runId}/confirm`, { method: "POST", body: JSON.stringify({ callId, decision }) }),
+  // L1:回退到某条消息(还原代码 / 回退对话)
+  rewind: (sessionId: string, b: { messageId: number; code?: boolean; chat?: boolean }) =>
+    req<{ ok: boolean; undoSha: string | null; text?: string; messages?: ChatMessage[] }>(`/sessions/${sessionId}/rewind`, {
+      method: "POST", body: JSON.stringify(b),
+    }),
+  rewindUndo: (sessionId: string, sha: string) =>
+    req<{ ok: boolean }>(`/sessions/${sessionId}/rewind/undo`, { method: "POST", body: JSON.stringify({ sha }) }),
+  checkpointDiff: (sessionId: string, from: string) =>
+    req<{ files: Array<{ status: string; path: string }>; patch: string }>(
+      `/checkpoints/diff?sessionId=${encodeURIComponent(sessionId)}&from=${encodeURIComponent(from)}`,
+    ),
+  // B3:MCP
+  mcpServers: (workspace: string) =>
+    req<{
+      servers: Array<{ name: string; status: string; tools: number; error?: string; stderr?: string }>;
+      tools: Array<{ server: string; name: string; description: string }>;
+      projectPending: boolean;
+      projectTrusted: boolean;
+    }>(`/mcp/servers?workspace=${encodeURIComponent(workspace)}`),
+  mcpConfig: (workspace: string) =>
+    req<{ user: { mcpServers: Record<string, unknown> }; project: { mcpServers: Record<string, unknown> } }>(
+      `/mcp/config?workspace=${encodeURIComponent(workspace)}`,
+    ),
+  saveMcpConfig: (user: { mcpServers: Record<string, unknown> }) =>
+    req<{ ok: boolean }>("/mcp/config", { method: "PUT", body: JSON.stringify({ user }) }),
+  restartMcp: (name: string, workspace: string) =>
+    req<{ ok: boolean }>(`/mcp/servers/${encodeURIComponent(name)}/restart?workspace=${encodeURIComponent(workspace)}`, { method: "POST" }),
+  trustMcp: (workspace: string, revoke = false) =>
+    req<{ ok: boolean; trusted: boolean }>("/mcp/trust", { method: "POST", body: JSON.stringify({ workspace, revoke }) }),
+  mcpImportPreview: () =>
+    req<{ available: boolean; path: string; servers: Array<{ name: string; conflict: boolean }> }>(
+      "/mcp/import/claude-desktop/preview", { method: "POST" },
+    ),
+  mcpImportApply: (names: string[]) =>
+    req<{ imported: number; skipped: number }>("/mcp/import/claude-desktop/apply", {
+      method: "POST", body: JSON.stringify({ names }),
+    }),
   // 权限规则(F7)
   permissions: (workspace: string) =>
     req<{ allow: string[]; ask: string[]; deny: string[] }>(`/tools/permissions?workspace=${encodeURIComponent(workspace)}`),

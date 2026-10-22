@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ModelRole, ProviderConfig, ProviderProtocol, SkillInfo } from "@xiyun/shared";
 import { api, type ExternalPreview } from "./api.ts";
 import { readExportFile } from "./settings/zip.ts";
+import { McpSection } from "./settings/McpSection.tsx";
 import {
   applyPreset, emptyForm, formFrom, mergeModelIds, PRESETS, PROTOCOL_OPTIONS, toConfig, type ProviderForm,
 } from "./settings/providerForm.ts";
@@ -560,7 +561,7 @@ export function SettingsPage({ onDataChanged }: { onDataChanged?: () => void } =
         {cat === "权限与安全" && <SecuritySection />}
         {cat === "数据" && <DataSection onChanged={onDataChanged} />}
         {cat === "Skill" && <SkillsSection />}
-        {cat === "插件" && <PlaceholderSection title="插件" note="可执行插件沙箱(Extension API)尚未实现;Skill 已支持声明式权限,见「Skill」与「权限与安全」页。插件执行能力在有真实需求后交付。" />}
+        {cat === "插件" && <McpSection workspace="" />}
         {cat === "关于" && <PlaceholderSection title="关于" note="XiyunAgent · 本地优先的个人 Agent 工作台。" />}
       </div>
     </div>
