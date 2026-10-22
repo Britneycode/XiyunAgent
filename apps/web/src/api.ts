@@ -140,6 +140,11 @@ export const api = {
     tasks: Array<{ role: AgentRole; prompt: string; title?: string; providerId?: string }>;
   }) => req<{ ids: string[] }>("/tasks", { method: "POST", body: JSON.stringify(b) }),
   cancelTask: (id: string) => req(`/tasks/${id}/cancel`, { method: "POST" }),
+  // L4:展开任务卡片时取完整 diff 与每步工具
+  taskDetail: (id: string) =>
+    req<{ branch: string | null; baseSha: string | null; patch: string; tools: Array<{ tool: string; status: string; at: string }> }>(
+      `/tasks/${id}/detail`,
+    ),
   retryTask: (id: string) => req(`/tasks/${id}/retry`, { method: "POST" }),
   resumeTask: (id: string, answer: string) => req(`/tasks/${id}/resume`, { method: "POST", body: JSON.stringify({ answer }) }),
   // L4:隔离分支落地操作(都需前端二次确认后带 confirm:true)

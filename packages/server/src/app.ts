@@ -17,7 +17,7 @@ import { SkillStore } from "./skills.ts";
 import { MAX_GROUP_TASKS, Scheduler, TaskEventBus, TaskStore } from "./tasks.ts";
 import { cheapestPriced, UsageLedger, type UsageGroupBy } from "./usage.ts";
 import {
-  createPullRequest, mergeBranch, pushBranch, remoteUrl, removeWorktree,
+  createPullRequest, diffText, mergeBranch, pushBranch, remoteUrl, removeWorktree,
 } from "./worktree.ts";
 import { detectShells, gitCommit, gitPreview, listTool, readTool, shellExec, writeTool } from "./tools.ts";
 import { DATA_DIR, backupDb } from "./db.ts";
@@ -1278,6 +1278,25 @@ export function createApp(
   app.get("/tasks/:id", (c) => {
     const t = taskStore.get(c.req.param("id"));
     return t ? c.json(t) : c.json({ error: "not found" }, 404);
+  });
+  // L4:任务卡片展开时的详情 —— 完整 diff(base_sha..branch)与每步工具。
+  // 工具来自事件表,任务结束后事件流不再订阅,靠这里一次性补齐。
+  app.get("/tasks/:id/detail", async (c) => {
+    const t = taskStore.get(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    const rows = db
+      .prepare("SELECT payload, created_at FROM events WHERE type = 'task.tool' AND payload LIKE ? ORDER BY id ASC LIMIT 200")
+      .all(`%"taskId":"${t.id}"%`) as Array<{ payload: string; created_at: string }>;
+    const tools = rows.flatMap((r) => {
+      try {
+        const p = JSON.parse(r.payload) as { tool?: string; status?: string };
+        return p.tool ? [{ tool: p.tool, status: p.status ?? "", at: r.created_at }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const patch = t.baseSha && t.branch ? (await diffText(t.workspace, t.baseSha, t.branch)).slice(0, 200_000) : "";
+    return c.json({ branch: t.branch ?? null, baseSha: t.baseSha ?? null, patch, tools });
   });
   app.post("/tasks/:id/cancel", (c) => {
     return scheduler.cancel(c.req.param("id"))

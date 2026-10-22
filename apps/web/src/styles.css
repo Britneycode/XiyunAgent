@@ -76,6 +76,20 @@ code, pre { font-family: var(--code-font, monospace); }
 .task .branch { margin: 6px 0 0; font-family: var(--code-font, monospace); font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task .diffstat { margin: 6px 0 0; font-size: 11px; color: var(--muted); white-space: pre-wrap; max-height: 120px; overflow: auto; }
 .task .note { margin: 6px 0 0; font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+/* L4:展开后的每步工具与完整 diff */
+.task .steptools { margin-top: 6px; font-size: 11px; }
+.task .steptools .label { color: var(--muted); }
+.task .steptools ol { margin: 4px 0 0; padding-left: 18px; max-height: 120px; overflow: auto; }
+.task .steptools li { color: var(--text); }
+.task .steptools li.bad { color: var(--err); }
+.task .steptools li em { margin-left: 6px; color: var(--muted); font-style: normal; }
+.task .patch { margin-top: 6px; font-size: 11px; }
+.task .patch summary { color: var(--muted); cursor: pointer; }
+.task .patch pre {
+  margin: 4px 0 0; padding: 6px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--code-bg); color: var(--code-text); font-family: var(--code-font, monospace);
+  white-space: pre; overflow: auto; max-height: 320px;
+}
 
 /* ===== 用量面板(L5) ===== */
 .usage-panel { display: flex; flex-direction: column; gap: 10px; font-size: 13px; }

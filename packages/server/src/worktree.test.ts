@@ -8,7 +8,7 @@ import type { ChatProvider, ModelRegistry } from "@xiyun/runtime";
 import { MemoryStore } from "./memory.ts";
 import { Scheduler, TaskStore } from "./tasks.ts";
 import { gitExec } from "./tools.ts";
-import { branchOf, createWorktree, diffStat, hasChanges, mergeBranch, removeWorktree } from "./worktree.ts";
+import { branchOf, createWorktree, diffStat, diffText, hasChanges, mergeBranch, removeWorktree } from "./worktree.ts";
 
 // L4:后台写任务的 git worktree 隔离。
 // 覆盖:两个并行 coder 任务各改各的文件、各自落在独立分支上,用户工作区不被改动;
@@ -203,6 +203,9 @@ describe("L4 worktree 隔离", () => {
     expect(await hasChanges(wt.path)).toBe(false);
     const stat = await diffStat(ws, wt.baseSha, wt.branch);
     expect(stat).toContain("x.txt");
+    // 完整 diff:带 +/- 行,任务卡片展开时用
+    const patch = await diffText(ws, wt.baseSha, wt.branch);
+    expect(patch).toContain("+hi");
     // 用户工作区不受影响
     expect(existsSync(join(ws, "x.txt"))).toBe(false);
     rmSync(ws, { recursive: true, force: true });

@@ -30,12 +30,30 @@ const LANDING: Array<{ key: "merge" | "push" | "pr" | "discard"; label: string; 
   { key: "discard", label: "丢弃", hint: "删除隔离 worktree 与分支?此操作不可撤销", run: (id) => api.discardTask(id) },
 ];
 
+type TaskDetail = Awaited<ReturnType<typeof api.taskDetail>>;
+
 function TaskCard({ task, onChanged }: { task: SubagentTask; onChanged: () => void }) {
   const [open, setOpen] = useState(false);
   const [answer, setAnswer] = useState("");
   const [note, setNote] = useState("");
   const [tool, setTool] = useState("");
+  const [detail, setDetail] = useState<TaskDetail | null>(null);
   const active = task.status === "queued" || task.status === "running";
+
+  // 展开时取完整 diff 与每步工具(任务结束后事件流不再订阅,历史从这里补齐)
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    void api
+      .taskDetail(task.id)
+      .then((d) => {
+        if (alive) setDetail(d);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [open, task.id, task.status]);
 
   // 运行中的任务订阅事件流,显示当前工具(结束或卸载时断开)
   useEffect(() => {
@@ -102,13 +120,43 @@ function TaskCard({ task, onChanged }: { task: SubagentTask; onChanged: () => vo
             </p>
           )}
           {task.diffStat && <pre className="diffstat">{task.diffStat}</pre>}
+          {detail && detail.tools.length > 0 && (
+            <div className="steptools">
+              <span className="label">工具</span>
+              <ol>
+                {detail.tools.map((t, i) => (
+                  <li key={`${t.at}-${i}`} className={t.status === "error" || t.status === "rejected" ? "bad" : undefined}>
+                    {t.tool}
+                    {t.status && <em>{t.status}</em>}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+          {detail?.patch && (
+            <details className="patch">
+              <summary>
+                完整 diff({detail.baseSha ? `${detail.baseSha.slice(0, 7)}...` : ""}
+                {detail.branch})
+              </summary>
+              <pre>{detail.patch}</pre>
+            </details>
+          )}
           {task.result && <p className="summary">{task.result.summary}</p>}
           {task.result && task.result.risks.length > 0 && (
             <p className="risks">风险:{task.result.risks.join(";")}</p>
           )}
           {task.error && <p className="risks">{task.error}</p>}
           <div className="row">
-            {active && <button onClick={() => void api.cancelTask(task.id).then(onChanged)}>取消</button>}
+            {active && (
+              <button
+                onClick={() => {
+                  if (window.confirm("停止该任务?已产生的改动会保留在隔离分支上")) void api.cancelTask(task.id).then(onChanged);
+                }}
+              >
+                停止
+              </button>
+            )}
             {(task.status === "failed" || task.status === "cancelled") && (
               <button onClick={() => void api.retryTask(task.id).then(onChanged)}>重试</button>
             )}

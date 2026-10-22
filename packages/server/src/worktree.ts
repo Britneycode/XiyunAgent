@@ -118,6 +118,12 @@ export async function diffStat(workspace: string, baseSha: string, branch: strin
   return r.exitCode === 0 ? r.stdout.trim() : "";
 }
 
+// 分支相对起点的完整 diff(base_sha...branch),供任务卡片展开查看
+export async function diffText(workspace: string, baseSha: string, branch: string): Promise<string> {
+  const r = await gitExec(workspace, ["diff", `${baseSha}..${branch}`], 60_000);
+  return r.exitCode === 0 ? r.stdout : "";
+}
+
 // 合并分支到用户当前分支;冲突时中止合并,不让工作区停在冲突状态
 export async function mergeBranch(workspace: string, branch: string): Promise<string> {
   const r = await gitExec(workspace, ["merge", "--no-ff", "-m", `合并子任务分支 ${branch}`, branch], 60_000);
