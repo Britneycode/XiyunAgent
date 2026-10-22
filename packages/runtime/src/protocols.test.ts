@@ -99,6 +99,15 @@ describe("Anthropic 适配器", () => {
       { type: "tool_args", id: "tu_1", delta: '{"path":' },
       { type: "tool_args", id: "tu_1", delta: '"a.ts"}' },
       { type: "tool_end", id: "tu_1", args: '{"path":"a.ts"}' },
+      // 有工具调用时回传原样内容块;没有签名的 thinking 块去掉
+      {
+        type: "raw",
+        protocol: "anthropic",
+        content: [
+          { type: "text", text: "你好" },
+          { type: "tool_use", id: "tu_1", name: "read_file", input: { path: "a.ts" } },
+        ],
+      },
       { type: "usage", usage: { promptTokens: 15, completionTokens: 42, totalTokens: 57, cachedTokens: 5 } },
       { type: "finish", reason: "tool_calls" },
     ]);
@@ -182,6 +191,7 @@ describe("Gemini 适配器", () => {
       { type: "tool_start", id: "call_0", index: 0, name: "search" },
       { type: "tool_args", id: "call_0", delta: '{"q":"x"}' },
       { type: "tool_end", id: "call_0", args: '{"q":"x"}' },
+      { type: "raw", protocol: "gemini", content: [{ text: "好的" }, { functionCall: { name: "search", args: { q: "x" } } }] },
       { type: "usage", usage: { promptTokens: 7, completionTokens: 5, totalTokens: 12, reasoningTokens: 2 } },
       { type: "finish", reason: "tool_calls" },
     ]);
@@ -290,5 +300,118 @@ describe("图片输入(B2)", () => {
     const c = body(calls[0]!).contents as Array<{ role: string; parts: unknown[] }>;
     expect(c[0]!.parts).toEqual([{ text: "看图" }, { inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }]);
     expect(c[2]!.parts).toEqual([{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }]);
+  });
+});
+
+describe("工具调用与结果回传(B1)", () => {
+  const call = { id: "c1", name: "read_file", args: '{"path":"a.ts"}' };
+  const loop = (raw?: { protocol: "openai" | "anthropic" | "gemini"; content: unknown }) => [
+    { role: "system" as const, content: "sys" },
+    { role: "user" as const, content: "读 a.ts" },
+    { role: "assistant" as const, content: "我先看看", toolCalls: [call], ...(raw ? { raw } : {}) },
+    { role: "tool" as const, content: "内容", toolCallId: "c1", toolName: "read_file" },
+    { role: "tool" as const, content: "失败", toolCallId: "c2", toolName: "grep", toolError: true },
+  ];
+  const drain = async (config: ProviderConfig, msgs: ReturnType<typeof loop>) => {
+    for await (const _ of createProvider(config).streamEvents!(msgs)) void _;
+  };
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("OpenAI:assistant 带 tool_calls,结果为 role=tool;reasoning_content 按原样回传", async () => {
+    const calls = mockFetch(() => sse(["data: [DONE]\n\n"]));
+    await drain({ id: "o", name: "o", baseUrl: "http://x/v1", apiKey: "k", model: "m" }, loop({ protocol: "openai", content: { reasoning_content: "想" } }));
+    const m = body(calls[0]!).messages as Array<Record<string, unknown>>;
+    expect(m[2]).toEqual({
+      role: "assistant",
+      content: "我先看看",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } }],
+      reasoning_content: "想",
+    });
+    expect(m[3]).toEqual({ role: "tool", tool_call_id: "c1", content: "内容" });
+    expect(m[4]).toEqual({ role: "tool", tool_call_id: "c2", content: "失败" });
+  });
+
+  it("OpenAI:流里有 reasoning_content 且有工具调用时产出 raw", async () => {
+    mockFetch(() =>
+      sse([
+        data({ choices: [{ delta: { reasoning_content: "推理" } }] }),
+        data({ choices: [{ delta: { tool_calls: [{ index: 0, id: "c9", function: { name: "bash", arguments: "{}" } }] } }] }),
+        "data: [DONE]\n\n",
+      ]),
+    );
+    const out: ProviderEvent[] = [];
+    for await (const ev of createProvider({ id: "o", name: "o", baseUrl: "http://x/v1", apiKey: "k", model: "m" }).streamEvents!([{ role: "user", content: "x" }])) out.push(ev);
+    expect(out).toContainEqual({ type: "raw", protocol: "openai", content: { reasoning_content: "推理" } });
+  });
+
+  it("Anthropic:tool_use 块 + 结果合并成一条 user 的 tool_result;有原样内容时直接回传", async () => {
+    const calls = mockFetch(() => sse([evt("message_stop", {})]));
+    const cfg: ProviderConfig = { id: "a", name: "a", protocol: "anthropic", baseUrl: "http://x", apiKey: "k", model: "m" };
+    await drain(cfg, loop());
+    let m = body(calls[0]!).messages as Array<{ role: string; content: unknown }>;
+    expect(m[1]).toEqual({
+      role: "assistant",
+      content: [
+        { type: "text", text: "我先看看" },
+        { type: "tool_use", id: "c1", name: "read_file", input: { path: "a.ts" } },
+      ],
+    });
+    expect(m[2]).toEqual({
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "c1", content: "内容" },
+        { type: "tool_result", tool_use_id: "c2", content: "失败", is_error: true },
+      ],
+    });
+    const raw = [{ type: "thinking", thinking: "t", signature: "sig" }, { type: "tool_use", id: "c1", name: "read_file", input: {} }];
+    await drain(cfg, loop({ protocol: "anthropic", content: raw }));
+    m = body(calls[1]!).messages as Array<{ role: string; content: unknown }>;
+    expect(m[1]!.content).toEqual(raw);
+    // 其他协议的原样内容不采用
+    await drain(cfg, loop({ protocol: "gemini", content: [{ text: "x" }] }));
+    m = body(calls[2]!).messages as Array<{ role: string; content: unknown }>;
+    expect((m[1]!.content as unknown[]).length).toBe(2);
+  });
+
+  it("Anthropic:thinking 签名经 signature_delta 收集进原样内容", async () => {
+    mockFetch(() =>
+      sse([
+        evt("content_block_start", { index: 0, content_block: { type: "thinking" } }),
+        evt("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: "想" } }),
+        evt("content_block_delta", { index: 0, delta: { type: "signature_delta", signature: "SIG" } }),
+        evt("content_block_stop", { index: 0 }),
+        evt("content_block_start", { index: 1, content_block: { type: "tool_use", id: "t1", name: "bash" } }),
+        evt("content_block_stop", { index: 1 }),
+        evt("message_stop", {}),
+      ]),
+    );
+    const out = await run({ ...base, protocol: "anthropic" });
+    expect(out).toContainEqual({
+      type: "raw",
+      protocol: "anthropic",
+      content: [
+        { type: "thinking", thinking: "想", signature: "SIG" },
+        { type: "tool_use", id: "t1", name: "bash", input: {} },
+      ],
+    });
+  });
+
+  it("Gemini:functionCall / functionResponse;原样 parts(含 thoughtSignature)直接回传", async () => {
+    const calls = mockFetch(() => sse([data({ candidates: [{ content: { parts: [{ text: "x" }] } }] })]));
+    const cfg: ProviderConfig = { id: "g", name: "g", protocol: "gemini", baseUrl: "http://x", apiKey: "k", model: "m" };
+    await drain(cfg, loop());
+    let c = body(calls[0]!).contents as Array<{ role: string; parts: unknown[] }>;
+    expect(c[1]).toEqual({ role: "model", parts: [{ text: "我先看看" }, { functionCall: { name: "read_file", args: { path: "a.ts" } } }] });
+    expect(c[2]).toEqual({
+      role: "user",
+      parts: [
+        { functionResponse: { name: "read_file", response: { result: "内容" } } },
+        { functionResponse: { name: "grep", response: { error: "失败" } } },
+      ],
+    });
+    const raw = [{ functionCall: { name: "read_file", args: {} }, thoughtSignature: "SIG" }];
+    await drain(cfg, loop({ protocol: "gemini", content: raw }));
+    c = body(calls[1]!).contents as Array<{ role: string; parts: unknown[] }>;
+    expect(c[1]!.parts).toEqual(raw);
   });
 });

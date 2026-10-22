@@ -3,6 +3,7 @@
 import type { ChatMessage, ProviderConfig, TokenUsage } from "@xiyun/shared";
 import type { ChatProvider, ChatStreamOptions, ProviderEvent } from "./index.ts";
 import {
+  argsObject,
   buildHeaders,
   buildUrl,
   EFFORT_BUDGET,
@@ -45,16 +46,34 @@ export function createGeminiProvider(config: ProviderConfig, popts: ProviderOpti
   const headers = () => buildHeaders(config, { "x-goog-api-key": config.apiKey });
 
   const streamEvents = async function* (messages: ChatMessage[], opts?: ChatStreamOptions): AsyncIterable<ProviderEvent> {
-    const { system, turns } = splitSystem(messages);
+    const { system, turns } = splitSystem(messages, "gemini");
     const p = config.params ?? {};
+    // 工具轮次(B1):model 轮带 functionCall(有原样 parts 时直接回传,保留 thoughtSignature);
+    // 工具结果作为 user 轮的 functionResponse
     const body: Record<string, unknown> = {
-      contents: turns.map((t) => ({
-        role: t.role === "assistant" ? "model" : "user",
-        parts: [
-          ...(t.content.trim() || !t.images?.length ? [{ text: t.content }] : []),
-          ...(t.images ?? []).map((i) => ({ inlineData: { mimeType: i.mime, data: i.data } })),
-        ],
-      })),
+      contents: turns.map((t) => {
+        if (t.role === "assistant" && t.toolCalls?.length) {
+          if (Array.isArray(t.raw) && t.raw.length) return { role: "model", parts: t.raw };
+          return {
+            role: "model",
+            parts: [
+              ...(t.content.trim() ? [{ text: t.content }] : []),
+              ...t.toolCalls.map((c) => ({ functionCall: { name: c.name, args: argsObject(c.args) } })),
+            ],
+          };
+        }
+        const results = (t.toolResults ?? []).map((r) => ({
+          functionResponse: { name: r.name, response: r.isError ? { error: r.content } : { result: r.content } },
+        }));
+        return {
+          role: t.role === "assistant" ? "model" : "user",
+          parts: [
+            ...results,
+            ...(t.content.trim() || (!t.images?.length && !results.length) ? [{ text: t.content }] : []),
+            ...(t.images ?? []).map((i) => ({ inlineData: { mimeType: i.mime, data: i.data } })),
+          ],
+        };
+      }),
     };
     if (system) body.systemInstruction = { parts: [{ text: system }] };
     const gen: Record<string, unknown> = {};
@@ -76,13 +95,24 @@ export function createGeminiProvider(config: ProviderConfig, popts: ProviderOpti
     let usage: TokenUsage | null = null;
     let finish: string | null = null;
     let calls = 0;
+    // 原样 parts:有函数调用时整段回传(Gemini 要求带回 thoughtSignature);相邻同类文本合并
+    const raw: Array<Record<string, unknown>> = [];
+    const keep = (part: Record<string, unknown>) => {
+      const prev = raw[raw.length - 1];
+      if (typeof part.text === "string" && prev && typeof prev.text === "string" && !!prev.thought === !!part.thought && !prev.thoughtSignature) {
+        prev.text = `${prev.text}${part.text}`;
+        if (part.thoughtSignature) prev.thoughtSignature = part.thoughtSignature;
+      } else raw.push({ ...part });
+    };
     for await (const line of readLines(res.body, o.idleTimeoutMs)) {
       const d = sseData(line);
       if (!d || "done" in d) continue;
       const obj = d.json as {
         error?: { code?: number; message?: string };
         candidates?: Array<{
-          content?: { parts?: Array<{ text?: string; thought?: boolean; functionCall?: { id?: string; name?: string; args?: unknown } }> };
+          content?: {
+            parts?: Array<{ text?: string; thought?: boolean; thoughtSignature?: string; functionCall?: { id?: string; name?: string; args?: unknown } }>;
+          };
           finishReason?: string;
         }>;
         usageMetadata?: Record<string, unknown>;
@@ -94,6 +124,7 @@ export function createGeminiProvider(config: ProviderConfig, popts: ProviderOpti
       }
       const c = obj.candidates?.[0];
       for (const part of c?.content?.parts ?? []) {
+        if (part && typeof part === "object") keep(part as Record<string, unknown>);
         if (part.functionCall?.name) {
           const id = part.functionCall.id || `call_${calls}`;
           const args = JSON.stringify(part.functionCall.args ?? {});
@@ -115,6 +146,10 @@ export function createGeminiProvider(config: ProviderConfig, popts: ProviderOpti
         if (n(u.cachedContentTokenCount)) usage.cachedTokens = n(u.cachedContentTokenCount);
         if (thoughts) usage.reasoningTokens = thoughts;
       }
+    }
+    if (calls) {
+      // 没有签名的思考文本不必回传
+      yield { type: "raw", protocol: "gemini", content: raw.filter((r) => !r.thought || !!r.thoughtSignature) };
     }
     if (usage) yield { type: "usage", usage };
     yield { type: "finish", reason: finish };

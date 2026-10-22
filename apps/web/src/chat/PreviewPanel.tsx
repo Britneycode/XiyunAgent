@@ -18,8 +18,11 @@ type DiffPreview = Extract<NonNullable<Preview>, { kind: "diff" }>;
 
 const TOOL_STATUS: Record<ToolPreview["block"]["status"], { label: string; tone: "neutral" | "ok" | "err" }> = {
   pending: { label: "待执行", tone: "neutral" },
+  awaiting: { label: "待确认", tone: "neutral" },
+  running: { label: "运行中", tone: "neutral" },
   success: { label: "成功", tone: "ok" },
   error: { label: "错误", tone: "err" },
+  rejected: { label: "已拒绝", tone: "neutral" },
 };
 
 function ToolDetail({ preview, onPreview }: { preview: ToolPreview; onPreview?: (p: Preview) => void }) {

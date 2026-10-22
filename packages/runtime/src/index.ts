@@ -38,6 +38,9 @@ export type ProviderEvent =
   | { type: "tool_start"; id: string; index: number; name: string }
   | { type: "tool_args"; id: string; delta: string }
   | { type: "tool_end"; id: string; args: string }
+  // 有工具调用时,协议需要原样回传的 assistant 内容(anthropic thinking 签名 / gemini thoughtSignature /
+  // openai 兼容网关的 reasoning_content),agent 循环把它挂在下一步请求的 assistant 消息上
+  | { type: "raw"; protocol: ProviderProtocol; content: unknown }
   | { type: "usage"; usage: TokenUsage } // 至多一次,紧挨 finish 之前
   | { type: "finish"; reason: string | null };
 
@@ -85,10 +88,22 @@ export interface ChatProvider {
 // Provider 实例按请求创建,所以缓存放在模块级。
 const usageUnsupported = new Set<string>();
 
-// 只发 role/content:blocks、id 等内部字段会让严格网关 400。带图片的 user 消息改用 content 数组(B2)
+// 只发 role/content:blocks、id 等内部字段会让严格网关 400。带图片的 user 消息改用 content 数组(B2)。
+// agent 循环(B1):assistant 带 tool_calls,工具结果用 role=tool + tool_call_id;
+// 推理模型(DeepSeek / Kimi 等)在工具循环里要求回传 reasoning_content,只在该网关返回过时带上
 const wireMessages = (messages: ChatMessage[]) =>
-  messages.map((m) =>
-    m.role === "user" && m.images?.length
+  messages.map((m) => {
+    if (m.role === "tool") return { role: "tool", tool_call_id: m.toolCallId ?? "", content: m.content || "(空)" };
+    if (m.role === "assistant" && m.toolCalls?.length) {
+      const raw = m.raw?.protocol === "openai" ? (m.raw.content as { reasoning_content?: unknown } | null) : null;
+      return {
+        role: "assistant",
+        content: m.content || null,
+        tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } })),
+        ...(typeof raw?.reasoning_content === "string" && raw.reasoning_content ? { reasoning_content: raw.reasoning_content } : {}),
+      };
+    }
+    return m.role === "user" && m.images?.length
       ? {
           role: m.role,
           content: [
@@ -96,8 +111,8 @@ const wireMessages = (messages: ChatMessage[]) =>
             ...m.images.map((i) => ({ type: "image_url", image_url: { url: `data:${i.mime};base64,${i.data}` } })),
           ],
         }
-      : { role: m.role, content: m.content },
-  );
+      : { role: m.role, content: m.content };
+  });
 
 export function createOpenAIProvider(config: ProviderConfig, popts: ProviderOptions = {}): ChatProvider {
   const usageKey = `${config.baseUrl.replace(/\/+$/, "")}|${config.model}`;
@@ -139,6 +154,7 @@ export function createOpenAIProvider(config: ProviderConfig, popts: ProviderOpti
     }
 
     const calls = new Map<number, CallState>();
+    let reasoningContent = ""; // 只收 reasoning_content 字段(需要回传的网关用这个字段名)
     let finishReason: string | null = null;
     let usage: TokenUsage | null = null;
 
@@ -190,6 +206,7 @@ export function createOpenAIProvider(config: ProviderConfig, popts: ProviderOpti
             ? d.reasoning
             : "";
       if (think) yield { type: "thinking", delta: think };
+      if (typeof d.reasoning_content === "string") reasoningContent += d.reasoning_content;
       for (const tc of d.tool_calls ?? []) {
         const idx = typeof tc.index === "number" ? tc.index : calls.size;
         let c = calls.get(idx);
@@ -226,6 +243,9 @@ export function createOpenAIProvider(config: ProviderConfig, popts: ProviderOpti
         c.ended = true;
         yield { type: "tool_end", id: c.id, args: c.args };
       }
+    }
+    if (reasoningContent && [...calls.values()].some((c) => c.started)) {
+      yield { type: "raw", protocol: "openai", content: { reasoning_content: reasoningContent } };
     }
     if (usage) yield { type: "usage", usage };
     yield { type: "finish", reason: finishReason };

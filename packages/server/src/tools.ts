@@ -84,19 +84,39 @@ export function detectShells(): ShellInfo[] {
   return found;
 }
 
-const MAX_OUTPUT = 200 * 1024; // ponytail: 输出截断在 200KB,大输出用 files.read 分页读取
+const MAX_OUTPUT = 200 * 1024; // 输出只保留最后 200KB(F7:长命令的结尾比开头更有用)
+export const SHELL_TIMEOUT_MS = 10 * 60_000; // 总时长上限
+export const SHELL_IDLE_MS = 2 * 60_000; // 连续无输出上限
 
-export function shellExec(opts: {
+// 结束整个进程树:sh -lc 启动的子进程(npm → node)不会随 sh 一起退出
+function killTree(child: ReturnType<typeof spawn>): void {
+  if (child.pid === undefined || child.exitCode !== null) return;
+  try {
+    if (process.platform === "win32") spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+    else process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+
+export interface ShellRunOptions {
   workspace: string;
   command: string;
   shell?: string;
-  confirmed?: boolean;
+  confirmed?: boolean; // 调用方已按权限规则放行 / 用户已确认
   timeoutMs?: number;
-}): Promise<ShellResult> {
+  idleMs?: number;
+  signal?: AbortSignal;
+  onData?: (chunk: string, stream: "stdout" | "stderr") => void; // 流式输出(F7)
+}
+
+// 执行命令:逐块回调输出,超时 / 空闲超时 / 中断时结束整个进程树;stdout / stderr 各保留最后 200KB
+export function shellExec(opts: ShellRunOptions): Promise<ShellResult> {
   const cls = classifyCommand(opts.command);
   if (cls === "deny") return Promise.reject(new ToolError("危险命令被拒绝执行"));
   if (cls === "confirm" && !opts.confirmed)
     return Promise.reject(new ToolError(`命令需要用户确认:${opts.command}`, true));
+  if (opts.signal?.aborted) return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
 
   const shells = detectShells();
   const sh = shells.find((s) => s.id === opts.shell) ?? shells[0];
@@ -104,30 +124,57 @@ export function shellExec(opts: {
   const t0 = Date.now();
 
   return new Promise((resolve, reject) => {
-    const child = spawn(sh.exe, sh.args(opts.command), { cwd, windowsHide: true });
+    const child = spawn(sh.exe, sh.args(opts.command), { cwd, windowsHide: true, detached: process.platform !== "win32" });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const timer = setTimeout(() => {
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    const stop = () => {
       timedOut = true;
-      child.kill();
-    }, opts.timeoutMs ?? 60_000);
-    child.stdout.on("data", (d: Buffer) => {
-      if (stdout.length < MAX_OUTPUT) stdout += d.toString("utf8");
+      killTree(child);
+    };
+    const timer = setTimeout(stop, opts.timeoutMs ?? SHELL_TIMEOUT_MS);
+    const idleMs = opts.idleMs ?? SHELL_IDLE_MS;
+    const touch = () => {
+      if (!(idleMs > 0)) return;
+      clearTimeout(idle);
+      idle = setTimeout(stop, idleMs);
+    };
+    touch();
+    const onAbort = () => killTree(child);
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    const tail = (buf: string, d: string) => {
+      const next = buf + d;
+      return next.length > MAX_OUTPUT ? next.slice(-MAX_OUTPUT) : next;
+    };
+    child.stdout?.on("data", (d: Buffer) => {
+      const t = d.toString("utf8");
+      stdout = tail(stdout, t);
+      touch();
+      opts.onData?.(t, "stdout");
     });
-    child.stderr.on("data", (d: Buffer) => {
-      if (stderr.length < MAX_OUTPUT) stderr += d.toString("utf8");
+    child.stderr?.on("data", (d: Buffer) => {
+      const t = d.toString("utf8");
+      stderr = tail(stderr, t);
+      touch();
+      opts.onData?.(t, "stderr");
     });
-    child.on("error", (e) => {
+    const done = () => {
       clearTimeout(timer);
+      clearTimeout(idle);
+      opts.signal?.removeEventListener("abort", onAbort);
+    };
+    child.on("error", (e) => {
+      done();
       reject(new ToolError(`shell 启动失败:${e.message}`));
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      done();
+      if (opts.signal?.aborted) return reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
       resolve({
         shell: sh.id, cwd, command: opts.command,
         exitCode: code ?? (timedOut ? -1 : 1),
-        stdout: stdout.slice(0, MAX_OUTPUT), stderr: stderr.slice(0, MAX_OUTPUT),
+        stdout, stderr,
         durationMs: Date.now() - t0, timedOut,
       });
     });

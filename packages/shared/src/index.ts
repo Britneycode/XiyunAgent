@@ -83,15 +83,36 @@ export type ChatBlock =
       rawArgs: string; // 拼接后的原始参数字符串,始终保留
       args?: unknown; // rawArgs 解析成功时存在
       argsError?: string; // 解析失败原因
-      status: "pending" | "success" | "error"; // 本轮只会出现 pending / error
+      // pending:未开放工具时模型仍请求调用(不执行);awaiting:等待用户确认;running:执行中;
+      // success / error:执行结束;rejected:被权限规则或用户拒绝(B1 / D-024)
+      status: ToolStatus;
       note?: string; // 例如 "已中断"
       target?: { workspace?: string; path?: string }; // 服务端填写
+      result?: string; // 工具执行结果(展示用,已截断)
+      output?: string; // 仅流式中:bash 输出尾部,结束后以 result 为准
+      exitCode?: number; // bash 退出码
+      durationMs?: number;
+      runId?: string; // 仅 awaiting:确认请求发往该运行(POST /runs/:id/confirm)
+      rule?: string; // 仅 awaiting:"本项目始终允许"将写入的规则,如 Bash(npm run *)
+      reason?: string; // 仅 awaiting:为什么需要确认
     }
   | { id: string; kind: "text"; text: string }
   // 仅 user 消息;文件引用带工作区相对路径与引用时内容的指纹(F4:之后文件变更时提示模型内容可能过时)
   | { id: string; kind: "ref"; refType: "message" | "doc" | "file"; label: string; excerpt: string; path?: string; hash?: string }
   // 仅 user 消息:上传的附件(B2)。type = image 时作为图片发给支持视觉的模型,text 时正文并入引用上下文
   | { id: string; kind: "attachment"; attachmentId: string; name: string; mime: string; size: number; type: AttachmentKind };
+
+export type ToolStatus = "pending" | "awaiting" | "running" | "success" | "error" | "rejected";
+
+// 工具确认的三种答复:允许一次 / 本项目始终允许(写入允许规则)/ 拒绝
+export type ToolDecision = "allow" | "always" | "deny";
+
+// 模型发起的一次工具调用(请求用,不落库):args 为原始 JSON 字符串
+export interface ToolCall {
+  id: string;
+  name: string;
+  args: string;
+}
 
 export type AttachmentKind = "image" | "text";
 
@@ -112,12 +133,17 @@ export interface TokenUsage {
   totalTokens: number;
   cachedTokens?: number; // 输入中命中缓存的部分
   reasoningTokens?: number; // 输出中的推理部分(不会随历史带入下一轮)
+  // agent 多步(B1):上面各项为所有步骤之和(计费口径);steps = 模型调用次数,
+  // contextTokens = 最后一步的输入 + 输出(上下文实际占用)
+  steps?: number;
+  contextTokens?: number;
 }
 
 export interface ChatMessage {
   // id 仅持久化消息有(数据库自增主键);流式中的临时气泡没有
   id?: number;
-  role: "system" | "user" | "assistant";
+  // tool 仅出现在发给模型的请求里(agent 循环中的工具结果)
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
   blocks?: ChatBlock[];
   aborted?: boolean;
@@ -131,6 +157,13 @@ export interface ChatMessage {
   trim?: { dropped: number; summary: boolean };
   // 只在发给模型的请求里出现(不落库、不下发前端):user 消息附带的图片,base64
   images?: Array<{ mime: string; data: string }>;
+  // 以下只在 agent 循环的请求里出现(B1):assistant 发起的工具调用、tool 结果对应的调用
+  toolCalls?: ToolCall[];
+  toolCallId?: string;
+  toolName?: string;
+  toolError?: boolean; // tool 结果是否为错误(anthropic is_error)
+  // 协议原样回传的 assistant 内容(anthropic 的 thinking 签名、gemini 的 thoughtSignature 等),协议不符时忽略
+  raw?: { protocol: ProviderProtocol; content: unknown };
 }
 
 // Token 估算(前后端共用):CJK 字符约 1 token/字,其余字符约 4 字符/token。

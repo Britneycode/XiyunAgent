@@ -3,6 +3,7 @@
 import type { ChatMessage, ProviderConfig, TokenUsage } from "@xiyun/shared";
 import type { ChatProvider, ChatStreamOptions, ProviderEvent } from "./index.ts";
 import {
+  argsObject,
   buildHeaders,
   buildUrl,
   EFFORT_BUDGET,
@@ -37,23 +38,39 @@ export function createAnthropicProvider(config: ProviderConfig, popts: ProviderO
   });
 
   const streamEvents = async function* (messages: ChatMessage[], opts?: ChatStreamOptions): AsyncIterable<ProviderEvent> {
-    const { system, turns } = splitSystem(messages);
+    const { system, turns } = splitSystem(messages, "anthropic");
     const p = config.params ?? {};
     const budget = p.reasoningEffort ? EFFORT_BUDGET[p.reasoningEffort] : 0;
     // 开启思考时 max_tokens 必须大于思考预算,且不能指定 temperature
     const maxTokens = Math.max(p.maxTokens && p.maxTokens > 0 ? p.maxTokens : DEFAULT_MAX_TOKENS, budget ? budget + 4096 : 0);
-    // 带图片的轮次用内容块数组:图片在前、文字在后(Anthropic 推荐顺序)
-    const wire = turns.map((t) =>
-      t.images?.length
-        ? {
-            role: t.role,
-            content: [
-              ...t.images.map((i) => ({ type: "image", source: { type: "base64", media_type: i.mime, data: i.data } })),
-              ...(t.content.trim() ? [{ type: "text", text: t.content }] : []),
-            ],
-          }
-        : { role: t.role, content: t.content },
-    );
+    // 带图片的轮次用内容块数组:图片在前、文字在后(Anthropic 推荐顺序)。
+    // 工具轮次(B1):assistant 带 tool_use 块(有原样内容时直接回传,保留 thinking 签名);
+    // 工具结果放在下一条 user 的最前面(tool_result 必须先于其他内容)
+    const wire = turns.map((t) => {
+      if (t.role === "assistant" && t.toolCalls?.length) {
+        if (Array.isArray(t.raw) && t.raw.length) return { role: t.role, content: t.raw };
+        return {
+          role: t.role,
+          content: [
+            ...(t.content.trim() ? [{ type: "text", text: t.content }] : []),
+            ...t.toolCalls.map((c) => ({ type: "tool_use", id: c.id, name: c.name, input: argsObject(c.args) })),
+          ],
+        };
+      }
+      if (t.images?.length || t.toolResults?.length) {
+        return {
+          role: t.role,
+          content: [
+            ...(t.toolResults ?? []).map((r) => ({
+              type: "tool_result", tool_use_id: r.id, content: r.content || "(空)", ...(r.isError ? { is_error: true } : {}),
+            })),
+            ...(t.images ?? []).map((i) => ({ type: "image", source: { type: "base64", media_type: i.mime, data: i.data } })),
+            ...(t.content.trim() ? [{ type: "text", text: t.content }] : []),
+          ],
+        };
+      }
+      return { role: t.role, content: t.content };
+    });
     const body: Record<string, unknown> = { model: config.model, max_tokens: maxTokens, messages: wire, stream: true };
     if (system) body.system = system;
     if (budget) body.thinking = { type: "enabled", budget_tokens: budget };
@@ -68,6 +85,9 @@ export function createAnthropicProvider(config: ProviderConfig, popts: ProviderO
     );
 
     const tools = new Map<number, { id: string; args: string }>();
+    // 原样内容块(按 index):有工具调用时整段回传给下一步请求,保留 thinking 签名(开启思考时必须)
+    const parts = new Map<number, Record<string, unknown>>();
+    let hasToolUse = false;
     let usage: Usage = {};
     let finish: string | null = null;
 
@@ -78,8 +98,8 @@ export function createAnthropicProvider(config: ProviderConfig, popts: ProviderO
         type?: string;
         index?: number;
         message?: { usage?: Usage };
-        content_block?: { type?: string; id?: string; name?: string };
-        delta?: { type?: string; text?: string; thinking?: string; partial_json?: string; stop_reason?: string };
+        content_block?: { type?: string; id?: string; name?: string; data?: string };
+        delta?: { type?: string; text?: string; thinking?: string; signature?: string; partial_json?: string; stop_reason?: string };
         usage?: Usage;
         error?: { type?: string; message?: string };
       } | null;
@@ -90,11 +110,25 @@ export function createAnthropicProvider(config: ProviderConfig, popts: ProviderO
       } else if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
         const id = ev.content_block.id || `call_${idx}`;
         tools.set(idx, { id, args: "" });
+        hasToolUse = true;
+        parts.set(idx, { type: "tool_use", id, name: ev.content_block.name ?? "", input: {} });
         yield { type: "tool_start", id, index: idx, name: ev.content_block.name ?? "" };
+      } else if (ev.type === "content_block_start" && ev.content_block) {
+        const t = ev.content_block.type;
+        if (t === "text") parts.set(idx, { type: "text", text: "" });
+        else if (t === "thinking") parts.set(idx, { type: "thinking", thinking: "", signature: "" });
+        else if (t === "redacted_thinking") parts.set(idx, { type: "redacted_thinking", data: ev.content_block.data ?? "" });
       } else if (ev.type === "content_block_delta" && ev.delta) {
-        if (ev.delta.type === "text_delta" && ev.delta.text) yield { type: "text", delta: ev.delta.text };
-        else if (ev.delta.type === "thinking_delta" && ev.delta.thinking) yield { type: "thinking", delta: ev.delta.thinking };
-        else if (ev.delta.type === "input_json_delta" && ev.delta.partial_json) {
+        const part = parts.get(idx);
+        if (ev.delta.type === "text_delta" && ev.delta.text) {
+          if (part?.type === "text") part.text = `${part.text as string}${ev.delta.text}`;
+          yield { type: "text", delta: ev.delta.text };
+        } else if (ev.delta.type === "thinking_delta" && ev.delta.thinking) {
+          if (part?.type === "thinking") part.thinking = `${part.thinking as string}${ev.delta.thinking}`;
+          yield { type: "thinking", delta: ev.delta.thinking };
+        } else if (ev.delta.type === "signature_delta" && ev.delta.signature) {
+          if (part?.type === "thinking") part.signature = `${part.signature as string}${ev.delta.signature}`;
+        } else if (ev.delta.type === "input_json_delta" && ev.delta.partial_json) {
           const t = tools.get(idx);
           if (t) {
             t.args += ev.delta.partial_json;
@@ -105,6 +139,8 @@ export function createAnthropicProvider(config: ProviderConfig, popts: ProviderO
         const t = tools.get(idx);
         if (t) {
           tools.delete(idx);
+          const part = parts.get(idx);
+          if (part) part.input = argsObject(t.args);
           yield { type: "tool_end", id: t.id, args: t.args || "{}" };
         }
       } else if (ev.type === "message_delta") {
@@ -120,7 +156,19 @@ export function createAnthropicProvider(config: ProviderConfig, popts: ProviderO
       }
     }
 
-    for (const t of tools.values()) yield { type: "tool_end", id: t.id, args: t.args || "{}" };
+    for (const [i, t] of tools) {
+      const part = parts.get(i);
+      if (part) part.input = argsObject(t.args);
+      yield { type: "tool_end", id: t.id, args: t.args || "{}" };
+    }
+    if (hasToolUse) {
+      // 空文本块与没有签名的 thinking 块会被 API 拒绝,去掉
+      const content = [...parts.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, v]) => v)
+        .filter((v) => (v.type === "text" ? !!(v.text as string).trim() : v.type === "thinking" ? !!v.signature : true));
+      yield { type: "raw", protocol: "anthropic", content };
+    }
     const cacheRead = n(usage.cache_read_input_tokens);
     const prompt = n(usage.input_tokens) + cacheRead + n(usage.cache_creation_input_tokens);
     const completion = n(usage.output_tokens);

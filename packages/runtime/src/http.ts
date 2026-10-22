@@ -1,5 +1,5 @@
 // 各协议适配器共用的 HTTP 层:错误归一化、首 token 前重试、SSE 逐行读取、URL / 请求头拼装。
-import type { ChatMessage, ProviderConfig } from "@xiyun/shared";
+import type { ChatMessage, ProviderConfig, ProviderProtocol, ToolCall } from "@xiyun/shared";
 import type { ChatProvider, ChatStreamOptions, ProviderEvent } from "./index.ts";
 
 // Provider 调用失败的统一错误:message 面向用户(含状态码、原因提示与脱敏后的服务端原文),
@@ -270,24 +270,61 @@ export function textOnly(
 }
 
 // 非 OpenAI 协议的消息整理:system 合并为一段;其余按 user / assistant 交替(相邻同角色合并,图片一并合并),
-// 首条必须是 user;空内容去掉(anthropic / gemini 都拒绝空消息)
+// 首条必须是 user;空内容去掉(anthropic / gemini 都拒绝空消息)。
+// agent 循环(B1):assistant 的 toolCalls 原样带上;tool 结果并成一条 user 轮次的 toolResults(紧跟发起调用的 assistant);
+// raw 只在协议一致时带上(thinking 签名等跨协议无效)
+export interface ToolResultTurn {
+  id: string;
+  name: string;
+  content: string;
+  isError?: boolean;
+}
 export interface Turn {
   role: "user" | "assistant";
   content: string;
   images?: Array<{ mime: string; data: string }>;
+  toolCalls?: ToolCall[];
+  toolResults?: ToolResultTurn[];
+  raw?: unknown;
 }
-export function splitSystem(messages: ChatMessage[]): { system: string; turns: Turn[] } {
+export function splitSystem(messages: ChatMessage[], protocol?: ProviderProtocol): { system: string; turns: Turn[] } {
   const system = messages.filter((m) => m.role === "system" && m.content.trim()).map((m) => m.content).join("\n\n");
   const turns: Turn[] = [];
   for (const m of messages) {
-    const images = m.role === "user" && m.images?.length ? m.images : undefined;
-    if (m.role === "system" || (!m.content.trim() && !images)) continue;
+    if (m.role === "system") continue;
     const last = turns[turns.length - 1];
+    if (m.role === "tool") {
+      const r: ToolResultTurn = { id: m.toolCallId ?? "", name: m.toolName ?? "", content: m.content };
+      if (m.toolError) r.isError = true;
+      if (last?.role === "user" && last.toolResults && !last.content && !last.images) last.toolResults.push(r);
+      else turns.push({ role: "user", content: "", toolResults: [r] });
+      continue;
+    }
+    const images = m.role === "user" && m.images?.length ? m.images : undefined;
+    const calls = m.role === "assistant" && m.toolCalls?.length ? m.toolCalls : undefined;
+    if (!m.content.trim() && !images && !calls) continue;
+    const raw = calls && protocol && m.raw?.protocol === protocol ? m.raw.content : undefined;
     if (last && last.role === m.role) {
       if (m.content.trim()) last.content = last.content ? `${last.content}\n\n${m.content}` : m.content;
       if (images) last.images = [...(last.images ?? []), ...images];
-    } else turns.push({ role: m.role, content: m.content, ...(images ? { images } : {}) });
+      if (calls) {
+        last.toolCalls = [...(last.toolCalls ?? []), ...calls];
+        delete last.raw; // 合并后的原样内容不再完整
+      }
+    } else {
+      turns.push({ role: m.role, content: m.content, ...(images ? { images } : {}), ...(calls ? { toolCalls: calls } : {}), ...(raw !== undefined ? { raw } : {}) });
+    }
   }
   if (turns[0]?.role === "assistant") turns.unshift({ role: "user", content: "(continue)" });
   return { system, turns };
+}
+
+// 工具参数 JSON 字符串 → 对象(anthropic input / gemini args 必须是对象)
+export function argsObject(args: string): Record<string, unknown> {
+  try {
+    const v = JSON.parse(args || "{}") as unknown;
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
