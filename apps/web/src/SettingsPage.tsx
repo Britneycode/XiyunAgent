@@ -458,11 +458,14 @@ function ExternalImport({ onChanged }: { onChanged?: () => void }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [pending, setPending] = useState<{ raw: string; preview: ExternalPreview; file: string } | null>(null);
+  // L2:导入后是否从这些对话里提取记忆
+  const [extract, setExtract] = useState(false);
   const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "?");
 
   const onFile = async (f: File) => {
     setMsg("");
     setPending(null);
+    setExtract(false);
     setBusy(true);
     try {
       const raw = await readExportFile(f);
@@ -477,10 +480,11 @@ function ExternalImport({ onChanged }: { onChanged?: () => void }) {
     if (!pending) return;
     setBusy(true);
     try {
-      const r = await api.externalImport(pending.raw);
+      const r = await api.externalImport(pending.raw, { extract });
       const skipped = [r.skipped.duplicate && `已导入过 ${r.skipped.duplicate} 个`, r.skipped.empty && `空对话 ${r.skipped.empty} 个`].filter(Boolean);
+      const job = r.job ? `;已开始提取记忆(作业 ${r.job.done}/${r.job.total}),可在「记忆」页看进度` : "";
       setMsg(
-        `导入完成:新增 ${r.added.sessions} 个会话、${r.added.messages} 条消息${skipped.length ? `;跳过${skipped.join("、")}` : ""}。导入的对话在 Chat 模式的会话列表里。`,
+        `导入完成:新增 ${r.added.sessions} 个会话、${r.added.messages} 条消息${skipped.length ? `;跳过${skipped.join("、")}` : ""}。导入的对话在 Chat 模式的会话列表里。${r.jobError ?? ""}${job}`,
       );
       setPending(null);
       onChanged?.();
@@ -512,6 +516,14 @@ function ExternalImport({ onChanged }: { onChanged?: () => void }) {
             {p.conversations > 0 && <span style={{ marginRight: 10 }}>时间 {day(p.from)} ~ {day(p.to)}</span>}
             {p.empty > 0 && <span>空对话 {p.empty} 个(跳过)</span>}
           </div>
+          {p.extractable ? (
+            <label className="reason" style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+              <input type="checkbox" checked={extract} onChange={(e) => setExtract(e.target.checked)} />
+              <span>导入后从这些对话中提取记忆(约 {p.extractable} 个会话、{p.estimatedTokens ?? 0} token,会调用记忆模型)</span>
+            </label>
+          ) : (
+            <div className="reason">这些对话都不足 2 轮,没有可提取的记忆。</div>
+          )}
           <div className="row">
             <button className="primary" disabled={busy || p.conversations - p.duplicate <= 0} onClick={() => void doImport()}>
               {busy ? "导入中…" : `导入 ${Math.max(0, p.conversations - p.duplicate)} 个对话`}

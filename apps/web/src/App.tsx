@@ -272,6 +272,18 @@ export function App() {
     setSideFloating(false);
   };
 
+  // L2:记忆页「查看出处」:按会话 id 打开并定位到那条消息
+  const openSource = (sessionId: string, messageId?: number) => {
+    void api.session(sessionId).then((s) => {
+      if (!sessions.some((x) => x.id === s.id)) setExtra(s);
+      if (messageId != null) requestFocus(s.id, messageId);
+      setByMode((prev) => ({ ...prev, [s.mode as Mode]: s.id }));
+      if (s.mode !== mode) setMode(s.mode as Mode);
+      setPage("main");
+      setSideFloating(false);
+    }).catch(() => {});
+  };
+
   const visible = sessions.filter(
     (s) => s.mode === mode && (!query || s.title.toLowerCase().includes(query.toLowerCase())),
   );
@@ -332,7 +344,7 @@ export function App() {
     page === "settings" ? (
       legacy(<SettingsPage onDataChanged={() => void refresh()} />)
     ) : page === "memory" ? (
-      legacy(<MemoryPage onChanged={refreshCandidates} />)
+      legacy(<MemoryPage onChanged={refreshCandidates} onOpenSource={openSource} />)
     ) : !online ? (
       <EmptyState
         icon={WifiOff}

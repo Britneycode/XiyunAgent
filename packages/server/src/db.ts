@@ -110,6 +110,67 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
     const mc = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name);
     if (!mc.includes("checkpoint_sha")) db.exec("ALTER TABLE messages ADD COLUMN checkpoint_sha TEXT");
   },
+  // v14:L2 记忆出处回链 + 导入作业。facts 记来源类型与原消息 id;
+  // memory_jobs / memory_job_items 记录批量提取的进度,支持暂停 / 恢复 / 取消
+  (db) => {
+    const fc = (db.prepare("PRAGMA table_info(facts)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!fc.includes("source_message_id")) db.exec("ALTER TABLE facts ADD COLUMN source_message_id INTEGER");
+    if (!fc.includes("source_kind")) db.exec("ALTER TABLE facts ADD COLUMN source_kind TEXT");
+    if (!fc.includes("source_session_id")) db.exec("ALTER TABLE facts ADD COLUMN source_session_id TEXT");
+    // 候选记忆也要带出处,确认成事实时才能把 source_message_id 传下去
+    const cc = (db.prepare("PRAGMA table_info(candidates)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cc.includes("source_message_id")) db.exec("ALTER TABLE candidates ADD COLUMN source_message_id INTEGER");
+    if (!cc.includes("source_kind")) db.exec("ALTER TABLE candidates ADD COLUMN source_kind TEXT");
+    if (!cc.includes("source_session_id")) db.exec("ALTER TABLE candidates ADD COLUMN source_session_id TEXT");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_jobs (
+        id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        total INTEGER NOT NULL DEFAULT 0,
+        done INTEGER NOT NULL DEFAULT 0,
+        failed INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        scope TEXT NOT NULL DEFAULT 'global',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS memory_job_items (
+        job_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        facts_added INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        PRIMARY KEY (job_id, session_id)
+      );
+    `);
+  },
+  // v15:F8 文档分块检索。doc_chunks 按段落分块(约 800 字,重叠 100),
+  // doc_chunks_fts 用 trigram 分词做 BM25 检索,触发器同步
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS doc_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id TEXT NOT NULL,
+        ord INTEGER NOT NULL,
+        start INTEGER NOT NULL,
+        end INTEGER NOT NULL,
+        text TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_doc_chunks_doc ON doc_chunks(doc_id, ord);
+      CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks_fts USING fts5(text, content='doc_chunks', content_rowid='id', tokenize='trigram');
+      CREATE TRIGGER IF NOT EXISTS doc_chunks_ai AFTER INSERT ON doc_chunks BEGIN
+        INSERT INTO doc_chunks_fts(rowid, text) VALUES (new.id, new.text);
+      END;
+      CREATE TRIGGER IF NOT EXISTS doc_chunks_ad AFTER DELETE ON doc_chunks BEGIN
+        INSERT INTO doc_chunks_fts(doc_chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+      END;
+      CREATE TRIGGER IF NOT EXISTS doc_chunks_au AFTER UPDATE ON doc_chunks BEGIN
+        INSERT INTO doc_chunks_fts(doc_chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+        INSERT INTO doc_chunks_fts(rowid, text) VALUES (new.id, new.text);
+      END;
+    `);
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

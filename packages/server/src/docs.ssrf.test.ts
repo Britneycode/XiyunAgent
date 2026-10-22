@@ -91,11 +91,8 @@ afterEach(async () => {
 });
 
 function setup() {
-  const db = new DatabaseSync(":memory:");
-  db.exec(`
-    CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file', source TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, workspace TEXT NOT NULL DEFAULT '', session_id TEXT, created_at TEXT NOT NULL);
-  `);
-  return new WorkStore(db);
+  // 用完整 schema(含 F8 分块表),WorkStore 导入文档时要写块
+  return new WorkStore(openDb(":memory:"));
 }
 
 // 假解析器:不依赖真实 DNS,也保证测试不发起外网请求。

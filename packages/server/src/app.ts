@@ -34,6 +34,8 @@ import {
   previewClaudeDesktopImport, revokeProjectTrust, saveUserConfig, trustProject,
 } from "./mcp.ts";
 import { addAllowRule, decide, loadPermissions, suggestRule } from "./permissions.ts";
+import { convertToText, isConvertible } from "./convert.ts";
+import { MemoryJobRunner } from "./memory-jobs.ts";
 
 const now = () => new Date().toISOString();
 
@@ -47,6 +49,8 @@ export function createApp(
     chatProvider?: () => ChatProvider;
     titleProvider?: () => ChatProvider | undefined;
     summaryProvider?: () => ChatProvider | undefined;
+    // 记忆提取用的模型(测试可注入);缺省按 memory 角色 → main → 激活顺序取
+    memoryProvider?: () => ChatProvider | undefined;
     dataDir?: string; // 附件存放目录的上级(缺省 DATA_DIR;测试用临时目录)
     // L1:工作区快照。缺省按 dataDir 建;测试可注入 skipGuards 跳过 home / 根目录与文件数检查
     checkpoints?: CheckpointStore;
@@ -119,7 +123,10 @@ export function createApp(
 
   // 记忆提取专用 Provider:memory 角色优先,回退 main/激活。未配置则不提取。
   const memoryProvider = () =>
-    providers.registry().byRole("memory") ?? providers.registry().byRole("main") ?? providers.activeProvider();
+    opts?.memoryProvider?.() ??
+    providers.registry().byRole("memory") ??
+    providers.registry().byRole("main") ??
+    providers.activeProvider();
 
   // 回复完成后异步提取候选记忆,不阻塞 SSE;失败只记事件(R-004:低置信度只进候选区)。
   const queueExtract = (sessionId: string, mode: string, workspace: string) => {
@@ -313,6 +320,23 @@ export function createApp(
     const byId = new Map(rows.map((r) => [r.id, r]));
     return ids.flatMap((id) => byId.get(id) ?? []);
   };
+  // L2:导入历史的批量记忆提取作业(一次一个会话,支持暂停 / 恢复 / 取消)。
+  // 放在 rowsByIds 之后:作业执行时才会取历史,声明顺序不影响。
+  const memoryJobs = new MemoryJobRunner({
+    db,
+    memory,
+    provider: memoryProvider,
+    historyFor: (sessionId) => {
+      // 只要当前分支的 user / assistant 正文,取最近 200 条,避免长会话一次性塞爆上下文
+      const ids = pathIds(loadTree(db, sessionId)).slice(-200);
+      return rowsByIds(ids)
+        .filter((r) => r.role === "user" || r.role === "assistant")
+        .map((r) => ({ role: r.role as "user" | "assistant", content: r.content, id: r.id }));
+    },
+    // 至少 2 轮(2 条 user)才值得提取
+    shouldProcess: (sessionId) =>
+      (db.prepare("SELECT COUNT(*) c FROM messages WHERE session_id = ? AND role = 'user'").get(sessionId) as { c: number }).c >= 2,
+  });
   const parseTrim = (raw: string | null): ChatMessage["trim"] => {
     if (!raw) return undefined;
     try {
@@ -384,6 +408,18 @@ export function createApp(
   };
 
   app.get("/sessions/:id/messages", (c) => c.json(listPath(c.req.param("id"))));
+  // L2:单个会话的元信息(记忆页「查看出处」要按 id 定位会话)
+  app.get("/sessions/:id", (c) => {
+    const r = db.prepare("SELECT * FROM sessions WHERE id = ?").get(c.req.param("id")) as
+      | { id: string; title: string; mode: string; workspace: string; created_at: string; updated_at: string | null; archived: number }
+      | undefined;
+    if (!r) return c.json({ error: "会话不存在" }, 404);
+    return c.json({
+      id: r.id, title: r.title, mode: r.mode, workspace: r.workspace,
+      createdAt: r.created_at, updatedAt: r.updated_at || r.created_at,
+      archived: Number(r.archived) === 1,
+    });
+  });
   // 切换分支:messageId 已在当前路径上则不变,否则切到它所在分支的最新末端;返回切换后的消息列表
   app.post("/sessions/:id/head", async (c) => {
     const sessionId = c.req.param("id");
@@ -508,10 +544,21 @@ export function createApp(
     const file = form?.file;
     if (!file || typeof file === "string") return c.json({ error: "缺少文件(multipart 字段 file)" }, 400);
     try {
-      return c.json(attachments.save(file.name, file.type, new Uint8Array(await file.arrayBuffer())));
+      let bytes = new Uint8Array(await file.arrayBuffer());
+      let name = file.name;
+      let mime = file.type;
+      // F8:PDF / Word 附件先转文本,再按文本附件存;转换失败按原类型交给后续校验
+      if (isConvertible(name)) {
+        const r = await convertToText(name, Buffer.from(bytes));
+        if (!r.text.trim()) return c.json({ error: r.warning ?? "文件没有可提取的文字" }, 415);
+        bytes = new TextEncoder().encode(r.text);
+        name = `${name}.txt`;
+        mime = "text/plain";
+      }
+      return c.json(attachments.save(name, mime, bytes));
     } catch (e) {
       if (e instanceof AttachmentError) return c.json({ error: e.message }, e.status);
-      throw e;
+      return c.json({ error: e instanceof Error ? e.message : "附件处理失败" }, 400);
     }
   });
   // 只按内容哈希取;文本一律按纯文本返回,图片按识别出的类型,禁止嗅探
@@ -739,7 +786,7 @@ export function createApp(
       skillText && `# 已启用 Skill\n${skillText}`,
       memories.length && `# 相关记忆\n${memories.join("\n")}`,
       docHits.length > 0 &&
-        `# 相关资料(引用时标注来源)\n${docHits.map((d) => `## ${d.title}(来源:${d.source})\n${d.snippet}`).join("\n\n")}`,
+        `# 相关资料(引用时标注来源)\n${docHits.map((d) => `## ${d.title}(来源:${d.source} §${(d.ord ?? 0) + 1})\n${d.text}`).join("\n\n")}`,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -1045,6 +1092,43 @@ export function createApp(
     return c.json({ candidates: n });
   });
 
+  // ---- L2:批量提取作业(导入历史后初始化记忆)----
+  app.get("/memory/jobs", (c) => c.json(memoryJobs.list()));
+  app.get("/memory/jobs/:id", (c) => {
+    const job = memoryJobs.get(c.req.param("id"));
+    if (!job) return c.json({ error: "作业不存在" }, 404);
+    return c.json({ ...job, items: memoryJobs.items(job.id) });
+  });
+  app.post("/memory/jobs", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { source?: string; sessionIds?: string[]; scope?: string };
+    const source = (b.source ?? "import").trim();
+    const ids = Array.isArray(b.sessionIds) ? b.sessionIds.filter((x) => typeof x === "string" && x) : [];
+    if (!ids.length) return c.json({ error: "缺少要处理的会话(sessionIds)" }, 400);
+    if (!memoryProvider()) return c.json({ error: "没有可用的记忆模型,请先在设置里配置" }, 400);
+    const job = memoryJobs.create({ source, sessionIds: ids, scope: b.scope ?? "global" });
+    void memoryJobs.run(job.id);
+    return c.json(memoryJobs.get(job.id));
+  });
+  app.post("/memory/jobs/:id/pause", (c) => {
+    if (!memoryJobs.pause(c.req.param("id"))) return c.json({ error: "作业不存在或已结束" }, 400);
+    return c.json(memoryJobs.get(c.req.param("id")));
+  });
+  app.post("/memory/jobs/:id/resume", (c) => {
+    if (!memoryJobs.resume(c.req.param("id"))) return c.json({ error: "作业不存在或不在暂停状态" }, 400);
+    return c.json(memoryJobs.get(c.req.param("id")));
+  });
+  app.post("/memory/jobs/:id/cancel", (c) => {
+    if (!memoryJobs.cancel(c.req.param("id"))) return c.json({ error: "作业不存在或已结束" }, 400);
+    return c.json(memoryJobs.get(c.req.param("id")));
+  });
+  // 按来源撤销全部记忆(软删除;二次确认由前端负责)
+  app.post("/memory/facts/revoke", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { sourceKind?: string };
+    const kind = (b.sourceKind ?? "").trim();
+    if (!kind) return c.json({ error: "缺少来源(sourceKind)" }, 400);
+    return c.json({ revoked: memory.revokeBySource(kind) });
+  });
+
   // ---- 子智能体任务(阶段 3)----
   // 单个:{ role, prompt, ... };批量:{ schedule:"parallel"|"pipeline", tasks:[{ role, prompt, ... }] }
   app.post("/tasks", async (c) => {
@@ -1304,6 +1388,20 @@ export function createApp(
 
   // ---- Work(阶段 5):文档导入、来源记录、待办 ----
   app.get("/work/docs", (c) => c.json(work.listDocs(c.req.query("workspace") || undefined)));
+  // F8:文档检索。返回命中块(bm25 排序),snippet 带高亮标记,前端点开定位到块。
+  // 必须注册在 /work/docs/:id 之前,否则 "search" 会被当成 id。
+  app.get("/work/docs/search", (c) => {
+    const q = (c.req.query("q") ?? "").trim();
+    if (!q) return c.json([]);
+    const limit = Math.min(Number(c.req.query("limit")) || 10, 50);
+    const hits = work.searchDocs(q, limit, c.req.query("workspace") || undefined);
+    return c.json(
+      hits.map((d) => ({
+        docId: d.id, title: d.title, source: d.source, kind: d.kind, workspace: d.workspace,
+        ord: d.ord, start: d.start, end: d.end, snippet: d.snippet,
+      })),
+    );
+  });
   app.get("/work/docs/:id", (c) => {
     const d = work.getDoc(c.req.param("id"));
     return d ? c.json(d) : c.json({ error: "not found" }, 404);
@@ -1311,7 +1409,7 @@ export function createApp(
   app.post("/work/docs/import-file", async (c) => {
     const b = (await c.req.json()) as { workspace: string; path: string; sessionId?: string };
     try {
-      const d = work.importFile(b.workspace, b.path, b.sessionId);
+      const d = await work.importFile(b.workspace, b.path, b.sessionId);
       auditTool("work.doc.import", { kind: "file", source: d.source, title: d.title });
       return c.json(d);
     } catch (e) {
@@ -1334,6 +1432,24 @@ export function createApp(
     const b = (await c.req.json()) as { title: string; content: string; workspace?: string; sessionId?: string };
     if (!b.content?.trim()) return c.json({ error: "缺少 content" }, 400);
     return c.json(work.importPaste(b.title || "粘贴资料", b.content, b));
+  });
+  // F8:拖入 PDF / Word。文件只转成文本存为资料,不写进用户工作区
+  app.post("/work/docs/upload", async (c) => {
+    const form = await c.req.parseBody().catch(() => null);
+    const file = form?.file;
+    if (!file || typeof file === "string") return c.json({ error: "缺少文件(multipart 字段 file)" }, 400);
+    const workspace = typeof form?.workspace === "string" ? form.workspace : "";
+    const sessionId = typeof form?.sessionId === "string" ? form.sessionId : undefined;
+    if (!isConvertible(file.name)) return c.json({ error: "只支持拖入 PDF 或 Word(.docx)文件" }, 415);
+    try {
+      const r = await convertToText(file.name, Buffer.from(await file.arrayBuffer()));
+      if (!r.text.trim()) return c.json({ error: r.warning ?? "文件没有可提取的文字" }, 415);
+      const doc = work.importConverted(file.name, file.name, r.text, { workspace, sessionId });
+      auditTool("work.doc.import", { kind: "upload", source: file.name, title: doc.title, bytes: r.text.length });
+      return c.json(r.warning ? { ...doc, warning: r.warning } : doc);
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : "import failed" }, 400);
+    }
   });
   app.delete("/work/docs/:id", (c) => {
     work.removeDoc(c.req.param("id"));
@@ -1629,6 +1745,12 @@ export function createApp(
     if (parsed instanceof Response) return parsed;
     const convs = parsed.conversations.filter((x) => x.messages.length);
     const dates = convs.map((x) => x.createdAt).sort();
+    // L2:可提取记忆的会话数(至少 2 轮 user)与 token 估算,供前端展示成本
+    const extractable = convs.filter((x) => x.messages.filter((m) => m.role === "user").length >= 2);
+    const estTokens = extractable.reduce(
+      (n, x) => n + estimateTokens(x.messages.map((m) => m.content).join("\n")),
+      0,
+    );
     return c.json({
       source: parsed.source,
       conversations: convs.length,
@@ -1637,12 +1759,17 @@ export function createApp(
       empty: parsed.conversations.length - convs.length,
       from: dates[0] ?? null,
       to: dates[dates.length - 1] ?? null,
+      extractable: extractable.length,
+      estimatedTokens: estTokens,
     });
   });
   app.post("/admin/import/external", async (c) => {
     const parsed = await readExternal(c);
     if (parsed instanceof Response) return parsed;
+    // L2:导入后可选从这些对话批量提取记忆(前端在预览弹窗勾选,用 ?extract=1 传)
+    const extract = c.req.query("extract") === "1";
     const added = { sessions: 0, messages: 0 };
+    const addedIds: string[] = [];
     const skipped = { duplicate: 0, empty: 0 };
     try {
       db.exec("BEGIN");
@@ -1665,6 +1792,7 @@ export function createApp(
         }
         setHead.run(conv.headKey == null ? null : (idOf.get(conv.headKey) ?? null), sid);
         added.sessions++;
+        addedIds.push(sid);
       }
       db.exec("COMMIT");
     } catch (e) {
@@ -1674,7 +1802,22 @@ export function createApp(
     db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('data.import.external', ?, ?)").run(
       JSON.stringify({ source: parsed.source, added, skipped }), now(),
     );
-    return c.json({ ok: true, source: parsed.source, added, skipped });
+    // L2:勾选了就创建提取作业(至少 2 轮 user 的会话才进队列);
+    // 记忆模型没配置时不让整次导入失败,只返回提示
+    let job: ReturnType<MemoryJobRunner["create"]> | null = null;
+    let jobError: string | undefined;
+    if (extract && addedIds.length) {
+      const usable = addedIds.filter(
+        (sid) => (db.prepare("SELECT COUNT(*) c FROM messages WHERE session_id = ? AND role = 'user'").get(sid) as { c: number }).c >= 2,
+      );
+      if (!memoryProvider()) jobError = "没有可用的记忆模型,已导入但未提取记忆";
+      else if (!usable.length) jobError = "导入的对话不足 2 轮,没有可提取的内容";
+      else {
+        job = memoryJobs.create({ source: `import:${parsed.source}`, sessionIds: usable, scope: "global" });
+        void memoryJobs.run(job.id);
+      }
+    }
+    return c.json({ ok: true, source: parsed.source, added, skipped, ...(job ? { job } : {}), ...(jobError ? { jobError } : {}) });
   });
 
   return app;

@@ -187,6 +187,10 @@ export interface Fact {
   validFrom: string;
   validTo: string | null;
   deletedAt: string | null;
+  // L2:出处回链。sourceMessageId 指向产生这条记忆的原消息
+  sourceMessageId?: number;
+  sourceKind?: string; // import:chatgpt / import:claude / extract:<sessionId>
+  sourceSessionId?: string; // 产生这条记忆的会话(定位「查看出处」)
 }
 
 // 阶段 2:候选记忆。提取流水线产出,用户确认后才成为事实。
@@ -205,6 +209,33 @@ export interface MemoryCandidate {
   status: "pending" | "confirmed" | "rejected";
   createdAt: string;
   resolvedAt: string | null;
+  // L2:出处(确认成事实时传给 Fact)
+  sourceMessageId?: number;
+  sourceKind?: string;
+  sourceSessionId?: string;
+}
+
+// L2:批量记忆提取作业(导入历史后初始化记忆)
+export type MemoryJobStatus = "queued" | "running" | "paused" | "done" | "cancelled";
+
+export interface MemoryJob {
+  id: string;
+  source: string;
+  status: MemoryJobStatus;
+  total: number;
+  done: number;
+  failed: number;
+  error: string | null;
+  scope: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryJobItem {
+  sessionId: string;
+  status: string;
+  factsAdded: number;
+  error: string | null;
 }
 
 export interface SessionMeta {

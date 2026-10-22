@@ -142,3 +142,17 @@ MCP(B3):依赖 `@modelcontextprotocol/sdk`。配置分两级——用户级 `~/.
 两处顺带修复:`shellExec` 中断时原来只 `killTree` 不 settle,进程树杀不干净时 `close` 事件迟迟不来,Promise 会挂住——改为中断立即以 AbortError 拒绝(仍调用 killTree 结束进程),并用 `settled` 标志避免重复 settle。新增 `vitest.config.ts` 设 `fileParallelism: false`:测试会启动真实子进程(git / node / shell)并操作临时目录,并行时互相抢 CPU 与磁盘,表现为随机超时(排查时观察到失败文件在漂移)。
 
 取舍:快照不记录被忽略的目录,所以 `node_modules` 之类的改动无法回退(符合预期);影子仓库每个工作区一份,工作区移动后 key 变化会重新建仓;MCP 的 http 传输不做 OAuth;工具列表在连接后缓存,收到 `notifications/tools/list_changed` 时自动重新拉取;chat 模式默认不开放 MCP 工具。
+
+## D-026:用导入历史初始化记忆,以及文档分块检索(2026-10-22)
+
+L2(导入历史初始化记忆):记忆事实与候选各加 `source_message_id` / `source_kind` / `source_session_id` 三列(v14 迁移),`extract.ts` 的提示词要求模型为每条事实标注它来自对话里的第几条消息(字段 `index`),解析后映射回原消息 id;长会话按约 6k tokens 分片(chunkHistory),避免一次塞爆上下文。`MemoryJobRunner` 一次只跑一个会话,会话之间默认间隔 2 秒(可配);429 指数退避重试最多 3 次;支持暂停 / 继续 / 取消;**服务重启后状态为 running 的作业转为 paused**(构造时改一次),不会在没人看着的情况下继续烧额度。`shouldProcess` 钩子过滤"至少 2 轮"(2 条 user)的会话,单轮的寒暄不值得调模型。作业的 `source` 固定为 `import:chatgpt` / `import:claude`,`scope` 为 global。触发点在 M1 的导入预览对话框:勾选「导入后从这些对话中提取记忆」后随 `?extract=1` 传参(请求体是原始导出数组,放不下这个标志),预览同时给出可提取会话数与 token 估算。
+
+撤销按来源批量做:`POST /memory/facts/revoke {sourceKind}` 走软删除(与单条删除同语义,数据保留、检索不可见),返回撤销条数并写 `memory.revoke` 审计;前端做两次确认。「查看出处」用 `source_session_id` + `source_message_id` 定位到原会话的原消息:先切到该会话所在模式,再用已有的 `requestFocus` 机制滚动并高亮——不新造跳转通道。`GET /sessions/:id` 补了单会话元信息接口(记忆页按 id 查会话标题与模式)。
+
+F8(文档检索):`doc_chunks(id, doc_id, ord, start, end, text)` 按段落累积到约 800 字符、相邻块重叠 100 字符;`doc_chunks_fts` 用 FTS5 `trigram` 分词(中文子串可搜),触发器与 `doc_chunks` 同步,导入或更新文档时重建该文档的块,启动时给缺块的老文档补建(可重复执行,补建失败不影响启动)。检索:查询词 ≥3 字符时每个词加引号转义、OR 连接、按 `bm25()` 排序,**每篇文档只取得分最高的块**;不足 3 字符退回 LIKE;整句自然语言提问(没有空格的长串)拼不出短语时再退化为 3 字滑窗 OR——沿用旧的 LIKE 兜底口径,保持召回行为不变。高亮由 `highlight()` 统一生成:相邻或重叠的命中合并成一段(否则 3 字滑窗会把词切碎),用 `\u0001` / `\u0002` 包住,前端拆成 `<mark>`。
+
+Work 模式注入改为**命中块的原文**(不再整篇截断),并标注「来源:标题 §段号」,让结论能回链到具体段落。`GET /work/docs/search` 返回命中块(必须注册在 `/work/docs/:id` 之前,否则 "search" 会被当成 id),前端在资料面板里显示高亮片段、点击定位到该块并高亮。
+
+PDF / Word 转换新建 `convert.ts`(依赖 `unpdf` 与 `mammoth`):PDF 用 `extractText` 逐页取文字,docx 用 `extractRawText`;**每页提取出的文字少于 50 字时提示"可能是扫描件(没有文字层),需要 OCR"**——扫描件不是解析失败,必须让用户知道原因;单文件上限 30MB。转换路径只有一条:Work 导入、B2 附件上传、Work 页拖入 PDF / Word 都走 `convertToText`,转成文本后按文本处理(附件存为 `原名.txt`,拖入的资料来源记文件名)。拖入的 PDF / Word **只转文本存为资料,不写进用户工作区**——避免污染用户目录。
+
+取舍:记忆作业不追求并发,一次一个会话 + 2 秒间隔是刻意的保守选择(批量调模型容易触发限流且难以观察);限流退避只针对 429,其它错误直接记 failed 继续下一个会话;文档检索不做向量检索,BM25 + trigram 够用且零额外依赖;`unpdf` / `mammoth` 引入后打包体积增加,只在这两条路径动态 import,不用 PDF 的用户不承担加载成本。

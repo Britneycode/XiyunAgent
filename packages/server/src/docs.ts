@@ -7,6 +7,8 @@ import { request as httpsRequest } from "node:https";
 import { BlockList, isIP, type LookupFunction } from "node:net";
 import type { Todo, WorkDoc } from "@xiyun/shared";
 import { assertInside } from "./workspace.ts";
+import { ChunkStore } from "./chunks.ts";
+import { convertToText, isConvertible } from "./convert.ts";
 
 // ---- 阶段 5:Work 文档导入与来源记录 ----
 // 支持 Markdown/TXT/代码文件直读、HTML 标签抽取、网页抓取。
@@ -144,43 +146,60 @@ const toTodo = (r: TodoRow): Todo => ({
   createdAt: r.created_at, doneAt: r.done_at,
 });
 
-// 片段定位:优先整句,否则用首个命中的滑窗词定位上下文。
-function toSnippet(d: WorkDoc, q: string, terms: string[]): WorkDoc & { snippet: string } {
-  const term = [q, ...terms].find((t) => d.content.includes(t)) ?? q;
-  const i = d.content.indexOf(term);
-  const snippet = i >= 0 ? d.content.slice(Math.max(0, i - 120), i + term.length + 280) : d.content.slice(0, 400);
-  return { ...d, snippet };
-}
-
 export class WorkStore {
   private db: DatabaseSync;
+  private chunks: ChunkStore;
   constructor(db: DatabaseSync) {
     this.db = db;
+    this.chunks = new ChunkStore(db);
+    // F8:启动时给缺块的老文档补建(可重复执行)
+    try {
+      this.chunks.backfill();
+    } catch {
+      // 补建失败不影响启动
+    }
   }
 
   private addDoc(d: { title: string; kind: WorkDoc["kind"]; source: string; content: string; workspace?: string; sessionId?: string }): WorkDoc {
     const id = randomUUID();
+    const content = d.content.slice(0, MAX_DOC);
     this.db
       .prepare("INSERT INTO docs (id, title, kind, source, content, workspace, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(id, d.title, d.kind, d.source, d.content.slice(0, MAX_DOC), d.workspace ?? "", d.sessionId ?? null, new Date().toISOString());
+      .run(id, d.title, d.kind, d.source, content, d.workspace ?? "", d.sessionId ?? null, new Date().toISOString());
+    this.chunks.rebuild(id, content);
     return this.getDoc(id)!;
   }
 
-  // 从工作区文件导入(相对路径,PathGuard 限制);HTML 文件做标签抽取。
-  importFile(workspace: string, path: string, sessionId?: string): WorkDoc {
+  // 从工作区文件导入(相对路径,PathGuard 限制);HTML 做标签抽取,PDF / docx 走 convert.ts 转文本。
+  async importFile(workspace: string, path: string, sessionId?: string): Promise<WorkDoc & { warning?: string }> {
     const abs = assertInside(workspace, path);
     const raw = readFileSync(abs);
-    if (raw.length > MAX_DOC) throw new Error(`文件过大(${raw.length}B),上限 ${MAX_DOC}B`);
-    const text = raw.toString("utf8");
     const isHtml = /\.(html?|htm)$/i.test(path);
-    return this.addDoc({
+    let text: string;
+    let warning: string | undefined;
+    if (isConvertible(path)) {
+      const r = await convertToText(path, raw);
+      text = r.text;
+      warning = r.warning;
+    } else {
+      if (raw.length > MAX_DOC) throw new Error(`文件过大(${raw.length}B),上限 ${MAX_DOC}B`);
+      text = raw.toString("utf8");
+    }
+    if (!text.trim()) throw new Error(warning ?? "文件没有可提取的文字");
+    const doc = this.addDoc({
       title: path.split(/[\\/]/).pop() ?? path, kind: "file", source: path,
       content: isHtml ? htmlToText(text) : text, workspace, sessionId,
     });
+    return warning ? { ...doc, warning } : doc;
   }
 
   importPaste(title: string, content: string, opts: { workspace?: string; sessionId?: string } = {}): WorkDoc {
     return this.addDoc({ title, kind: "paste", source: "粘贴导入", content, ...opts });
+  }
+
+  // F8:拖入的 PDF / Word 转成文本后存为资料(来源记文件名,不写进工作区)
+  importConverted(title: string, source: string, content: string, opts: { workspace?: string; sessionId?: string } = {}): WorkDoc {
+    return this.addDoc({ title, kind: "file", source, content, ...opts });
   }
 
   // 网页抓取:记录来源 URL,正文抽取。受控:仅 GET、手动跟随重定向(每跳重新解析并钉住地址)、限大小。
@@ -223,33 +242,24 @@ export class WorkStore {
   }
 
   removeDoc(id: string): void {
+    this.chunks.remove(id);
     this.db.prepare("DELETE FROM docs WHERE id = ?").run(id);
   }
 
-  // 全文检索:标题或正文 LIKE,返回带上下文的片段供引用注入。
-  // 整句提问无命中时,退化为 3 字滑窗 OR + 按命中片段数排序(与记忆检索的兜底一致)。
-  searchDocs(query: string, limit = 3, workspace?: string): Array<WorkDoc & { snippet: string }> {
+  // F8:分块 BM25 检索。查询词 ≥3 字符走 fts5 trigram,更短的退回 LIKE。
+  // 返回命中块的原文(不再整篇截断),带块序号与偏移,供 Work 模式注入与前端定位。
+  searchDocs(query: string, limit = 3, workspace?: string): Array<WorkDoc & { snippet: string; text: string; ord?: number; start?: number; end?: number }> {
     const q = query.replace(/\s+/g, " ").trim();
     if (!q) return [];
-    const wsIn = workspace ? " AND workspace = ?" : "";
-    const wsArgs = workspace ? [workspace] : [];
-    const rows = this.db
-      .prepare(`SELECT * FROM docs WHERE (title LIKE ? OR content LIKE ?)${wsIn} ORDER BY created_at DESC LIMIT ?`)
-      .all(`%${q}%`, `%${q}%`, ...wsArgs, limit) as DocRow[];
-    if (rows.length === 0 && q.length > 3) {
-      const shingles = [...new Set(Array.from({ length: q.length - 2 }, (_, i) => q.slice(i, i + 3)))].slice(0, 50);
-      const where = shingles.map(() => "content LIKE ?").join(" OR ");
-      const candidates = this.db
-        .prepare(`SELECT * FROM docs WHERE (${where})${wsIn}`)
-        .all(...shingles.map((s) => `%${s}%`), ...wsArgs) as DocRow[];
-      // 按命中的不同片段数排序,取前 limit
-      const scored = candidates
-        .map((r) => ({ r, hits: shingles.filter((s) => r.content.includes(s)).length }))
-        .sort((a, b) => b.hits - a.hits)
-        .slice(0, limit);
-      return scored.map(({ r }) => toSnippet(toDoc(r), q, shingles));
+    const hits = this.chunks.search(q, limit, workspace);
+    if (!hits.length) return [];
+    const out: Array<WorkDoc & { snippet: string; text: string; ord?: number; start?: number; end?: number }> = [];
+    for (const h of hits) {
+      const doc = this.getDoc(h.docId);
+      if (!doc) continue;
+      out.push({ ...doc, snippet: h.snippet, text: h.text, ord: h.ord, start: h.start, end: h.end });
     }
-    return rows.map((r) => toSnippet(toDoc(r), q, [q]));
+    return out;
   }
 
   // ---- 待办 ----

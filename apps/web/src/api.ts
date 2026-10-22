@@ -1,4 +1,4 @@
-import type { AgentRole, AttachmentMeta, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, WorkDoc } from "@xiyun/shared";
+import type { AgentRole, AttachmentMeta, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, MemoryJob, MemoryJobItem, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, WorkDoc } from "@xiyun/shared";
 
 // /chat SSE 事件:typed 块事件 + 旧版 plain delta/error/done
 export type StreamEvent =
@@ -62,10 +62,19 @@ export const api = {
   // 从 ChatGPT / Claude 导入(M1):body 为 conversations.json 原文
   externalPreview: (raw: string) =>
     req<ExternalPreview>("/admin/import/external/preview", { method: "POST", body: raw }),
-  externalImport: (raw: string) =>
-    req<{ ok: boolean; source: string; added: { sessions: number; messages: number }; skipped: { duplicate: number; empty: number } }>(
-      "/admin/import/external", { method: "POST", body: raw },
-    ),
+  externalImport: (raw: string, opts: { extract?: boolean } = {}) =>
+    req<{
+      ok: boolean; source: string; added: { sessions: number; messages: number }; skipped: { duplicate: number; empty: number };
+      job?: MemoryJob; jobError?: string;
+    }>(`/admin/import/external${opts.extract ? "?extract=1" : ""}`, { method: "POST", body: raw }),
+  // L2:批量记忆提取作业
+  memoryJobs: () => req<MemoryJob[]>("/memory/jobs"),
+  memoryJob: (id: string) => req<MemoryJob & { items: MemoryJobItem[] }>(`/memory/jobs/${id}`),
+  memoryJobAction: (id: string, action: "pause" | "resume" | "cancel") =>
+    req<MemoryJob>(`/memory/jobs/${id}/${action}`, { method: "POST", body: "{}" }),
+  // L2:按来源撤销(软删除)
+  revokeMemoryBySource: (sourceKind: string) =>
+    req<{ revoked: number }>("/memory/facts/revoke", { method: "POST", body: JSON.stringify({ sourceKind }) }),
   createSession: (body?: Partial<SessionMeta>) => req<SessionMeta>("/sessions", { method: "POST", body: JSON.stringify(body ?? {}) }),
   deleteSession: (id: string) => req(`/sessions/${id}`, { method: "DELETE" }),
   // F6:切换到包含 messageId 的分支(兄弟版本 / 搜索命中),返回切换后的消息列表
@@ -77,6 +86,8 @@ export const api = {
   branchSession: (sessionId: string, body: { messageId?: number; title?: string }) =>
     req<SessionMeta>(`/sessions/${sessionId}/branch`, { method: "POST", body: JSON.stringify(body) }),
   messages: (id: string) => req<ChatMessage[]>(`/sessions/${id}/messages`),
+  // L2:单个会话元信息(记忆页「查看出处」定位会话)
+  session: (id: string) => req<SessionMeta>(`/sessions/${id}`),
   // M7:消息全文搜索;archived=true 时连同已归档会话一起搜
   search: (q: string, opts: { mode?: string; archived?: boolean; limit?: number } = {}) => {
     const p = new URLSearchParams({ q });
@@ -186,8 +197,24 @@ export const api = {
     req<{ content: string }>("/tools/read", { method: "POST", body: JSON.stringify({ workspace, path }) }),
   workDocs: (workspace?: string) => req<WorkDoc[]>(`/work/docs${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`),
   workDoc: (id: string) => req<WorkDoc>(`/work/docs/${id}`),
+  // F8:文档检索(命中块 + 高亮片段)
+  searchDocs: (q: string, workspace?: string) =>
+    req<WorkDocHit[]>(`/work/docs/search?q=${encodeURIComponent(q)}${workspace ? `&workspace=${encodeURIComponent(workspace)}` : ""}`),
   importDocFile: (b: { workspace: string; path: string; sessionId?: string }) =>
     req<WorkDoc>("/work/docs/import-file", { method: "POST", body: JSON.stringify(b) }),
+  // F8:拖入 PDF / Word(转成文本存为资料)
+  uploadDocFile: async (file: File, workspace: string, sessionId?: string): Promise<WorkDoc> => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    form.append("workspace", workspace);
+    if (sessionId) form.append("sessionId", sessionId);
+    const res = await fetch(`${base}/work/docs/upload`, { method: "POST", body: form });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(body?.error ?? `导入失败(${res.status})`);
+    }
+    return res.json() as Promise<WorkDoc>;
+  },
   importDocUrl: (b: { url: string; workspace?: string; sessionId?: string }) =>
     req<WorkDoc>("/work/docs/import-url", { method: "POST", body: JSON.stringify(b) }),
   pasteDoc: (b: { title: string; content: string; workspace?: string; sessionId?: string }) =>
@@ -374,6 +401,19 @@ export async function toolShellStream(
   }
 }
 
+// F8:文档检索命中。snippet 中命中词用 \u0001 / \u0002 包住,由前端转成高亮
+export type WorkDocHit = {
+  docId: string;
+  title: string;
+  source: string;
+  kind: string;
+  workspace: string;
+  ord?: number;
+  start?: number;
+  end?: number;
+  snippet: string;
+};
+
 export type ExternalPreview = {
   source: "chatgpt" | "claude";
   conversations: number;
@@ -382,6 +422,9 @@ export type ExternalPreview = {
   empty: number;
   from: string | null;
   to: string | null;
+  // L2:可提取记忆的会话数与 token 估算
+  extractable?: number;
+  estimatedTokens?: number;
 };
 
 export async function streamChat(

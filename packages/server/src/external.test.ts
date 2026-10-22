@@ -124,7 +124,7 @@ describe("外部对话导入接口(M1)", () => {
   it("预览 → 导入:每个对话一个 Chat 会话,保留分支与当前分支;重复导入跳过;可被全文搜索", async () => {
     const { app } = setup();
     const pv = await (await post(app, "/admin/import/external/preview", chatgpt())).json();
-    expect(pv).toEqual({ source: "chatgpt", conversations: 1, messages: 5, duplicate: 0, empty: 1, from: "2023-11-14T22:13:20.500Z", to: "2023-11-14T22:13:20.500Z" });
+    expect(pv).toEqual({ source: "chatgpt", conversations: 1, messages: 5, duplicate: 0, empty: 1, from: "2023-11-14T22:13:20.500Z", to: "2023-11-14T22:13:20.500Z", extractable: 1, estimatedTokens: expect.any(Number) });
     const r = await (await post(app, "/admin/import/external", chatgpt())).json();
     expect(r).toEqual({ ok: true, source: "chatgpt", added: { sessions: 1, messages: 5 }, skipped: { duplicate: 0, empty: 1 } });
     const sessions = (await (await app.request("/sessions")).json()) as Array<{ id: string; title: string; mode: string; updatedAt: string }>;

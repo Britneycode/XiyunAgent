@@ -17,7 +17,7 @@ function fakeProvider(reply: string): ChatProvider {
 function setup() {
   const db = new DatabaseSync(":memory:");
   db.exec(`
-    CREATE TABLE facts (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.5, scope TEXT NOT NULL DEFAULT 'global', valid_from TEXT NOT NULL, valid_to TEXT, deleted_at TEXT);
+    CREATE TABLE facts (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.5, scope TEXT NOT NULL DEFAULT 'global', valid_from TEXT NOT NULL, valid_to TEXT, deleted_at TEXT, source_message_id INTEGER, source_kind TEXT, source_session_id TEXT);
     CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE VIRTUAL TABLE facts_fts USING fts5(id UNINDEXED, content, tokenize='trigram');
   `);
