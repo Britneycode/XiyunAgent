@@ -4,7 +4,7 @@ export type Mode = "chat" | "work" | "code";
 export type Page = "main" | "memory" | "settings";
 // 检查器标签页:预览 / 子任务 / 候选为通用页;其余为模式专属面板,由对应页面通过 portal 填充
 export type PanelId = "changes" | "terminal" | "docs" | "todos";
-export type InspectorTabId = "preview" | PanelId | "tasks" | "candidates";
+export type InspectorTabId = "preview" | PanelId | "tasks" | "candidates" | "usage";
 
 export const MODES: Mode[] = ["chat", "work", "code"];
 

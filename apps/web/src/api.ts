@@ -1,4 +1,10 @@
-import type { AgentRole, AttachmentMeta, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, MemoryJob, MemoryJobItem, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, WorkDoc } from "@xiyun/shared";
+import type { AgentRole, AttachmentMeta, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, MemoryJob, MemoryJobItem, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, UsageSummary, WorkDoc } from "@xiyun/shared";
+
+// L5:用量设置(与服务端 AppSettings 同口径)
+export interface AppSettings {
+  dailyBudget?: number | null;
+  currency?: string;
+}
 
 // /chat SSE 事件:typed 块事件 + 旧版 plain delta/error/done
 export type StreamEvent =
@@ -9,7 +15,16 @@ export type StreamEvent =
   | { type: "tool_output"; id: string; delta: string }
   | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
   // 首个事件:本轮 user 消息的落库 id、后台运行 id、所用模型;trim = 历史超出上下文预算时的裁剪情况(F4)
-  | { type: "meta"; userMessageId: number | null; runId?: string; model?: string | null; trim?: { dropped: number; summary: boolean } }
+  | {
+      type: "meta";
+      userMessageId: number | null;
+      runId?: string;
+      model?: string | null;
+      trim?: { dropped: number; summary: boolean };
+      // L5:回退到另一家模型 / 超预算降级,气泡上给出提示
+      fallback?: { from: string; to: string; reason: string };
+      downgraded?: { from: string; to: string; reason: string };
+    }
   | { type: "cancelled"; messageId: number | null; userMessageId: number | null } // 被停止:半截已落库(无内容时 messageId 为 null)
   | { type: "title"; title: string } // 新会话自动命名完成(模型起的标题)
   | { delta: string; id?: string }
@@ -127,6 +142,23 @@ export const api = {
   cancelTask: (id: string) => req(`/tasks/${id}/cancel`, { method: "POST" }),
   retryTask: (id: string) => req(`/tasks/${id}/retry`, { method: "POST" }),
   resumeTask: (id: string, answer: string) => req(`/tasks/${id}/resume`, { method: "POST", body: JSON.stringify({ answer }) }),
+  // L4:隔离分支落地操作(都需前端二次确认后带 confirm:true)
+  mergeTask: (id: string) => req<{ ok: boolean; output: string }>(`/tasks/${id}/merge`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  pushTask: (id: string) => req<{ ok: boolean; output: string }>(`/tasks/${id}/push`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  createTaskPr: (id: string) =>
+    req<{ ok: boolean; url?: string; error?: string; compareUrl?: string }>(`/tasks/${id}/pr`, {
+      method: "POST", body: JSON.stringify({ confirm: true }),
+    }),
+  discardTask: (id: string) => req<{ ok: boolean }>(`/tasks/${id}/discard`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  // L5:用量账本与设置
+  usage: (groupBy: "day" | "session" | "provider" | "model" = "day", range: { from?: string; to?: string } = {}) => {
+    const p = new URLSearchParams({ groupBy });
+    if (range.from) p.set("from", range.from);
+    if (range.to) p.set("to", range.to);
+    return req<UsageSummary>(`/usage?${p}`);
+  },
+  settings: () => req<AppSettings>("/settings"),
+  saveSettings: (b: AppSettings) => req<AppSettings>("/settings", { method: "PATCH", body: JSON.stringify(b) }),
   providerModels: (id: string) => req<{ models: string[] }>(`/providers/${id}/models`),
   probeProvider: (id: string) => req<{ ok: boolean; latencyMs: number; model: string; error?: string }>(`/providers/${id}/probe`, { method: "POST" }),
   // ---- 阶段 4:工具 ----
@@ -353,6 +385,42 @@ async function withResume(
 // 续订一次后台生成(切回会话 / 刷新后),从头回放到结束
 export function subscribeRun(runId: string, onEvent: (ev: StreamEvent) => void, signal?: AbortSignal): Promise<void> {
   return withResume(() => fetch(`${base}/runs/${runId}/events`, { signal: signal ?? null }), onEvent, signal, runId);
+}
+
+// L4:订阅单个子任务的事件流(服务端先回放历史,再实时推送)
+export interface TaskStreamEvent {
+  id: number;
+  type: string;
+  payload: unknown;
+  createdAt: string;
+}
+
+export async function subscribeTaskEvents(
+  taskId: string,
+  onEvent: (ev: TaskStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${base}/tasks/${taskId}/events`, { signal: signal ?? null });
+  if (!res.ok || !res.body) throw new Error(`任务事件流失败(${res.status})`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const blocks = buf.split("\n\n");
+    buf = blocks.pop() ?? "";
+    for (const b of blocks) {
+      const line = b.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line.slice(5).trim()) as TaskStreamEvent);
+      } catch {
+        // 坏 JSON 跳过
+      }
+    }
+  }
 }
 
 export const attachmentUrl = (id: string) => `${base}/attachments/${id}`;

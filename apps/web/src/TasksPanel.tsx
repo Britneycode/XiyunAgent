@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { AgentRole, SubagentTask, TaskSchedule } from "@xiyun/shared";
-import { api } from "./api.ts";
+import { api, subscribeTaskEvents } from "./api.ts";
 
 const ROLE_LABEL: Record<AgentRole, string> = {
   coder: "Coder", reviewer: "Reviewer", tester: "Tester",
@@ -22,16 +22,56 @@ function fmtDuration(ms: number | null): string {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
+// L4:隔离分支的落地操作。每个都要二次确认,结果(含失败原因)显示在卡片上。
+const LANDING: Array<{ key: "merge" | "push" | "pr" | "discard"; label: string; hint: string; run: (id: string) => Promise<unknown> }> = [
+  { key: "merge", label: "合并", hint: "把隔离分支合入当前工作区分支?", run: (id) => api.mergeTask(id) },
+  { key: "push", label: "推送", hint: "推送隔离分支到 origin?", run: (id) => api.pushTask(id) },
+  { key: "pr", label: "建 PR", hint: "推送分支并创建 PR?", run: (id) => api.createTaskPr(id) },
+  { key: "discard", label: "丢弃", hint: "删除隔离 worktree 与分支?此操作不可撤销", run: (id) => api.discardTask(id) },
+];
+
 function TaskCard({ task, onChanged }: { task: SubagentTask; onChanged: () => void }) {
   const [open, setOpen] = useState(false);
   const [answer, setAnswer] = useState("");
+  const [note, setNote] = useState("");
+  const [tool, setTool] = useState("");
   const active = task.status === "queued" || task.status === "running";
+
+  // 运行中的任务订阅事件流,显示当前工具(结束或卸载时断开)
+  useEffect(() => {
+    if (!active) return;
+    const ac = new AbortController();
+    void subscribeTaskEvents(
+      task.id,
+      (e) => {
+        const p = e.payload as { tool?: string } | null;
+        if (e.type === "task.tool" && p?.tool) setTool(p.tool);
+      },
+      ac.signal,
+    ).catch(() => {});
+    return () => ac.abort();
+  }, [active, task.id]);
+  // 有隔离分支时才显示落地按钮
+  const hasBranch = !active && !!task.branch;
+
+  const land = async (op: (typeof LANDING)[number]) => {
+    if (!window.confirm(op.hint)) return;
+    setNote(`${op.label}中…`);
+    try {
+      const r = (await op.run(task.id)) as { url?: string; compareUrl?: string; error?: string } | undefined;
+      setNote(r?.url ?? r?.compareUrl ?? (r?.error ? `${op.label}失败:${r.error}` : `${op.label}完成`));
+      onChanged();
+    } catch (e) {
+      setNote(`${op.label}失败:${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
   return (
     <div className="task" onClick={() => setOpen(!open)} role="button" tabIndex={0}
       onKeyDown={(e) => e.key === "Enter" && setOpen(!open)}>
       <div className="head">
         <span className="badge">{ROLE_LABEL[task.role]}</span>
         <span className={`st ${STATUS_CLASS[task.status]}`}>{STATUS_LABEL[task.status]}</span>
+        {active && tool && <span className="tool">{tool}</span>}
         <span className="dur">{fmtDuration(task.durationMs)}</span>
       </div>
       <div className="title">{task.title}</div>
@@ -52,7 +92,16 @@ function TaskCard({ task, onChanged }: { task: SubagentTask; onChanged: () => vo
           <div className="meta">
             <span>模型 {task.model ?? "未执行"}</span>
             <span>{task.schedule}</span>
+            {task.steps != null && <span>{task.steps} 步</span>}
+            {task.usage && <span>{task.usage.totalTokens} tokens</span>}
           </div>
+          {task.branch && (
+            <p className="branch" title={task.worktree ?? ""}>
+              {task.baseSha ? `${task.baseSha.slice(0, 7)}...` : ""}
+              {task.branch}
+            </p>
+          )}
+          {task.diffStat && <pre className="diffstat">{task.diffStat}</pre>}
           {task.result && <p className="summary">{task.result.summary}</p>}
           {task.result && task.result.risks.length > 0 && (
             <p className="risks">风险:{task.result.risks.join(";")}</p>
@@ -63,7 +112,14 @@ function TaskCard({ task, onChanged }: { task: SubagentTask; onChanged: () => vo
             {(task.status === "failed" || task.status === "cancelled") && (
               <button onClick={() => void api.retryTask(task.id).then(onChanged)}>重试</button>
             )}
+            {hasBranch &&
+              LANDING.map((op) => (
+                <button key={op.key} className={op.key === "discard" ? "danger" : undefined} onClick={() => void land(op)}>
+                  {op.label}
+                </button>
+              ))}
           </div>
+          {note && <p className="note">{note}</p>}
         </div>
       )}
     </div>

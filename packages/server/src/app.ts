@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
-import { estimateTokens, type AgentRole, type ChatBlock, type ChatMessage, type ProviderConfig, type SessionMeta, type TaskStatus, type TokenUsage, type ToolDecision } from "@xiyun/shared";
+import { estimateTokens, modelsOf, pricingOf, type AgentRole, type ChatBlock, type ChatMessage, type ProviderConfig, type SessionMeta, type TaskStatus, type TokenUsage, type ToolDecision } from "@xiyun/shared";
 import type { ChatProvider, ProviderEvent, ToolDef } from "../../runtime/src/index.ts";
 import { MemoryStore } from "./memory.ts";
 import { ProviderStore } from "./providers.ts";
@@ -14,7 +14,11 @@ import { extractMemories } from "./extract.ts";
 import { runMemoryTool } from "./memchat.ts";
 import { WorkStore } from "./docs.ts";
 import { SkillStore } from "./skills.ts";
-import { MAX_GROUP_TASKS, Scheduler, TaskStore } from "./tasks.ts";
+import { MAX_GROUP_TASKS, Scheduler, TaskEventBus, TaskStore } from "./tasks.ts";
+import { cheapestPriced, UsageLedger, type UsageGroupBy } from "./usage.ts";
+import {
+  createPullRequest, mergeBranch, pushBranch, remoteUrl, removeWorktree,
+} from "./worktree.ts";
 import { detectShells, gitCommit, gitPreview, listTool, readTool, shellExec, writeTool } from "./tools.ts";
 import { DATA_DIR, backupDb } from "./db.ts";
 import { DEFAULT_TITLE, generateTitle, heuristicTitle } from "./title.ts";
@@ -63,6 +67,8 @@ export function createApp(
   app.use("*", cors({ origin: (o) => (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(o) ? o : undefined) }));
 
   const taskStore = new TaskStore(db);
+  // L5:成本账本(主对话 + 子任务共用一个库)
+  const usageLedger = new UsageLedger(db);
   // B2:附件。启动时清理一天前上传、但没有随任何消息发出的附件
   const attachments = new AttachmentStore(db, opts?.dataDir ?? DATA_DIR);
   // L1:工作区快照(影子仓库,不碰用户的 .git)
@@ -76,15 +82,23 @@ export function createApp(
   }
   const work = new WorkStore(db);
   const skills = new SkillStore(db, DATA_DIR);
+  // L4:任务事件总线,供 GET /tasks/:id/events 实时推送
+  const taskEvents = new TaskEventBus();
   const scheduler = new Scheduler({
     store: taskStore,
     memory,
     registry: () => providers.registry(),
     skillsFor: (mode, role, query) => skills.promptFor(mode, role, query),
-    onEvent: (type, payload) =>
-      db.prepare("INSERT INTO events (type, payload, created_at) VALUES (?, ?, ?)").run(
-        type, JSON.stringify(payload), now(),
-      ),
+    // L5:子任务用量同样记账
+    usage: (entry) => usageLedger.record(entry),
+    onEvent: (type, payload) => {
+      const r = db
+        .prepare("INSERT INTO events (type, payload, created_at) VALUES (?, ?, ?)")
+        .run(type, JSON.stringify(payload), now());
+      // L4:任务事件同步推给订阅者(前端可实时看每步工具与状态变化)
+      const taskId = (payload as { taskId?: string } | null)?.taskId;
+      if (taskId) taskEvents.publish(taskId, { id: Number(r.lastInsertRowid), type, payload, createdAt: now() });
+    },
   });
   // 启动恢复:上次中断的 queued/running 任务重新拉起。
   const recovered = scheduler.recover();
@@ -211,6 +225,26 @@ export function createApp(
     } catch (e) {
       return c.json({ ok: false, latencyMs: Date.now() - t0, error: e instanceof Error ? e.message : "probe failed" });
     }
+  });
+
+  // ---- L5:用量账本与设置 ----
+  // groupBy:day|session|provider|model;from/to 为 ISO 日期(含端点)
+  app.get("/usage", (c) => {
+    const raw = c.req.query("groupBy") ?? "day";
+    const groupBy: UsageGroupBy = raw === "session" || raw === "provider" || raw === "model" ? raw : "day";
+    const { rows, total } = usageLedger.summary(groupBy, c.req.query("from"), c.req.query("to"));
+    const s = providers.settings();
+    return c.json({
+      groupBy, rows, total,
+      currency: s.currency ?? "USD",
+      budget: s.dailyBudget ?? null,
+      spentToday: usageLedger.spentToday(),
+    });
+  });
+  app.get("/settings", (c) => c.json(providers.settings()));
+  app.patch("/settings", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { dailyBudget?: number | null; currency?: string };
+    return c.json(providers.updateSettings(b));
   });
 
   // 拉取服务商的模型列表(设置页"获取模型");失败返回可读错误
@@ -658,9 +692,41 @@ export function createApp(
     const pick = typeof body.providerId === "string" && body.providerId
       ? { id: body.providerId, model: body.model ?? null }
       : { id: session.provider_id, model: session.model };
-    const provider = opts?.chatProvider?.() ?? providers.resolve(pick.id, pick.model) ?? providers.registry().byRole("main");
+    // 用户本轮显式选了模型:预算超支时只提示,不擅自换模型
+    const explicitPick = typeof body.providerId === "string" && !!body.providerId;
+    let provider = opts?.chatProvider?.() ?? providers.resolve(pick.id, pick.model) ?? providers.registry().byRole("main");
     if (!provider) return c.json({ error: "no provider configured" }, 400);
-    const modelName = provider.config.model || null; // 落到 assistant 消息上,前端气泡显示
+    let modelName = provider.config.model || null; // 落到 assistant 消息上,前端气泡显示
+
+    // L5:日预算。已超支且用户没指定模型时,降级到已定价模型里最便宜的一个。
+    const dailyBudget = providers.settings().dailyBudget ?? null;
+    const spentToday = usageLedger.spentToday();
+    let downgraded: { from: string; to: string; reason: string } | null = null;
+    if (dailyBudget != null && spentToday >= dailyBudget) {
+      const cheap = cheapestPriced(
+        providers.configs().flatMap((c) =>
+          modelsOf(c).map((m) => ({ providerId: c.id, model: m.id, pricing: m.pricing })),
+        ),
+      );
+      const curModel = provider.config.model;
+      if (cheap && cheap.model !== curModel && !explicitPick) {
+        const next = providers.resolve(cheap.providerId, cheap.model);
+        if (next) {
+          downgraded = {
+            from: curModel,
+            to: cheap.model,
+            reason: `今日已花费 ${spentToday.toFixed(2)} 超出日预算 ${dailyBudget.toFixed(2)},已降级到最低价模型`,
+          };
+          provider = next;
+          modelName = next.config.model || null;
+        }
+      } else if (explicitPick) {
+        downgraded = {
+          from: curModel, to: curModel,
+          reason: `今日已花费 ${spentToday.toFixed(2)} 超出日预算 ${dailyBudget.toFixed(2)},本轮按你指定的模型继续`,
+        };
+      }
+    }
     // 同一会话同时只允许一个生成(F1):先拦下,避免记忆工具等副作用
     const busyMsg = "该会话正在生成,请等待完成或先停止";
     if (runs.active(sessionId)?.status === "running") return c.json({ error: busyMsg }, 409);
@@ -886,7 +952,11 @@ export function createApp(
     const ac = run.ac;
     const send = (obj: unknown) => run.emit(obj);
     // 先下发已落库的 user 消息 id 与 runId:中断或出错时客户端也能立即编辑 / 分支,断线后可凭 runId 续订
-    send({ type: "meta", userMessageId, runId: run.id, model: modelName, ...(trim ? { trim } : {}) });
+    send({
+      type: "meta", userMessageId, runId: run.id, model: modelName,
+      ...(trim ? { trim } : {}),
+      ...(downgraded ? { downgraded } : {}),
+    });
     // 运行结束后 emit 自动忽略,标题晚到时只落库
     void titlePending?.then((title) => {
       if (title) send({ type: "title", title });
@@ -899,8 +969,16 @@ export function createApp(
       const blocks = builder.blocks;
       let finishReason: string | null = null;
       let usage: TokenUsage | null = null;
+      // L5:记账要用实际完成本次运行的模型(可能已回退)
+      let finalProvider = provider;
+      let persistedId: number | null = null;
 
       try {
+        // L5:回退链 = 当前模型之后,同 main 角色的其他模型(去重)。
+        // 注入了 chatProvider(测试)时不启用,保证用例可复现。
+        const chain = opts?.chatProvider
+          ? []
+          : providers.registry().byRoleAll("main").filter((p) => p.config.id !== provider.config.id);
         const result = await runAgent({
           provider,
           messages,
@@ -910,6 +988,11 @@ export function createApp(
           builder,
           homeDir: homedir(),
           maxSteps: 30,
+          fallbacks: chain,
+          onFallback: ({ from, to, reason }) => {
+            modelName = to;
+            send({ type: "meta", userMessageId, runId: run.id, model: to, fallback: { from, to, reason } });
+          },
           // 确认回调:写入 runId 后挂起,等 POST /runs/:id/confirm
           confirm: async (req) => {
             const b = builder.tool(req.blockId);
@@ -934,6 +1017,7 @@ export function createApp(
         });
         finishReason = result.finishReason;
         usage = result.usage;
+        finalProvider = result.provider;
         builder.closeOpen();
 
         if (ac.signal.aborted) {
@@ -950,6 +1034,7 @@ export function createApp(
         }
         const content = builder.textOf();
         const messageId = persist({ content, blocks, aborted: false });
+        persistedId = messageId;
         db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('chat', ?, ?)").run(
           JSON.stringify({ sessionId, user: message, assistant: content }), now(),
         );
@@ -989,6 +1074,18 @@ export function createApp(
         }
         void send({ error, messageId, userMessageId });
       } finally {
+        // L5:有用量就记一行账(取消时也记,已经消耗的 token 是真实成本)
+        if (usage) {
+          try {
+            usageLedger.record({
+              sessionId, messageId: persistedId, providerId: finalProvider.config.id,
+              model: finalProvider.config.model || null, usage,
+              pricing: pricingOf(finalProvider.config), currency: providers.settings().currency,
+            });
+          } catch {
+            // 记账失败不影响回复
+          }
+        }
         runs.finish(run, ac.signal.aborted ? "cancelled" : outcome);
       }
 
@@ -1198,6 +1295,131 @@ export function createApp(
     return scheduler.resume(c.req.param("id"), b.answer.trim())
       ? c.json({ ok: true })
       : c.json({ error: "任务不存在或未在等待用户" }, 400);
+  });
+
+  // L4:任务事件流(SSE)。先回放历史事件,再实时推送新事件。
+  app.get("/tasks/:id/events", (c) => {
+    const id = c.req.param("id");
+    if (!taskStore.get(id)) return c.json({ error: "not found" }, 404);
+    return streamSSE(c, async (stream) => {
+      let queue: Promise<unknown> = Promise.resolve();
+      let end!: () => void;
+      const ended = new Promise<void>((r) => (end = r));
+      const gone = () => end();
+      stream.onAbort(gone);
+      c.req.raw.signal.addEventListener("abort", gone, { once: true });
+      const seen = new Set<number>();
+      // 先订阅再回放:回放期间到达的事件会重复出现,按 events 表 id 去重
+      const unsub = taskEvents.subscribe(id, (e) => {
+        if (seen.has(e.id)) return;
+        seen.add(e.id);
+        queue = queue
+          .then(() => stream.writeSSE({ id: String(e.id), data: JSON.stringify(e) }))
+          .catch(() => {});
+      });
+      const rows = db
+        .prepare(
+          "SELECT id, type, payload, created_at FROM events WHERE type LIKE 'task.%' AND payload LIKE ? ORDER BY id ASC LIMIT 1000",
+        )
+        .all(`%"taskId":"${id}"%`) as Array<{
+        id: number; type: string; payload: string; created_at: string;
+      }>;
+      for (const r of rows) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        let payload: unknown = {};
+        try {
+          payload = JSON.parse(r.payload);
+        } catch {
+          // payload 损坏时按空对象回放,不中断整条流
+        }
+        await stream.writeSSE({
+          id: String(r.id),
+          data: JSON.stringify({ id: r.id, type: r.type, payload, createdAt: r.created_at }),
+        });
+      }
+      await ended;
+      unsub();
+      if (!c.req.raw.signal.aborted) await queue;
+    });
+  });
+
+  // L4:隔离分支的落地操作(合并 / 推送 / 建 PR / 丢弃)。
+  // 前端确认后调用,服务端再校验一次;只对有隔离分支的任务可用。
+  const withTask = async (id: string) => {
+    const t = taskStore.get(id);
+    return t ?? null;
+  };
+  app.post("/tasks/:id/merge", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { confirm?: boolean };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能合并" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (!t.worktree || !t.branch) return c.json({ error: "该任务没有待合并的隔离分支" }, 400);
+    try {
+      const output = await mergeBranch(t.workspace, t.branch);
+      await removeWorktree(t.workspace, t.worktree, t.branch);
+      taskStore.patch(t.id, { worktree: null, branch: null, diffStat: null });
+      return c.json({ ok: true, output });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  });
+  app.post("/tasks/:id/push", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { confirm?: boolean; remote?: string };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能推送" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (!t.branch) return c.json({ error: "该任务没有待推送的隔离分支" }, 400);
+    try {
+      const output = await pushBranch(t.workspace, t.branch, b.remote?.trim() || "origin");
+      return c.json({ ok: true, output });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  });
+  app.post("/tasks/:id/pr", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as {
+      confirm?: boolean; title?: string; body?: string; base?: string;
+    };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能建 PR" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (!t.branch) return c.json({ error: "该任务没有待推送的隔离分支" }, 400);
+    const title = b.title?.trim() || t.title || `子任务 ${t.role}`;
+    const body =
+      b.body?.trim() ||
+      [t.diffStat ? `## 变更\n\n\`\`\`\n${t.diffStat}\n\`\`\`` : "", t.result?.summary ?? ""]
+        .filter(Boolean)
+        .join("\n\n");
+    try {
+      // gh 建 PR 要求分支已在远端
+      await pushBranch(t.workspace, t.branch);
+      const r = await createPullRequest(t.workspace, t.branch, title, body, b.base);
+      if (r && "url" in r) return c.json({ ok: true, url: r.url });
+      if (r && "error" in r) return c.json({ ok: false, error: r.error }, 400);
+      // 没装 gh:给出 compare 链接,由用户自己开
+      const remote = await remoteUrl(t.workspace);
+      const compareUrl = remote ? `${remote}/compare/${t.baseSha ?? "main"}...${t.branch}` : null;
+      return c.json({ ok: false, error: "未安装 gh,无法自动建 PR", compareUrl }, 400);
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  });
+  app.post("/tasks/:id/discard", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { confirm?: boolean };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能丢弃" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (t.status === "running") return c.json({ error: "任务还在运行,先停止再丢弃" }, 400);
+    if (!t.worktree || !t.branch) return c.json({ error: "该任务没有待丢弃的隔离分支" }, 400);
+    try {
+      await removeWorktree(t.workspace, t.worktree, t.branch);
+      taskStore.patch(t.id, { worktree: null, branch: null, diffStat: null });
+      return c.json({ ok: true });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
   });
 
   // 修改会话:工作区(Code/Work 绑定项目目录)、标题重命名、归档开关;至少给一个字段

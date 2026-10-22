@@ -94,6 +94,45 @@ function AppearanceSection() {
   );
 }
 
+// L5:日预算与计价货币。超出日预算时 /chat 自动降级到更便宜的已定价模型。
+function BudgetSection() {
+  const [dailyBudget, setDailyBudget] = useState<number | "">("");
+  const [currency, setCurrency] = useState("USD");
+  const [note, setNote] = useState("");
+
+  useEffect(() => {
+    void api.settings().then((s) => {
+      setDailyBudget(s.dailyBudget ?? "");
+      setCurrency(s.currency ?? "USD");
+    }).catch(() => {});
+  }, []);
+
+  const save = async () => {
+    setNote("保存中…");
+    try {
+      const s = await api.saveSettings({ dailyBudget: dailyBudget === "" ? null : dailyBudget, currency });
+      setDailyBudget(s.dailyBudget ?? "");
+      setCurrency(s.currency ?? "USD");
+      setNote("已保存");
+    } catch (e) {
+      setNote(`保存失败:${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  return (
+    <div style={{ margin: "var(--pad) 0" }}>
+      <label>日预算(留空不限制) <input type="number" style={{ width: 235 }} min={0} step={0.01} value={dailyBudget}
+        onChange={(e) => setDailyBudget(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+      <label>计价货币 <input style={{ width: 235 }} value={currency} onChange={(e) => setCurrency(e.target.value)} /></label>
+      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+        模型行填写价格后才会计价;超出日预算时优先降级到更便宜的已定价模型。用量明细在右侧「用量」面板。
+      </div>
+      <button onClick={() => void save()}>保存预算</button>
+      {note && <span style={{ fontSize: 12, color: "var(--muted)", marginLeft: 8 }}>{note}</span>}
+    </div>
+  );
+}
+
 function ProvidersSection() {
   const [providers, setProviders] = useState<Awaited<ReturnType<typeof api.providers>>>([]);
   const [form, setForm] = useState<ProviderForm>(emptyForm);
@@ -144,6 +183,7 @@ function ProvidersSection() {
   return (
     <>
       <h2>模型</h2>
+      <BudgetSection />
       {providers.map((p) => (
         <div key={p.id} style={{ marginBottom: 10 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -184,10 +224,10 @@ function ProvidersSection() {
       <label>默认模型 <input value={draft.model} placeholder="留空取模型列表第一项" onChange={(e) => setDraft({ ...draft, model: e.target.value })} /></label>
       <div style={{ margin: "var(--pad) 0" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-          <span style={{ flex: 1 }}>模型列表<span style={{ fontSize: 12, color: "var(--muted)" }}>(每行:模型 id [上下文如 128k] [vision/tools/json])</span></span>
+          <span style={{ flex: 1 }}>模型列表<span style={{ fontSize: 12, color: "var(--muted)" }}>(每行:模型 id [上下文如 128k] [vision/tools/json] [$输入/输出,或 $输入/缓存/输出,单位是每百万 tokens])</span></span>
           <button disabled={!saved} title={saved ? "用已保存的 Key 获取" : "先保存再获取"} onClick={() => void fetchModels()}>获取模型列表</button>
         </div>
-        <textarea style={area} value={form.modelsText} placeholder={"gpt-4o 128k vision tools\ngpt-4o-mini 128k"}
+        <textarea style={area} value={form.modelsText} placeholder={"gpt-4o 128k vision tools $2.5/10\ngpt-4o-mini 128k $0.15/0.6"}
           onChange={(e) => setForm((f) => ({ ...f, modelsText: e.target.value }))} />
         {fetchNote && <div style={{ fontSize: 12, color: "var(--muted)" }}>{fetchNote}</div>}
       </div>

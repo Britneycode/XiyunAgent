@@ -171,6 +171,34 @@ const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
       END;
     `);
   },
+  // v16:L4 后台并行任务(worktree 隔离)+ L5 成本账本。
+  // tasks 记隔离工作区、分支与起点、步数、用量与变更统计;
+  // usage_ledger 逐条记主对话与子任务的 token 消耗与成本
+  (db) => {
+    const cols = (db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cols.includes("worktree")) db.exec("ALTER TABLE tasks ADD COLUMN worktree TEXT");
+    if (!cols.includes("branch")) db.exec("ALTER TABLE tasks ADD COLUMN branch TEXT");
+    if (!cols.includes("base_sha")) db.exec("ALTER TABLE tasks ADD COLUMN base_sha TEXT");
+    if (!cols.includes("steps")) db.exec("ALTER TABLE tasks ADD COLUMN steps INTEGER");
+    if (!cols.includes("usage")) db.exec("ALTER TABLE tasks ADD COLUMN usage TEXT");
+    if (!cols.includes("diff_stat")) db.exec("ALTER TABLE tasks ADD COLUMN diff_stat TEXT");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS usage_ledger (
+        id TEXT PRIMARY KEY,
+        at TEXT NOT NULL,
+        session_id TEXT,
+        message_id INTEGER,
+        task_id TEXT,
+        provider_id TEXT,
+        model TEXT,
+        prompt INTEGER NOT NULL DEFAULT 0,
+        completion INTEGER NOT NULL DEFAULT 0,
+        cached INTEGER NOT NULL DEFAULT 0,
+        cost REAL NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_ledger_at ON usage_ledger(at);
+    `);
+  },
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
@@ -310,6 +338,20 @@ export function openDb(file = join(DATA_DIR, "app.db")): DatabaseSync {
       kind TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS usage_ledger (
+      id TEXT PRIMARY KEY,
+      at TEXT NOT NULL,
+      session_id TEXT,
+      message_id INTEGER,
+      task_id TEXT,
+      provider_id TEXT,
+      model TEXT,
+      prompt INTEGER NOT NULL DEFAULT 0,
+      completion INTEGER NOT NULL DEFAULT 0,
+      cached INTEGER NOT NULL DEFAULT 0,
+      cost REAL NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_ledger_at ON usage_ledger(at);
   `);
   for (let v = version; v < SCHEMA_VERSION; v++) MIGRATIONS[v](db);
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);

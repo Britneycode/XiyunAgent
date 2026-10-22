@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Brain, Eye, GitCompareArrows, Library, ListTodo, LoaderCircle, Plus, SquareCheckBig, SquareTerminal, WifiOff } from "lucide-react";
+import { Brain, ChartColumn, Eye, GitCompareArrows, Library, ListTodo, LoaderCircle, Plus, SquareCheckBig, SquareTerminal, WifiOff } from "lucide-react";
 import type { MemoryCandidate, SearchHit, SessionMeta } from "@xiyun/shared";
 import { ChatPage } from "./ChatPage.tsx";
 import { SettingsPage } from "./SettingsPage.tsx";
 import { MemoryPage } from "./MemoryPage.tsx";
 import { TasksPanel } from "./TasksPanel.tsx";
+import { UsagePanel } from "./UsagePanel.tsx";
 import { CodePage } from "./CodePage.tsx";
 import { WorkPage } from "./WorkPage.tsx";
 import type { Preview } from "./chat/blocks.tsx";
@@ -430,6 +431,16 @@ export function App() {
       badge: candidates.length,
       content: (
         <CandidateList candidates={candidates} onResolve={resolveCandidate} onOpenMemory={() => setPage("memory")} />
+      ),
+    },
+    {
+      id: "usage",
+      label: "用量",
+      icon: ChartColumn,
+      content: (
+        <div className="legacy">
+          <UsagePanel />
+        </div>
       ),
     },
   ];

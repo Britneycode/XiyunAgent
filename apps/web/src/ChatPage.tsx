@@ -230,6 +230,24 @@ const MessageItem = memo(function MessageItem({
               {m.model}
             </span>
           )}
+          {m.fallback && (
+            <span
+              className="ml-0.5 inline-flex items-center gap-1 px-1 text-2xs text-subtle"
+              title={m.fallback.reason}
+            >
+              <GitBranch size={11} strokeWidth={1.75} aria-hidden />
+              由 {m.fallback.to} 接手({m.fallback.from} 不可用)
+            </span>
+          )}
+          {m.downgraded && (
+            <span
+              className="ml-0.5 inline-flex items-center gap-1 px-1 text-2xs text-subtle"
+              title={m.downgraded.reason}
+            >
+              <TriangleAlert size={11} strokeWidth={1.75} aria-hidden />
+              {m.downgraded.from === m.downgraded.to ? "超出日预算" : `超出日预算,已降级到 ${m.downgraded.to}`}
+            </span>
+          )}
           {m.trim && (
             <span
               className="ml-0.5 inline-flex items-center gap-1 px-1 text-2xs text-subtle"

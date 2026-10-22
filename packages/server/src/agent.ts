@@ -575,6 +575,20 @@ export interface RunAgentOptions {
   onToolEnd?: (info: { name: string; status: ToolStatus; args: Record<string, unknown>; exitCode?: number }) => void;
   // L1:写操作或非只读命令执行前拍快照,返回的 sha 记到工具块上
   beforeWrite?: (info: { name: string; args: Record<string, unknown> }) => Promise<string | null>;
+  // L5:跨厂商回退链。只在首步、尚无任何输出时生效,按顺序尝试下一个模型。
+  fallbacks?: ChatProvider[];
+  onFallback?: (info: { from: string; to: string; reason: string }) => void;
+}
+
+// 可以换模型重试的错误:限流、配额、服务端 5xx、网络中断。
+// 400 / 413 / 上下文超长不换:换一家也救不回来,还会掩盖真实原因。
+const NON_RETRYABLE_RE = /(400|413|context.{0,24}(length|window|too long)|maximum context|too many tokens)/i;
+const RETRYABLE_RE =
+  /(429|5\d\d|rate.?limit|quota|overloaded|too many requests|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|network)/i;
+
+export function isRetryableModelError(msg: string): boolean {
+  if (NON_RETRYABLE_RE.test(msg)) return false;
+  return RETRYABLE_RE.test(msg);
 }
 
 export interface RunAgentResult {
@@ -582,6 +596,8 @@ export interface RunAgentResult {
   usage: TokenUsage | null;
   steps: number;
   finalText: string;
+  // 实际完成本次运行的模型(发生回退时与传入的不同),用于落库模型名与记账
+  provider: ChatProvider;
 }
 
 // 各协议的工具调用 id 跨步可能重复(Gemini 每步都是 call_0),块 id 与回传模型的 wireId 分开
@@ -605,6 +621,9 @@ export async function runAgent(o: RunAgentOptions): Promise<RunAgentResult> {
   let sawAnyOutput = false;
   let useTools = toolDefs.length > 0;
   let retriedWithoutTools = false;
+  // L5:当前生效的模型与尚未尝试的回退链
+  let provider = o.provider;
+  const fallbacks = [...(o.fallbacks ?? [])];
 
   for (let step = 0; step < maxSteps; step++) {
     if (o.signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
@@ -616,10 +635,12 @@ export async function runAgent(o: RunAgentOptions): Promise<RunAgentResult> {
     let stepUsage: TokenUsage | null = null;
     let stepFinish: string | null = null;
 
-    const iter = o.provider.streamEvents
-      ? o.provider.streamEvents(messages, { signal: o.signal, ...(useTools ? { tools: toolDefs } : {}) })
+    // 每步都按当前 provider 取流:回退后从下一步起走新模型
+    const cur = provider;
+    const iter = cur.streamEvents
+      ? cur.streamEvents(messages, { signal: o.signal, ...(useTools ? { tools: toolDefs } : {}) })
       : (async function* (): AsyncIterable<ProviderEvent> {
-          for await (const d of o.provider.streamChat(messages, { signal: o.signal })) yield { type: "text", delta: d };
+          for await (const d of cur.streamChat(messages, { signal: o.signal })) yield { type: "text", delta: d };
         })();
 
     // 与中断竞速:Provider 不响应 signal 时也能立即收尾落库,不把流挂死
@@ -691,6 +712,19 @@ export async function runAgent(o: RunAgentOptions): Promise<RunAgentResult> {
         useTools = false;
         steps -= 1;
         step = -1; // 回到第 0 步重来
+        continue;
+      }
+      // L5:首步、尚无输出时按回退链换模型;已出过内容就不再换,避免半截回答拼接两个模型
+      if (step === 0 && !sawAnyOutput && fallbacks.length && isRetryableModelError(msg)) {
+        const from = provider.config.model || provider.config.id;
+        const next = fallbacks.shift()!;
+        const to = next.config.model || next.config.id;
+        provider = next;
+        // 新模型的工具能力可能不同:没有 streamEvents 就当纯对话
+        if (!next.streamEvents) useTools = false;
+        o.onFallback?.({ from, to, reason: msg.slice(0, 200) });
+        steps -= 1;
+        step = -1;
         continue;
       }
       throw e;
@@ -922,5 +956,5 @@ export async function runAgent(o: RunAgentOptions): Promise<RunAgentResult> {
     finalText = stepText;
   }
 
-  return { finishReason, usage, steps, finalText };
+  return { finishReason, usage, steps, finalText, provider };
 }
