@@ -28,6 +28,8 @@ export function WorkPage({ session, onSessionChanged, onPreview, onBranch, onNew
   const [docs, setDocs] = useState<WorkDoc[]>([]);
   const [todos, setTodos] = useState<Todo[]>([]);
   const [doc, setDoc] = useState<WorkDoc | null>(null);
+  // F8:从检索结果打开文档时标出的命中块
+  const [focus, setFocus] = useState<{ start: number; end: number } | null>(null);
   const [mode, setMode] = useState<ImportMode>("file");
   const [importPath, setImportPath] = useState("");
   const [importUrl, setImportUrl] = useState("");
@@ -118,8 +120,16 @@ export function WorkPage({ session, onSessionChanged, onPreview, onBranch, onNew
           busy={busy}
           docs={docs}
           doc={doc}
-          onOpenDoc={(id) => void run(async () => setDoc(await api.workDoc(id)))}
-          onCloseDoc={() => setDoc(null)}
+          focus={focus}
+          onOpenDoc={(id) => void run(async () => { setFocus(null); setDoc(await api.workDoc(id)); })}
+          onOpenDocAt={(id, start, end) =>
+            void run(async () => {
+              const d = await api.workDoc(id);
+              setFocus({ start, end });
+              setDoc(d);
+            })
+          }
+          onCloseDoc={() => { setFocus(null); setDoc(null); }}
           onDeleteDoc={() =>
             doc &&
             void run(async () => {
@@ -160,6 +170,11 @@ export function WorkPage({ session, onSessionChanged, onPreview, onBranch, onNew
           onRefresh={refresh}
           onPreview={onPreview}
           onPreviewFile={(p) => void previewFile(p)}
+          onUploadFile={(file) =>
+            void run(async () => {
+              await api.uploadDocFile(file, workspace, session.id);
+            })
+          }
         />
       </InspectorPortal>
 

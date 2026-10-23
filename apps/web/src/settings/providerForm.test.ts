@@ -16,6 +16,20 @@ describe("Provider 表单(M2)", () => {
     expect(parseModelLines(formatModelLines(models))).toEqual(models);
   });
 
+  it("模型行价格:两段为输入/输出,三段含缓存价,可往返(L5)", () => {
+    expect(parseModelLines("gpt-4o $2.5/10\ngpt-4o-mini 128k $0.15/0.6")).toEqual([
+      { id: "gpt-4o", pricing: { input: 2.5, output: 10 } },
+      { id: "gpt-4o-mini", contextLength: 128000, pricing: { input: 0.15, output: 0.6 } },
+    ]);
+    expect(parseModelLines("a $3/0.3/15")).toEqual([{ id: "a", pricing: { input: 3, cachedInput: 0.3, output: 15 } }]);
+    const models = [
+      { id: "a", capabilities: ["vision"], pricing: { input: 3, cachedInput: 0.3, output: 15 } },
+      { id: "b", pricing: { input: 2.5, output: 10 } },
+    ];
+    expect(formatModelLines(models)).toBe("a vision $3/0.3/15\nb $2.5/10");
+    expect(parseModelLines(formatModelLines(models))).toEqual(models);
+  });
+
   it("键值对按第一个分隔符切分", () => {
     expect(parseKV("api-key: {apiKey}\nX-Url: http://a:1\nbad\n: v", ":")).toEqual({ "api-key": "{apiKey}", "X-Url": "http://a:1" });
     expect(parseKV("api-version=2024=10", "=")).toEqual({ "api-version": "2024=10" });

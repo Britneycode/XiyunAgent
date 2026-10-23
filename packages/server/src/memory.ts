@@ -11,6 +11,9 @@ type FactRow = {
   valid_from: string;
   valid_to: string | null;
   deleted_at: string | null;
+  source_message_id: number | null;
+  source_kind: string | null;
+  source_session_id: string | null;
 };
 
 type CandidateRow = {
@@ -28,6 +31,9 @@ type CandidateRow = {
   status: "pending" | "confirmed" | "rejected";
   created_at: string;
   resolved_at: string | null;
+  source_message_id: number | null;
+  source_kind: string | null;
+  source_session_id: string | null;
 };
 
 function toFact(r: FactRow): Fact {
@@ -40,6 +46,9 @@ function toFact(r: FactRow): Fact {
     validFrom: r.valid_from,
     validTo: r.valid_to,
     deletedAt: r.deleted_at,
+    ...(r.source_message_id != null ? { sourceMessageId: r.source_message_id } : {}),
+    ...(r.source_kind ? { sourceKind: r.source_kind } : {}),
+    ...(r.source_session_id ? { sourceSessionId: r.source_session_id } : {}),
   };
 }
 
@@ -59,6 +68,9 @@ function toCandidate(r: CandidateRow): MemoryCandidate {
     status: r.status,
     createdAt: r.created_at,
     resolvedAt: r.resolved_at,
+    ...(r.source_message_id != null ? { sourceMessageId: r.source_message_id } : {}),
+    ...(r.source_kind ? { sourceKind: r.source_kind } : {}),
+    ...(r.source_session_id ? { sourceSessionId: r.source_session_id } : {}),
   };
 }
 
@@ -68,12 +80,20 @@ export class MemoryStore {
     this.db = db;
   }
 
-  addFact(content: string, opts: { source?: string; confidence?: number; scope?: string } = {}): Fact {
+  addFact(
+    content: string,
+    opts: { source?: string; confidence?: number; scope?: string; sourceMessageId?: number; sourceKind?: string; sourceSessionId?: string } = {},
+  ): Fact {
     const id = randomUUID();
     const now = new Date().toISOString();
     this.db
-      .prepare("INSERT INTO facts (id, content, source, confidence, scope, valid_from) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(id, content, opts.source ?? "", opts.confidence ?? 0.5, opts.scope ?? "global", now);
+      .prepare(
+        "INSERT INTO facts (id, content, source, confidence, scope, valid_from, source_message_id, source_kind, source_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        id, content, opts.source ?? "", opts.confidence ?? 0.5, opts.scope ?? "global", now,
+        opts.sourceMessageId ?? null, opts.sourceKind ?? null, opts.sourceSessionId ?? null,
+      );
     this.db.prepare("INSERT INTO facts_fts (id, content) VALUES (?, ?)").run(id, content);
     return this.get(id)!;
   }
@@ -84,7 +104,11 @@ export class MemoryStore {
   }
 
   // 新事实不覆盖旧事实,而是结束旧事实的有效期(决策 D-004)。
-  supersede(id: string, newContent: string, opts: { source?: string; confidence?: number } = {}): Fact {
+  supersede(
+    id: string,
+    newContent: string,
+    opts: { source?: string; confidence?: number; sourceMessageId?: number; sourceKind?: string; sourceSessionId?: string } = {},
+  ): Fact {
     const now = new Date().toISOString();
     this.db.prepare("UPDATE facts SET valid_to = ? WHERE id = ? AND valid_to IS NULL").run(now, id);
     const old = this.get(id);
@@ -92,6 +116,9 @@ export class MemoryStore {
       source: opts.source ?? old?.source ?? "",
       confidence: opts.confidence ?? old?.confidence ?? 0.5,
       scope: old?.scope ?? "global",
+      ...(opts.sourceMessageId != null ? { sourceMessageId: opts.sourceMessageId } : {}),
+      ...(opts.sourceKind ? { sourceKind: opts.sourceKind } : {}),
+      ...(opts.sourceSessionId ? { sourceSessionId: opts.sourceSessionId } : {}),
     });
   }
 
@@ -125,17 +152,20 @@ export class MemoryStore {
     workspace?: string;
     action?: "add" | "supersede";
     targetId?: string;
+    sourceMessageId?: number;
+    sourceKind?: string;
+    sourceSessionId?: string;
   }): MemoryCandidate {
     const id = randomUUID();
     this.db
       .prepare(
-        `INSERT INTO candidates (id, content, reason, source, confidence, scope, session_id, mode, workspace, action, target_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO candidates (id, content, reason, source, confidence, scope, session_id, mode, workspace, action, target_id, created_at, source_message_id, source_kind, source_session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id, c.content, c.reason ?? "", c.source ?? "", c.confidence ?? 0.5, c.scope ?? "global",
         c.sessionId ?? null, c.mode ?? "chat", c.workspace ?? "", c.action ?? "add", c.targetId ?? null,
-        new Date().toISOString(),
+        new Date().toISOString(), c.sourceMessageId ?? null, c.sourceKind ?? null, c.sourceSessionId ?? null,
       );
     return this.getCandidate(id)!;
   }
@@ -156,10 +186,16 @@ export class MemoryStore {
     const c = this.getCandidate(id);
     if (!c) throw new Error(`candidate not found: ${id}`);
     if (c.status !== "pending") throw new Error(`candidate already ${c.status}`);
+    // L2:把候选上的出处传给事实,记忆页才能"查看出处"
+    const origin = {
+      ...(c.sourceMessageId != null ? { sourceMessageId: c.sourceMessageId } : {}),
+      ...(c.sourceKind ? { sourceKind: c.sourceKind } : {}),
+      ...(c.sourceSessionId ? { sourceSessionId: c.sourceSessionId } : {}),
+    };
     const fact =
       c.action === "supersede" && c.targetId
-        ? this.supersede(c.targetId, c.content, { source: c.source, confidence: c.confidence })
-        : this.addFact(c.content, { source: c.source, confidence: c.confidence, scope: c.scope });
+        ? this.supersede(c.targetId, c.content, { source: c.source, confidence: c.confidence, ...origin })
+        : this.addFact(c.content, { source: c.source, confidence: c.confidence, scope: c.scope, ...origin });
     this.db
       .prepare("UPDATE candidates SET status = 'confirmed', resolved_at = ? WHERE id = ?")
       .run(new Date().toISOString(), id);
@@ -183,6 +219,23 @@ export class MemoryStore {
   list(includeDeleted = false): Fact[] {
     const sql = `SELECT * FROM facts ${includeDeleted ? "" : "WHERE deleted_at IS NULL"} ORDER BY valid_from DESC`;
     return (this.db.prepare(sql).all() as FactRow[]).map(toFact);
+  }
+
+  // L2:按来源撤销(软删除)。返回撤销条数;硬删仍走单条的 forget。
+  revokeBySource(sourceKind: string): number {
+    const rows = this.db
+      .prepare("SELECT id FROM facts WHERE source_kind = ? AND deleted_at IS NULL")
+      .all(sourceKind) as Array<{ id: string }>;
+    if (!rows.length) return 0;
+    const ts = new Date().toISOString();
+    const upd = this.db.prepare("UPDATE facts SET deleted_at = ? WHERE id = ?");
+    const delFts = this.db.prepare("DELETE FROM facts_fts WHERE id = ?");
+    for (const r of rows) {
+      upd.run(ts, r.id);
+      delFts.run(r.id);
+    }
+    this.audit("memory.revoke", { sourceKind, count: rows.length });
+    return rows.length;
   }
 
   // 泛化提问兜底:无主题词时 FTS 召回为空,按时间返回最近的有效事实(如"我上次学到哪了")。

@@ -1,18 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { WorkStore, htmlToText } from "./docs.ts";
 import { listTool } from "./tools.ts";
+import { openDb } from "./db.ts";
 
 function setup() {
-  const db = new DatabaseSync(":memory:");
-  db.exec(`
-    CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file', source TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, workspace TEXT NOT NULL DEFAULT '', session_id TEXT, created_at TEXT NOT NULL);
-    CREATE TABLE todos (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', due TEXT, source TEXT NOT NULL DEFAULT '', workspace TEXT NOT NULL DEFAULT '', session_id TEXT, created_at TEXT NOT NULL, done_at TEXT);
-  `);
-  return new WorkStore(db);
+  return new WorkStore(openDb(":memory:"));
 }
 
 describe("htmlToText", () => {
@@ -27,11 +22,11 @@ describe("htmlToText", () => {
 
 describe("WorkStore 文档", () => {
   const ws = mkdtempSync(join(tmpdir(), "xiyun-work-"));
-  it("导入工作区文件并检索到来源片段", () => {
+  it("导入工作区文件并检索到来源片段", async () => {
     const store = setup();
     mkdirSync(join(ws, "req"), { recursive: true });
     writeFileSync(join(ws, "req", "spec.md"), "# 供应商需求\n交付截止日期为 2026-11-01,包含审计日志。");
-    const d = store.importFile(ws, "req/spec.md", "s1");
+    const d = await store.importFile(ws, "req/spec.md", "s1");
     expect(d.kind).toBe("file");
     expect(d.source).toBe("req/spec.md");
     const hits = store.searchDocs("审计日志", 3, ws);
@@ -39,16 +34,16 @@ describe("WorkStore 文档", () => {
     expect(hits[0].snippet).toContain("审计日志");
     expect(hits[0].source).toBe("req/spec.md");
   });
-  it("HTML 文件导入时做标签抽取", () => {
+  it("HTML 文件导入时做标签抽取", async () => {
     const store = setup();
     writeFileSync(join(ws, "page.html"), "<html><body><p>正文内容</p><script>x()</script></body></html>");
-    const d = store.importFile(ws, "page.html");
+    const d = await store.importFile(ws, "page.html");
     expect(d.content).toContain("正文内容");
     expect(d.content).not.toContain("<p>");
   });
-  it("越权路径被拒绝;粘贴导入记录来源", () => {
+  it("越权路径被拒绝;粘贴导入记录来源", async () => {
     const store = setup();
-    expect(() => store.importFile(ws, "../outside.md")).toThrow("outside workspace");
+    await expect(store.importFile(ws, "../outside.md")).rejects.toThrow("outside workspace");
     const d = store.importPaste("会议纪要", "会议结论:分两期交付", { workspace: ws });
     expect(d.kind).toBe("paste");
     expect(store.listDocs(ws).some((x) => x.title === "会议纪要")).toBe(true);
@@ -59,10 +54,10 @@ describe("WorkStore 文档", () => {
     store.removeDoc(d.id);
     expect(store.searchDocs("唯一关键词zzq", 3, ws)).toHaveLength(0);
   });
-  it("自然语言问句经 3 字滑窗兜底命中文档", () => {
+  it("自然语言问句经 3 字滑窗兜底命中文档", async () => {
     const store = setup();
     writeFileSync(join(ws, "plan.md"), "项目分两期交付,第一期包含审计日志与权限矩阵。");
-    store.importFile(ws, "plan.md");
+    await store.importFile(ws, "plan.md");
     // 整句不是原文子串,纯 LIKE 必不中;滑窗兜底应命中
     const hits = store.searchDocs("我们的审计日志什么时候交付?", 3, ws);
     expect(hits).toHaveLength(1);

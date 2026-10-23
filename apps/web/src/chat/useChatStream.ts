@@ -6,6 +6,9 @@ export interface UIMessage extends ChatMessage {
   streaming?: boolean;
   // 本地创建的气泡的稳定 key:回填落库 id 后 React key 不变,气泡不会重新挂载
   localKey?: string;
+  // L5:本轮由另一家模型接手 / 超预算降级(只在本轮气泡上展示,不落库)
+  fallback?: { from: string; to: string; reason: string };
+  downgraded?: { from: string; to: string; reason: string };
 }
 
 let localSeq = 0;
@@ -32,6 +35,12 @@ function applyEvent(blocks: ChatBlock[], ev: StreamEvent): ChatBlock[] {
   }
   if (ev.type === "block_end") {
     return blocks.map((b) => (b.id === ev.id ? ev.block : b));
+  }
+  // 流式输出只保留尾部 64KB,避免长命令把内存和渲染撑爆
+  if (ev.type === "tool_output") {
+    return blocks.map((b) =>
+      b.id === ev.id && b.kind === "tool" ? { ...b, output: `${b.output ?? ""}${ev.delta}`.slice(-64 * 1024) } : b,
+    );
   }
   return blocks;
 }
@@ -78,11 +87,16 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   let messageId: number | null = null;
   let model: string | null = null;
   let trim: UIMessage["trim"];
+  let fallback: UIMessage["fallback"];
+  let downgraded: UIMessage["downgraded"];
   for (const ev of queue) {
     if ("type" in ev) {
       if (ev.type === "meta" && ev.userMessageId != null) userId = ev.userMessageId;
       if (ev.type === "meta" && ev.model) model = ev.model;
       if (ev.type === "meta" && ev.trim) trim = ev.trim;
+      // L5:后到的 meta 覆盖先到的(回退后又降级时以最后一次为准)
+      if (ev.type === "meta" && ev.fallback) fallback = ev.fallback;
+      if (ev.type === "meta" && ev.downgraded) downgraded = ev.downgraded;
       if (ev.type === "cancelled") {
         if (ev.userMessageId != null) userId = ev.userMessageId;
         if (ev.messageId != null) messageId = ev.messageId;
@@ -97,6 +111,8 @@ export function applyStream(ms: UIMessage[], queue: StreamEvent[]): UIMessage[] 
   if (messageId != null && msg.id == null) msg = { ...msg, id: messageId };
   if (model && !msg.model) msg = { ...msg, model };
   if (trim && !msg.trim) msg = { ...msg, trim };
+  if (fallback && !msg.fallback) msg = { ...msg, fallback };
+  if (downgraded && !msg.downgraded) msg = { ...msg, downgraded };
   next[ai] = msg;
   if (userId != null) {
     for (let i = ai - 1; i >= 0; i--) {

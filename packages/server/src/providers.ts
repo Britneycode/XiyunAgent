@@ -3,9 +3,16 @@ import { join } from "node:path";
 import { withModel, type ProviderConfig } from "@xiyun/shared";
 import { createProvider, ModelRegistry, type ChatProvider } from "@xiyun/runtime";
 
+// L5:用量设置。日预算为 0 / 缺省表示不限制;currency 缺省 USD。
+export interface AppSettings {
+  dailyBudget?: number | null;
+  currency?: string;
+}
+
 interface ConfigFile {
   providers: ProviderConfig[];
   activeProviderId?: string;
+  settings?: AppSettings;
 }
 
 const MASK = "********";
@@ -97,5 +104,30 @@ export class ProviderStore {
     const r = new ModelRegistry();
     for (const c of this.data.providers) r.register(createProvider(c));
     return r;
+  }
+
+  // L5:用量设置(日预算 / 计价货币)
+  settings(): AppSettings {
+    return { dailyBudget: this.data.settings?.dailyBudget ?? null, currency: this.data.settings?.currency || "USD" };
+  }
+
+  updateSettings(patch: AppSettings): AppSettings {
+    const cur = this.data.settings ?? {};
+    const next: AppSettings = { ...cur };
+    if ("dailyBudget" in patch) {
+      const v = patch.dailyBudget;
+      // 负数与非法值视为不限制
+      next.dailyBudget = typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+    }
+    if ("currency" in patch && typeof patch.currency === "string" && patch.currency.trim())
+      next.currency = patch.currency.trim().toUpperCase().slice(0, 8);
+    this.data.settings = next;
+    this.save();
+    return this.settings();
+  }
+
+  // 全部已配置的 provider 原始配置(只读,供价格 / 降级计算)
+  configs(): ProviderConfig[] {
+    return this.data.providers;
   }
 }

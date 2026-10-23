@@ -1,13 +1,30 @@
-import type { AgentRole, AttachmentMeta, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, WorkDoc } from "@xiyun/shared";
+import type { AgentRole, AttachmentMeta, ChatBlock, ChatMessage, Fact, GitPreview, MemoryCandidate, MemoryJob, MemoryJobItem, ProviderConfig, SearchHit, SessionMeta, ShellInfo, ShellResult, SkillInfo, SubagentTask, TaskSchedule, TaskStatus, Todo, TokenUsage, UsageSummary, WorkDoc } from "@xiyun/shared";
+
+// L5:用量设置(与服务端 AppSettings 同口径)
+export interface AppSettings {
+  dailyBudget?: number | null;
+  currency?: string;
+}
 
 // /chat SSE 事件:typed 块事件 + 旧版 plain delta/error/done
 export type StreamEvent =
   | { type: "block"; id: string; block: { kind: "text" | "thinking" } | { kind: "tool"; name: string; status: string } }
   | { type: "block_delta"; id: string; delta: string }
   | { type: "block_end"; id: string; block: ChatBlock }
+  // 工具执行中的流式输出(bash 等);按 id 追加到对应块的 output,只保留尾部
+  | { type: "tool_output"; id: string; delta: string }
   | { type: "usage"; usage: TokenUsage } // 模型返回的真实用量,至多一次,在 done 之前
   // 首个事件:本轮 user 消息的落库 id、后台运行 id、所用模型;trim = 历史超出上下文预算时的裁剪情况(F4)
-  | { type: "meta"; userMessageId: number | null; runId?: string; model?: string | null; trim?: { dropped: number; summary: boolean } }
+  | {
+      type: "meta";
+      userMessageId: number | null;
+      runId?: string;
+      model?: string | null;
+      trim?: { dropped: number; summary: boolean };
+      // L5:回退到另一家模型 / 超预算降级,气泡上给出提示
+      fallback?: { from: string; to: string; reason: string };
+      downgraded?: { from: string; to: string; reason: string };
+    }
   | { type: "cancelled"; messageId: number | null; userMessageId: number | null } // 被停止:半截已落库(无内容时 messageId 为 null)
   | { type: "title"; title: string } // 新会话自动命名完成(模型起的标题)
   | { delta: string; id?: string }
@@ -60,10 +77,19 @@ export const api = {
   // 从 ChatGPT / Claude 导入(M1):body 为 conversations.json 原文
   externalPreview: (raw: string) =>
     req<ExternalPreview>("/admin/import/external/preview", { method: "POST", body: raw }),
-  externalImport: (raw: string) =>
-    req<{ ok: boolean; source: string; added: { sessions: number; messages: number }; skipped: { duplicate: number; empty: number } }>(
-      "/admin/import/external", { method: "POST", body: raw },
-    ),
+  externalImport: (raw: string, opts: { extract?: boolean } = {}) =>
+    req<{
+      ok: boolean; source: string; added: { sessions: number; messages: number }; skipped: { duplicate: number; empty: number };
+      job?: MemoryJob; jobError?: string;
+    }>(`/admin/import/external${opts.extract ? "?extract=1" : ""}`, { method: "POST", body: raw }),
+  // L2:批量记忆提取作业
+  memoryJobs: () => req<MemoryJob[]>("/memory/jobs"),
+  memoryJob: (id: string) => req<MemoryJob & { items: MemoryJobItem[] }>(`/memory/jobs/${id}`),
+  memoryJobAction: (id: string, action: "pause" | "resume" | "cancel") =>
+    req<MemoryJob>(`/memory/jobs/${id}/${action}`, { method: "POST", body: "{}" }),
+  // L2:按来源撤销(软删除)
+  revokeMemoryBySource: (sourceKind: string) =>
+    req<{ revoked: number }>("/memory/facts/revoke", { method: "POST", body: JSON.stringify({ sourceKind }) }),
   createSession: (body?: Partial<SessionMeta>) => req<SessionMeta>("/sessions", { method: "POST", body: JSON.stringify(body ?? {}) }),
   deleteSession: (id: string) => req(`/sessions/${id}`, { method: "DELETE" }),
   // F6:切换到包含 messageId 的分支(兄弟版本 / 搜索命中),返回切换后的消息列表
@@ -75,6 +101,8 @@ export const api = {
   branchSession: (sessionId: string, body: { messageId?: number; title?: string }) =>
     req<SessionMeta>(`/sessions/${sessionId}/branch`, { method: "POST", body: JSON.stringify(body) }),
   messages: (id: string) => req<ChatMessage[]>(`/sessions/${id}/messages`),
+  // L2:单个会话元信息(记忆页「查看出处」定位会话)
+  session: (id: string) => req<SessionMeta>(`/sessions/${id}`),
   // M7:消息全文搜索;archived=true 时连同已归档会话一起搜
   search: (q: string, opts: { mode?: string; archived?: boolean; limit?: number } = {}) => {
     const p = new URLSearchParams({ q });
@@ -112,8 +140,30 @@ export const api = {
     tasks: Array<{ role: AgentRole; prompt: string; title?: string; providerId?: string }>;
   }) => req<{ ids: string[] }>("/tasks", { method: "POST", body: JSON.stringify(b) }),
   cancelTask: (id: string) => req(`/tasks/${id}/cancel`, { method: "POST" }),
+  // L4:展开任务卡片时取完整 diff 与每步工具
+  taskDetail: (id: string) =>
+    req<{ branch: string | null; baseSha: string | null; patch: string; tools: Array<{ tool: string; status: string; at: string }> }>(
+      `/tasks/${id}/detail`,
+    ),
   retryTask: (id: string) => req(`/tasks/${id}/retry`, { method: "POST" }),
   resumeTask: (id: string, answer: string) => req(`/tasks/${id}/resume`, { method: "POST", body: JSON.stringify({ answer }) }),
+  // L4:隔离分支落地操作(都需前端二次确认后带 confirm:true)
+  mergeTask: (id: string) => req<{ ok: boolean; output: string }>(`/tasks/${id}/merge`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  pushTask: (id: string) => req<{ ok: boolean; output: string }>(`/tasks/${id}/push`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  createTaskPr: (id: string) =>
+    req<{ ok: boolean; url?: string; error?: string; compareUrl?: string }>(`/tasks/${id}/pr`, {
+      method: "POST", body: JSON.stringify({ confirm: true }),
+    }),
+  discardTask: (id: string) => req<{ ok: boolean }>(`/tasks/${id}/discard`, { method: "POST", body: JSON.stringify({ confirm: true }) }),
+  // L5:用量账本与设置
+  usage: (groupBy: "day" | "session" | "provider" | "model" = "day", range: { from?: string; to?: string } = {}) => {
+    const p = new URLSearchParams({ groupBy });
+    if (range.from) p.set("from", range.from);
+    if (range.to) p.set("to", range.to);
+    return req<UsageSummary>(`/usage?${p}`);
+  },
+  settings: () => req<AppSettings>("/settings"),
+  saveSettings: (b: AppSettings) => req<AppSettings>("/settings", { method: "PATCH", body: JSON.stringify(b) }),
   providerModels: (id: string) => req<{ models: string[] }>(`/providers/${id}/models`),
   probeProvider: (id: string) => req<{ ok: boolean; latencyMs: number; model: string; error?: string }>(`/providers/${id}/probe`, { method: "POST" }),
   // ---- 阶段 4:工具 ----
@@ -121,7 +171,53 @@ export const api = {
     req(`/sessions/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   shells: () => req<ShellInfo[]>("/tools/shells"),
   toolShell: (b: { workspace: string; command: string; shell?: string; confirmed?: boolean }) =>
-    req<ShellResult & { needsConfirm?: boolean }>("/tools/shell", { method: "POST", body: JSON.stringify(b) }),
+    req<ShellResult & { needsConfirm?: boolean; rule?: string; reason?: string }>("/tools/shell", { method: "POST", body: JSON.stringify(b) }),
+  toolShellStream,
+  // 工具确认(B1):awaiting 卡片上点「允许 / 始终允许 / 拒绝」
+  confirmTool: (runId: string, callId: string, decision: "allow" | "always" | "deny") =>
+    req<{ ok: boolean }>(`/runs/${runId}/confirm`, { method: "POST", body: JSON.stringify({ callId, decision }) }),
+  // L1:回退到某条消息(还原代码 / 回退对话)
+  rewind: (sessionId: string, b: { messageId: number; code?: boolean; chat?: boolean }) =>
+    req<{ ok: boolean; undoSha: string | null; text?: string; messages?: ChatMessage[] }>(`/sessions/${sessionId}/rewind`, {
+      method: "POST", body: JSON.stringify(b),
+    }),
+  rewindUndo: (sessionId: string, sha: string) =>
+    req<{ ok: boolean }>(`/sessions/${sessionId}/rewind/undo`, { method: "POST", body: JSON.stringify({ sha }) }),
+  checkpointDiff: (sessionId: string, from: string) =>
+    req<{ files: Array<{ status: string; path: string }>; patch: string }>(
+      `/checkpoints/diff?sessionId=${encodeURIComponent(sessionId)}&from=${encodeURIComponent(from)}`,
+    ),
+  // B3:MCP
+  mcpServers: (workspace: string) =>
+    req<{
+      servers: Array<{ name: string; status: string; tools: number; error?: string; stderr?: string }>;
+      tools: Array<{ server: string; name: string; description: string }>;
+      projectPending: boolean;
+      projectTrusted: boolean;
+    }>(`/mcp/servers?workspace=${encodeURIComponent(workspace)}`),
+  mcpConfig: (workspace: string) =>
+    req<{ user: { mcpServers: Record<string, unknown> }; project: { mcpServers: Record<string, unknown> } }>(
+      `/mcp/config?workspace=${encodeURIComponent(workspace)}`,
+    ),
+  saveMcpConfig: (user: { mcpServers: Record<string, unknown> }) =>
+    req<{ ok: boolean }>("/mcp/config", { method: "PUT", body: JSON.stringify({ user }) }),
+  restartMcp: (name: string, workspace: string) =>
+    req<{ ok: boolean }>(`/mcp/servers/${encodeURIComponent(name)}/restart?workspace=${encodeURIComponent(workspace)}`, { method: "POST" }),
+  trustMcp: (workspace: string, revoke = false) =>
+    req<{ ok: boolean; trusted: boolean }>("/mcp/trust", { method: "POST", body: JSON.stringify({ workspace, revoke }) }),
+  mcpImportPreview: () =>
+    req<{ available: boolean; path: string; servers: Array<{ name: string; conflict: boolean }> }>(
+      "/mcp/import/claude-desktop/preview", { method: "POST" },
+    ),
+  mcpImportApply: (names: string[]) =>
+    req<{ imported: number; skipped: number }>("/mcp/import/claude-desktop/apply", {
+      method: "POST", body: JSON.stringify({ names }),
+    }),
+  // 权限规则(F7)
+  permissions: (workspace: string) =>
+    req<{ allow: string[]; ask: string[]; deny: string[] }>(`/tools/permissions?workspace=${encodeURIComponent(workspace)}`),
+  allowRule: (workspace: string, rule: string) =>
+    req<{ ok: boolean }>("/tools/permissions/allow", { method: "POST", body: JSON.stringify({ workspace, rule }) }),
   gitStatus: (workspace: string) =>
     req<ShellResult>("/tools/git/status", { method: "POST", body: JSON.stringify({ workspace }) }),
   gitDiff: (workspace: string) =>
@@ -138,8 +234,24 @@ export const api = {
     req<{ content: string }>("/tools/read", { method: "POST", body: JSON.stringify({ workspace, path }) }),
   workDocs: (workspace?: string) => req<WorkDoc[]>(`/work/docs${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`),
   workDoc: (id: string) => req<WorkDoc>(`/work/docs/${id}`),
+  // F8:文档检索(命中块 + 高亮片段)
+  searchDocs: (q: string, workspace?: string) =>
+    req<WorkDocHit[]>(`/work/docs/search?q=${encodeURIComponent(q)}${workspace ? `&workspace=${encodeURIComponent(workspace)}` : ""}`),
   importDocFile: (b: { workspace: string; path: string; sessionId?: string }) =>
     req<WorkDoc>("/work/docs/import-file", { method: "POST", body: JSON.stringify(b) }),
+  // F8:拖入 PDF / Word(转成文本存为资料)
+  uploadDocFile: async (file: File, workspace: string, sessionId?: string): Promise<WorkDoc> => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    form.append("workspace", workspace);
+    if (sessionId) form.append("sessionId", sessionId);
+    const res = await fetch(`${base}/work/docs/upload`, { method: "POST", body: form });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(body?.error ?? `导入失败(${res.status})`);
+    }
+    return res.json() as Promise<WorkDoc>;
+  },
   importDocUrl: (b: { url: string; workspace?: string; sessionId?: string }) =>
     req<WorkDoc>("/work/docs/import-url", { method: "POST", body: JSON.stringify(b) }),
   pasteDoc: (b: { title: string; content: string; workspace?: string; sessionId?: string }) =>
@@ -280,7 +392,100 @@ export function subscribeRun(runId: string, onEvent: (ev: StreamEvent) => void, 
   return withResume(() => fetch(`${base}/runs/${runId}/events`, { signal: signal ?? null }), onEvent, signal, runId);
 }
 
+// L4:订阅单个子任务的事件流(服务端先回放历史,再实时推送)
+export interface TaskStreamEvent {
+  id: number;
+  type: string;
+  payload: unknown;
+  createdAt: string;
+}
+
+export async function subscribeTaskEvents(
+  taskId: string,
+  onEvent: (ev: TaskStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${base}/tasks/${taskId}/events`, { signal: signal ?? null });
+  if (!res.ok || !res.body) throw new Error(`任务事件流失败(${res.status})`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const blocks = buf.split("\n\n");
+    buf = blocks.pop() ?? "";
+    for (const b of blocks) {
+      const line = b.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line.slice(5).trim()) as TaskStreamEvent);
+      } catch {
+        // 坏 JSON 跳过
+      }
+    }
+  }
+}
+
 export const attachmentUrl = (id: string) => `${base}/attachments/${id}`;
+
+export type ShellStreamEvent =
+  | { type: "output"; stream: "stdout" | "stderr"; data: string }
+  | ({ type: "result" } & ShellResult)
+  | { type: "error"; error: string };
+
+// 流式执行命令(F7):逐块回调输出,最后一条是完整结果。signal 中断时服务端结束进程树
+export async function toolShellStream(
+  b: { workspace: string; command: string; shell?: string; confirmed?: boolean },
+  onEvent: (ev: ShellStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${base}/tools/shell/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(b),
+    signal: signal ?? null,
+  });
+  if (!res.ok) {
+    // 409 带 needsConfirm / rule,交给调用方弹确认条
+    const body = (await res.json().catch(() => ({}))) as { error?: string; needsConfirm?: boolean; rule?: string; reason?: string };
+    throw Object.assign(new Error(body.error ?? `请求失败(${res.status})`), body);
+  }
+  if (!res.body) throw new Error("empty response");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const blocks = buf.split("\n\n");
+    buf = blocks.pop() ?? "";
+    for (const blk of blocks) {
+      const line = blk.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line.slice(5).trim()) as ShellStreamEvent);
+      } catch {
+        // 坏 JSON 跳过
+      }
+    }
+  }
+}
+
+// F8:文档检索命中。snippet 中命中词用 \u0001 / \u0002 包住,由前端转成高亮
+export type WorkDocHit = {
+  docId: string;
+  title: string;
+  source: string;
+  kind: string;
+  workspace: string;
+  ord?: number;
+  start?: number;
+  end?: number;
+  snippet: string;
+};
 
 export type ExternalPreview = {
   source: "chatgpt" | "claude";
@@ -290,6 +495,9 @@ export type ExternalPreview = {
   empty: number;
   from: string | null;
   to: string | null;
+  // L2:可提取记忆的会话数与 token 估算
+  extractable?: number;
+  estimatedTokens?: number;
 };
 
 export async function streamChat(

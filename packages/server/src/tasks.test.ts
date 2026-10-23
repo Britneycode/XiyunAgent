@@ -43,10 +43,10 @@ function setup(providers: ChatProvider[]) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'chat', workspace TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS facts (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.5, scope TEXT NOT NULL DEFAULT 'global', valid_from TEXT NOT NULL, valid_to TEXT, deleted_at TEXT);
+    CREATE TABLE IF NOT EXISTS facts (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.5, scope TEXT NOT NULL DEFAULT 'global', valid_from TEXT NOT NULL, valid_to TEXT, deleted_at TEXT, source_message_id INTEGER, source_kind TEXT, source_session_id TEXT);
     CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS candidates (id TEXT PRIMARY KEY, content TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.5, scope TEXT NOT NULL DEFAULT 'global', session_id TEXT, mode TEXT NOT NULL DEFAULT 'chat', workspace TEXT NOT NULL DEFAULT '', action TEXT NOT NULL DEFAULT 'add', target_id TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, resolved_at TEXT);
-    CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, session_id TEXT, role TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, schedule TEXT NOT NULL DEFAULT 'run', status TEXT NOT NULL DEFAULT 'queued', provider_id TEXT, model TEXT, mode TEXT NOT NULL DEFAULT 'chat', workspace TEXT NOT NULL DEFAULT '', depends_on TEXT, result TEXT, error TEXT, question TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, duration_ms INTEGER);
+    CREATE TABLE IF NOT EXISTS candidates (id TEXT PRIMARY KEY, content TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.5, scope TEXT NOT NULL DEFAULT 'global', session_id TEXT, mode TEXT NOT NULL DEFAULT 'chat', workspace TEXT NOT NULL DEFAULT '', action TEXT NOT NULL DEFAULT 'add', target_id TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, resolved_at TEXT, source_message_id INTEGER, source_kind TEXT, source_session_id TEXT);
+    CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, group_id TEXT NOT NULL, session_id TEXT, role TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, schedule TEXT NOT NULL DEFAULT 'run', status TEXT NOT NULL DEFAULT 'queued', provider_id TEXT, model TEXT, mode TEXT NOT NULL DEFAULT 'chat', workspace TEXT NOT NULL DEFAULT '', depends_on TEXT, result TEXT, error TEXT, question TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, duration_ms INTEGER, worktree TEXT, branch TEXT, base_sha TEXT, steps INTEGER, usage TEXT, diff_stat TEXT);
     CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(id UNINDEXED, content, tokenize='trigram');
   `);
   const memory = new MemoryStore(db);
@@ -187,19 +187,29 @@ describe("TaskStore/Scheduler", () => {
     expect(store.get(t.id)!.question).toBeNull();
   });
 
-  it("code 模式:coder 用 ```tool 块调用 files.read,结果喂回后继续", async () => {
+  it("code 模式:coder 用原生工具调用 read_file,结果喂回后继续", async () => {
     const ws = mkdtempSync(join(tmpdir(), "xiyun-task-"));
     writeFileSync(join(ws, "x.txt"), "file-content-42");
     let calls = 0;
     const seen: string[][] = [];
     const p: ChatProvider = {
       config: { id: "p1", name: "p1", baseUrl: "", apiKey: "", model: "m1", roles: ["coder"] },
-      async *streamChat(messages: ChatMessage[]) {
+      async *streamChat(_messages: ChatMessage[]) {
+        throw new Error("应走 streamEvents");
+      },
+      async *streamEvents(messages: ChatMessage[]) {
         calls++;
         seen.push(messages.map((m) => m.content));
-        yield calls === 1
-          ? '先读文件\n```tool\n{"tool":"files.read","args":{"path":"x.txt"}}\n```'
-          : JSON_REPLY;
+        if (calls === 1) {
+          yield { type: "text", delta: "先读文件" } as const;
+          yield { type: "tool_start", id: "c1", index: 0, name: "read_file" } as const;
+          yield { type: "tool_args", id: "c1", delta: "{\"path\":\"x.txt\"}" } as const;
+          yield { type: "tool_end", id: "c1", args: "{\"path\":\"x.txt\"}" } as const;
+          yield { type: "finish", reason: "tool_calls" } as const;
+        } else {
+          yield { type: "text", delta: JSON_REPLY } as const;
+          yield { type: "finish", reason: "stop" } as const;
+        }
       },
     };
     const { store, scheduler } = setup([p]);
@@ -208,7 +218,7 @@ describe("TaskStore/Scheduler", () => {
     await waitStatus(store, t.id, ["completed"]);
     expect(calls).toBe(2);
     expect(seen[1].some((m) => m.includes("file-content-42"))).toBe(true); // 工具结果喂回
-    expect(seen[0][0]).toContain("```tool"); // system 含工具协议
+    expect(seen[0][0]).toContain("你可以使用工具"); // system 含工具使用说明
     rmSync(ws, { recursive: true, force: true });
   });
 
@@ -225,6 +235,6 @@ describe("TaskStore/Scheduler", () => {
     const t = store.create({ role: "coder", prompt: "任务", mode: "chat" });
     scheduler.run(t.id);
     await waitStatus(store, t.id, ["completed"]);
-    expect(systems[0]).not.toContain("```tool");
+    expect(systems[0]).not.toContain("你可以使用工具");
   });
 });

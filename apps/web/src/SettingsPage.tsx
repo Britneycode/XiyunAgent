@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ModelRole, ProviderConfig, ProviderProtocol, SkillInfo } from "@xiyun/shared";
 import { api, type ExternalPreview } from "./api.ts";
 import { readExportFile } from "./settings/zip.ts";
+import { McpSection } from "./settings/McpSection.tsx";
 import {
   applyPreset, emptyForm, formFrom, mergeModelIds, PRESETS, PROTOCOL_OPTIONS, toConfig, type ProviderForm,
 } from "./settings/providerForm.ts";
@@ -93,6 +94,45 @@ function AppearanceSection() {
   );
 }
 
+// L5:日预算与计价货币。超出日预算时 /chat 自动降级到更便宜的已定价模型。
+function BudgetSection() {
+  const [dailyBudget, setDailyBudget] = useState<number | "">("");
+  const [currency, setCurrency] = useState("USD");
+  const [note, setNote] = useState("");
+
+  useEffect(() => {
+    void api.settings().then((s) => {
+      setDailyBudget(s.dailyBudget ?? "");
+      setCurrency(s.currency ?? "USD");
+    }).catch(() => {});
+  }, []);
+
+  const save = async () => {
+    setNote("保存中…");
+    try {
+      const s = await api.saveSettings({ dailyBudget: dailyBudget === "" ? null : dailyBudget, currency });
+      setDailyBudget(s.dailyBudget ?? "");
+      setCurrency(s.currency ?? "USD");
+      setNote("已保存");
+    } catch (e) {
+      setNote(`保存失败:${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  return (
+    <div style={{ margin: "var(--pad) 0" }}>
+      <label>日预算(留空不限制) <input type="number" style={{ width: 235 }} min={0} step={0.01} value={dailyBudget}
+        onChange={(e) => setDailyBudget(e.target.value === "" ? "" : Number(e.target.value))} /></label>
+      <label>计价货币 <input style={{ width: 235 }} value={currency} onChange={(e) => setCurrency(e.target.value)} /></label>
+      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+        模型行填写价格后才会计价;超出日预算时优先降级到更便宜的已定价模型。用量明细在右侧「用量」面板。
+      </div>
+      <button onClick={() => void save()}>保存预算</button>
+      {note && <span style={{ fontSize: 12, color: "var(--muted)", marginLeft: 8 }}>{note}</span>}
+    </div>
+  );
+}
+
 function ProvidersSection() {
   const [providers, setProviders] = useState<Awaited<ReturnType<typeof api.providers>>>([]);
   const [form, setForm] = useState<ProviderForm>(emptyForm);
@@ -143,6 +183,7 @@ function ProvidersSection() {
   return (
     <>
       <h2>模型</h2>
+      <BudgetSection />
       {providers.map((p) => (
         <div key={p.id} style={{ marginBottom: 10 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -183,10 +224,10 @@ function ProvidersSection() {
       <label>默认模型 <input value={draft.model} placeholder="留空取模型列表第一项" onChange={(e) => setDraft({ ...draft, model: e.target.value })} /></label>
       <div style={{ margin: "var(--pad) 0" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-          <span style={{ flex: 1 }}>模型列表<span style={{ fontSize: 12, color: "var(--muted)" }}>(每行:模型 id [上下文如 128k] [vision/tools/json])</span></span>
+          <span style={{ flex: 1 }}>模型列表<span style={{ fontSize: 12, color: "var(--muted)" }}>(每行:模型 id [上下文如 128k] [vision/tools/json] [$输入/输出,或 $输入/缓存/输出,单位是每百万 tokens])</span></span>
           <button disabled={!saved} title={saved ? "用已保存的 Key 获取" : "先保存再获取"} onClick={() => void fetchModels()}>获取模型列表</button>
         </div>
-        <textarea style={area} value={form.modelsText} placeholder={"gpt-4o 128k vision tools\ngpt-4o-mini 128k"}
+        <textarea style={area} value={form.modelsText} placeholder={"gpt-4o 128k vision tools $2.5/10\ngpt-4o-mini 128k $0.15/0.6"}
           onChange={(e) => setForm((f) => ({ ...f, modelsText: e.target.value }))} />
         {fetchNote && <div style={{ fontSize: 12, color: "var(--muted)" }}>{fetchNote}</div>}
       </div>
@@ -457,11 +498,14 @@ function ExternalImport({ onChanged }: { onChanged?: () => void }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [pending, setPending] = useState<{ raw: string; preview: ExternalPreview; file: string } | null>(null);
+  // L2:导入后是否从这些对话里提取记忆
+  const [extract, setExtract] = useState(false);
   const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "?");
 
   const onFile = async (f: File) => {
     setMsg("");
     setPending(null);
+    setExtract(false);
     setBusy(true);
     try {
       const raw = await readExportFile(f);
@@ -476,10 +520,11 @@ function ExternalImport({ onChanged }: { onChanged?: () => void }) {
     if (!pending) return;
     setBusy(true);
     try {
-      const r = await api.externalImport(pending.raw);
+      const r = await api.externalImport(pending.raw, { extract });
       const skipped = [r.skipped.duplicate && `已导入过 ${r.skipped.duplicate} 个`, r.skipped.empty && `空对话 ${r.skipped.empty} 个`].filter(Boolean);
+      const job = r.job ? `;已开始提取记忆(作业 ${r.job.done}/${r.job.total}),可在「记忆」页看进度` : "";
       setMsg(
-        `导入完成:新增 ${r.added.sessions} 个会话、${r.added.messages} 条消息${skipped.length ? `;跳过${skipped.join("、")}` : ""}。导入的对话在 Chat 模式的会话列表里。`,
+        `导入完成:新增 ${r.added.sessions} 个会话、${r.added.messages} 条消息${skipped.length ? `;跳过${skipped.join("、")}` : ""}。导入的对话在 Chat 模式的会话列表里。${r.jobError ?? ""}${job}`,
       );
       setPending(null);
       onChanged?.();
@@ -511,6 +556,14 @@ function ExternalImport({ onChanged }: { onChanged?: () => void }) {
             {p.conversations > 0 && <span style={{ marginRight: 10 }}>时间 {day(p.from)} ~ {day(p.to)}</span>}
             {p.empty > 0 && <span>空对话 {p.empty} 个(跳过)</span>}
           </div>
+          {p.extractable ? (
+            <label className="reason" style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+              <input type="checkbox" checked={extract} onChange={(e) => setExtract(e.target.checked)} />
+              <span>导入后从这些对话中提取记忆(约 {p.extractable} 个会话、{p.estimatedTokens ?? 0} token,会调用记忆模型)</span>
+            </label>
+          ) : (
+            <div className="reason">这些对话都不足 2 轮,没有可提取的记忆。</div>
+          )}
           <div className="row">
             <button className="primary" disabled={busy || p.conversations - p.duplicate <= 0} onClick={() => void doImport()}>
               {busy ? "导入中…" : `导入 ${Math.max(0, p.conversations - p.duplicate)} 个对话`}
@@ -560,7 +613,7 @@ export function SettingsPage({ onDataChanged }: { onDataChanged?: () => void } =
         {cat === "权限与安全" && <SecuritySection />}
         {cat === "数据" && <DataSection onChanged={onDataChanged} />}
         {cat === "Skill" && <SkillsSection />}
-        {cat === "插件" && <PlaceholderSection title="插件" note="可执行插件沙箱(Extension API)尚未实现;Skill 已支持声明式权限,见「Skill」与「权限与安全」页。插件执行能力在有真实需求后交付。" />}
+        {cat === "插件" && <McpSection workspace="" />}
         {cat === "关于" && <PlaceholderSection title="关于" note="XiyunAgent · 本地优先的个人 Agent 工作台。" />}
       </div>
     </div>

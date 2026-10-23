@@ -35,8 +35,10 @@ export const PRESETS: Preset[] = [
 
 const CAPS = new Set(["stream", "tools", "vision", "json"]);
 const CTX_RE = /^(\d+(?:\.\d+)?)([km]?)$/i;
+// L5:价格标记 `$输入/输出`(每百万 tokens),可带缓存价 `$输入/缓存/输出`
+const PRICE_RE = /^\$(\d+(?:\.\d+)?)(?:\/(\d+(?:\.\d+)?))?(?:\/(\d+(?:\.\d+)?))?$/;
 
-// 每行一个模型:`模型id [上下文] [能力...]`,如 `gpt-4o 128k vision tools`;上下文 k=千、m=百万
+// 每行一个模型:`模型id [上下文] [能力...] [$输入/输出]`,如 `gpt-4o 128k vision tools $2.5/10`
 export function parseModelLines(text: string): ModelInfo[] {
   const out: ModelInfo[] = [];
   const seen = new Set<string>();
@@ -48,9 +50,16 @@ export function parseModelLines(text: string): ModelInfo[] {
     const caps: string[] = [];
     for (const t of rest) {
       const ctx = CTX_RE.exec(t);
+      const price = PRICE_RE.exec(t);
       if (ctx) {
         const unit = ctx[2]!.toLowerCase();
         m.contextLength = Math.round(Number(ctx[1]) * (unit === "k" ? 1000 : unit === "m" ? 1_000_000 : 1));
+      } else if (price) {
+        // 两段 = 输入/输出;三段 = 输入/缓存/输出
+        const a = Number(price[1]);
+        const b = price[2] === undefined ? undefined : Number(price[2]);
+        const c = price[3] === undefined ? undefined : Number(price[3]);
+        m.pricing = c !== undefined ? { input: a, cachedInput: b, output: c } : { input: a, output: b ?? 0 };
       } else if (CAPS.has(t.toLowerCase())) caps.push(t.toLowerCase());
     }
     if (caps.length) m.capabilities = caps;
@@ -59,11 +68,18 @@ export function parseModelLines(text: string): ModelInfo[] {
   return out;
 }
 
+const fmtPrice = (n: number) => String(Number(n.toFixed(6)));
+
 const fmtCtx = (n: number) => (n % 1_000_000 === 0 ? `${n / 1_000_000}m` : n % 1000 === 0 ? `${n / 1000}k` : String(n));
 
 export function formatModelLines(models: ModelInfo[] | undefined): string {
   return (models ?? [])
-    .map((m) => [m.id, m.contextLength ? fmtCtx(m.contextLength) : "", ...(m.capabilities ?? [])].filter(Boolean).join(" "))
+    .map((m) => {
+      const price = m.pricing
+        ? `$${m.pricing.cachedInput != null ? `${fmtPrice(m.pricing.input)}/${fmtPrice(m.pricing.cachedInput)}` : fmtPrice(m.pricing.input)}/${fmtPrice(m.pricing.output)}`
+        : "";
+      return [m.id, m.contextLength ? fmtCtx(m.contextLength) : "", ...(m.capabilities ?? []), price].filter(Boolean).join(" ");
+    })
     .join("\n");
 }
 

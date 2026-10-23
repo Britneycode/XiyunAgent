@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ClipboardPaste,
@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  Upload,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -19,6 +20,7 @@ import type { WorkDoc } from "@xiyun/shared";
 import type { Preview } from "../chat/blocks.tsx";
 import { PathLabel } from "../chat/DiffView.tsx";
 import { StreamingMarkdown } from "../chat/StreamingMarkdown.tsx";
+import { api, type WorkDocHit } from "../api.ts";
 import { cn } from "../ui/cn.ts";
 import { Notice, PanelEmpty, PanelHeader, SectionLabel, TextArea, TextInput } from "../ui/panel.tsx";
 import { Badge, Button, IconButton } from "../ui/primitives.tsx";
@@ -35,6 +37,8 @@ export interface DocsPanelProps {
   onOpenDoc: (id: string) => void;
   onCloseDoc: () => void;
   onDeleteDoc: () => void;
+  // F8:从检索结果打开文档时,标出命中的块
+  focus?: { start: number; end: number } | null;
   files: string[];
   mode: ImportMode;
   onMode: (m: ImportMode) => void;
@@ -52,6 +56,10 @@ export interface DocsPanelProps {
   onRefresh: () => void;
   onPreview?: (p: Preview) => void;
   onPreviewFile: (path: string) => void;
+  // F8:拖入 PDF / Word
+  onUploadFile: (file: File) => void;
+  // F8:检索命中块(带高亮片段),点击定位到块
+  onOpenDocAt?: (id: string, start: number, end: number) => void;
 }
 
 const KIND: Record<WorkDoc["kind"], { icon: LucideIcon; label: string }> = {
@@ -72,15 +80,25 @@ const FILE_LIMIT = 100;
 // Markdown 来源的资料按 Markdown 渲染,其余保持原文排版
 const isMarkdownDoc = (doc: WorkDoc) => /\.(md|markdown|mdx)$/i.test(doc.source) || /\.(md|markdown)$/i.test(doc.title);
 
-function DocDetail({ doc, busy, onBack, onDelete, onPreview }: {
+function DocDetail({ doc, busy, onBack, onDelete, onPreview, focus }: {
   doc: WorkDoc;
   busy: boolean;
   onBack: () => void;
   onDelete: () => void;
   onPreview?: (p: Preview) => void;
+  // F8:从检索结果跳进来时高亮命中的块
+  focus?: { start: number; end: number } | null;
 }) {
   const [confirming, setConfirming] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const kind = KIND[doc.kind];
+  // 定位到块:非 Markdown 文档直接在正文里标出命中范围
+  const marked = focus && !isMarkdownDoc(doc) ? markRange(doc.content, focus.start, focus.end) : null;
+  useEffect(() => {
+    if (!focus) return;
+    const el = bodyRef.current?.querySelector("[data-hit]");
+    el?.scrollIntoView({ block: "center" });
+  }, [focus, doc.id]);
   return (
     <div className="flex h-full min-h-0 flex-col">
       <PanelHeader
@@ -134,27 +152,88 @@ function DocDetail({ doc, busy, onBack, onDelete, onPreview }: {
             doc.source
           )}
         </p>
-        {isMarkdownDoc(doc) ? (
-          <div className="rounded-lg border border-line bg-canvas px-3.5 py-3 font-reading text-fg">
-            <StreamingMarkdown text={doc.content} className="text-ui" />
-          </div>
-        ) : (
-          <div className="whitespace-pre-wrap break-words rounded-lg border border-line bg-canvas p-3 font-reading text-ui leading-relaxed text-fg">
-            {doc.content}
-          </div>
-        )}
+        <div ref={bodyRef}>
+          {isMarkdownDoc(doc) ? (
+            <div className="rounded-lg border border-line bg-canvas px-3.5 py-3 font-reading text-fg">
+              <StreamingMarkdown text={doc.content} className="text-ui" />
+            </div>
+          ) : marked ? (
+            <div className="whitespace-pre-wrap break-words rounded-lg border border-line bg-canvas p-3 font-reading text-ui leading-relaxed text-fg">
+              {marked.before}
+              <mark data-hit className="rounded-sm bg-accent-soft px-px text-accent">
+                {marked.hit}
+              </mark>
+              {marked.after}
+            </div>
+          ) : (
+            <div className="whitespace-pre-wrap break-words rounded-lg border border-line bg-canvas p-3 font-reading text-ui leading-relaxed text-fg">
+              {doc.content}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-// Work 模式"资料"面板:导入(文件 / 网页 / 粘贴)、已导入资料、工作目录文件
+// 在正文里标出命中范围(越界时退化为整篇)
+function markRange(content: string, start: number, end: number) {
+  const s = Math.max(0, Math.min(start, content.length));
+  const e = Math.max(s, Math.min(end, content.length));
+  if (s === e) return { before: content, hit: "", after: "" };
+  return { before: content.slice(0, s), hit: content.slice(s, e), after: content.slice(e) };
+}
+
+// 服务端用 \u0001 / \u0002 包住命中词;这里拆成文本节点 + <mark>
+function Highlight({ text }: { text: string }) {
+  const parts = text.split(/(\u0001[^\u0002]*\u0002)/);
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.startsWith("\u0001") ? (
+          <mark key={i} className="rounded-sm bg-accent-soft px-px text-accent">
+            {p.slice(1, -1)}
+          </mark>
+        ) : (
+          <span key={i}>{p.replace(/[\u0001\u0002]/g, "")}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+// Work 模式"资料"面板:导入(文件 / 网页 / 粘贴)、检索、已导入资料、工作目录文件
 export function DocsPanel(props: DocsPanelProps) {
   const [filter, setFilter] = useState("");
+  // F8:拖入 PDF / Word
+  const [dragging, setDragging] = useState(false);
+  // F8:文档检索
+  const [q, setQ] = useState("");
+  const [hits, setHits] = useState<WorkDocHit[] | null>(null);
   const shownFiles = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    return (q ? props.files.filter((f) => f.toLowerCase().includes(q)) : props.files).slice(0, FILE_LIMIT);
+    const qq = filter.trim().toLowerCase();
+    return (qq ? props.files.filter((f) => f.toLowerCase().includes(qq)) : props.files).slice(0, FILE_LIMIT);
   }, [props.files, filter]);
+
+  // 检索:输入停顿 250ms 后查询
+  useEffect(() => {
+    const s = q.trim();
+    if (Array.from(s).length < 2) {
+      setHits(null);
+      return;
+    }
+    let stale = false;
+    const t = setTimeout(() => {
+      api
+        .searchDocs(s, props.workspace)
+        .then((r) => !stale && setHits(r))
+        .catch(() => !stale && setHits([]));
+    }, 250);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [q, props.workspace]);
 
   if (props.doc) {
     return (
@@ -164,6 +243,7 @@ export function DocsPanel(props: DocsPanelProps) {
         onBack={props.onCloseDoc}
         onDelete={props.onDeleteDoc}
         onPreview={props.onPreview}
+        focus={props.focus}
       />
     );
   }
@@ -209,6 +289,61 @@ export function DocsPanel(props: DocsPanelProps) {
             {props.error}
           </Notice>
         )}
+
+        {/* F8:拖入 PDF / Word */}
+        <section
+          onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) props.onUploadFile(f);
+          }}
+          className={cn(
+            "mx-3 mt-3 flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-xs transition-colors",
+            dragging ? "border-accent bg-accent-soft text-accent" : "border-line text-subtle",
+          )}
+        >
+          <Upload size={13} strokeWidth={1.75} aria-hidden />
+          <span>把 PDF 或 Word(.docx)拖到这里,自动转成文本存为资料</span>
+        </section>
+
+        {/* F8:资料检索 */}
+        <section className="flex flex-col gap-1 border-b border-line p-3">
+          <label className="flex h-7 items-center gap-1.5 rounded-md border border-line bg-elevated px-2 focus-within:border-accent/60">
+            <Search size={12} strokeWidth={1.75} className="text-subtle" aria-hidden />
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="检索资料内容"
+              aria-label="检索资料内容"
+              className="h-full min-w-0 flex-1 bg-transparent text-xs text-fg outline-none placeholder:text-subtle"
+            />
+          </label>
+          {hits && (
+            <ul className="-mx-1 mt-1 flex flex-col">
+              {hits.length === 0 && <li className="px-1.5 py-1 text-2xs text-subtle">没有匹配的资料</li>}
+              {hits.map((h, i) => (
+                <li key={`${h.docId}-${h.ord}-${i}`}>
+                  <button
+                    type="button"
+                    onClick={() => props.onOpenDocAt?.(h.docId, h.start ?? 0, h.end ?? 0)}
+                    className="flex w-full min-w-0 flex-col gap-0.5 rounded-md px-1.5 py-1.5 text-left transition-colors hover:bg-surface-2"
+                  >
+                    <span className="flex w-full items-center gap-1.5 text-2xs text-subtle">
+                      <span className="min-w-0 flex-1 truncate font-medium text-muted">{h.title}</span>
+                      {h.ord != null && <span className="shrink-0">§{h.ord + 1}</span>}
+                    </span>
+                    <span className="line-clamp-2 break-words text-xs leading-snug text-muted">
+                      <Highlight text={h.snippet} />
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
 
         {/* 导入 */}
         <section className="flex flex-col gap-2 border-b border-line p-3">

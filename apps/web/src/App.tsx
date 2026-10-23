@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Brain, Eye, GitCompareArrows, Library, ListTodo, LoaderCircle, Plus, SquareCheckBig, SquareTerminal, WifiOff } from "lucide-react";
+import { Brain, ChartColumn, Eye, GitCompareArrows, Library, ListTodo, LoaderCircle, Plus, SquareCheckBig, SquareTerminal, WifiOff } from "lucide-react";
 import type { MemoryCandidate, SearchHit, SessionMeta } from "@xiyun/shared";
 import { ChatPage } from "./ChatPage.tsx";
 import { SettingsPage } from "./SettingsPage.tsx";
 import { MemoryPage } from "./MemoryPage.tsx";
 import { TasksPanel } from "./TasksPanel.tsx";
+import { UsagePanel } from "./UsagePanel.tsx";
 import { CodePage } from "./CodePage.tsx";
 import { WorkPage } from "./WorkPage.tsx";
 import type { Preview } from "./chat/blocks.tsx";
@@ -272,6 +273,18 @@ export function App() {
     setSideFloating(false);
   };
 
+  // L2:记忆页「查看出处」:按会话 id 打开并定位到那条消息
+  const openSource = (sessionId: string, messageId?: number) => {
+    void api.session(sessionId).then((s) => {
+      if (!sessions.some((x) => x.id === s.id)) setExtra(s);
+      if (messageId != null) requestFocus(s.id, messageId);
+      setByMode((prev) => ({ ...prev, [s.mode as Mode]: s.id }));
+      if (s.mode !== mode) setMode(s.mode as Mode);
+      setPage("main");
+      setSideFloating(false);
+    }).catch(() => {});
+  };
+
   const visible = sessions.filter(
     (s) => s.mode === mode && (!query || s.title.toLowerCase().includes(query.toLowerCase())),
   );
@@ -332,7 +345,7 @@ export function App() {
     page === "settings" ? (
       legacy(<SettingsPage onDataChanged={() => void refresh()} />)
     ) : page === "memory" ? (
-      legacy(<MemoryPage onChanged={refreshCandidates} />)
+      legacy(<MemoryPage onChanged={refreshCandidates} onOpenSource={openSource} />)
     ) : !online ? (
       <EmptyState
         icon={WifiOff}
@@ -418,6 +431,16 @@ export function App() {
       badge: candidates.length,
       content: (
         <CandidateList candidates={candidates} onResolve={resolveCandidate} onOpenMemory={() => setPage("memory")} />
+      ),
+    },
+    {
+      id: "usage",
+      label: "用量",
+      icon: ChartColumn,
+      content: (
+        <div className="legacy">
+          <UsagePanel />
+        </div>
       ),
     },
   ];

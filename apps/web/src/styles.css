@@ -71,6 +71,47 @@ code, pre { font-family: var(--code-font, monospace); }
 .task .summary { margin: 6px 0 0; font-size: 12px; white-space: pre-wrap; }
 .task .risks { margin: 4px 0 0; font-size: 12px; color: var(--err); }
 .task .detail .row { display: flex; gap: 6px; margin-top: 6px; }
+/* L4:运行中的当前工具、隔离分支与落地结果 */
+.task .head .tool { font-size: 11px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
+.task .branch { margin: 6px 0 0; font-family: var(--code-font, monospace); font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task .diffstat { margin: 6px 0 0; font-size: 11px; color: var(--muted); white-space: pre-wrap; max-height: 120px; overflow: auto; }
+.task .note { margin: 6px 0 0; font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+/* L4:展开后的每步工具与完整 diff */
+.task .steptools { margin-top: 6px; font-size: 11px; }
+.task .steptools .label { color: var(--muted); }
+.task .steptools ol { margin: 4px 0 0; padding-left: 18px; max-height: 120px; overflow: auto; }
+.task .steptools li { color: var(--text); }
+.task .steptools li.bad { color: var(--err); }
+.task .steptools li em { margin-left: 6px; color: var(--muted); font-style: normal; }
+.task .patch { margin-top: 6px; font-size: 11px; }
+.task .patch summary { color: var(--muted); cursor: pointer; }
+.task .patch pre {
+  margin: 4px 0 0; padding: 6px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--code-bg); color: var(--code-text); font-family: var(--code-font, monospace);
+  white-space: pre; overflow: auto; max-height: 320px;
+}
+
+/* ===== 用量面板(L5) ===== */
+.usage-panel { display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+.usage-controls { display: flex; gap: 6px; }
+.usage-controls select { flex: 1; min-width: 0; }
+.usage-error { margin: 0; color: var(--err); font-size: 12px; }
+.usage-budget { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; font-size: 12px; color: var(--muted); }
+.usage-budget.over { color: var(--err); border-color: var(--err); }
+.usage-budget .meter { margin-top: 5px; height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
+.usage-budget .meter i { display: block; height: 100%; background: var(--accent); }
+.usage-budget.over .meter i { background: var(--err); }
+.usage-total { color: var(--muted); font-size: 12px; }
+.usage-bars { display: flex; align-items: flex-end; gap: 3px; height: 110px; padding: 6px 4px 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
+.usage-bars .bar { position: relative; flex: 1 0 10px; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; }
+.usage-bars .fill { width: 100%; background: var(--accent); border-radius: 2px 2px 0 0; opacity: 0.75; }
+.usage-bars .tick { position: absolute; bottom: -15px; font-size: 9px; color: var(--muted); white-space: nowrap; }
+.usage-bars { padding-bottom: 16px; }
+.usage-empty { margin: 0; color: var(--muted); font-size: 12px; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usage-table th { text-align: left; font-weight: 500; color: var(--muted); border-bottom: 1px solid var(--border); padding: 4px 6px; }
+.usage-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.usage-table td.k { max-width: 0; width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 
 /* ===== 设置页 ===== */

@@ -34,11 +34,15 @@ export function loadTree(db: DatabaseSync, sessionId: string): Tree {
   }
   const ids = rows.map((r) => r.id);
   let head = s?.head_id ?? null;
+  // head 指向已删除的消息:视为失效
   if (head != null && !parent.has(head)) head = null;
   const legacy = rows.every((r) => r.parent_id == null);
-  // head 失效但已经是树:回退到最新一条消息所在的分支
-  if (head == null && !legacy && ids.length) head = ids[ids.length - 1]!;
-  return { parent, children, head, linear: head == null && ids.length > 0, ids };
+  // 老库(全部没有 parent)按 id 顺序视为单链,head 为最后一条。
+  // 新库里 head 明确为 null 表示"空会话"(例如回退到第一条消息之前),不再自动兜底
+  if (head == null && legacy && ids.length) head = ids[ids.length - 1]!;
+  // linear 只表示"老库单链"(没有 parent 信息),用于让展示层省略 parentId / siblings。
+  // head 为 null 的新库是"空会话"(回退到第一条之前),路径为空,不能当单链处理
+  return { parent, children, head, linear: legacy && ids.length > 0, ids };
 }
 
 // 从 id 回溯到根,返回根 → id 的路径

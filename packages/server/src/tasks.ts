@@ -1,11 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
+import { pricingOf } from "@xiyun/shared";
 import type {
-  AgentRole, ChatMessage, SubagentTask, TaskResult, TaskSchedule, TaskStatus,
+  AgentRole, ChatMessage, ModelPricing, SubagentTask, TaskResult, TaskSchedule, TaskStatus, TokenUsage,
 } from "@xiyun/shared";
 import type { ChatProvider, ModelRegistry } from "@xiyun/runtime";
 import type { MemoryStore } from "./memory.ts";
-import { ROLE_TOOLS, runTool } from "./tools.ts";
+import { ALL_TOOLS, BlockBuilder, runAgent, toolsForMode, type AgentTool } from "./agent.ts";
+import {
+  commitAll, createWorktree, diffStat, hasChanges, isGitRepo, removeWorktree, type WorktreeInfo,
+} from "./worktree.ts";
 
 const now = () => new Date().toISOString();
 
@@ -29,32 +34,18 @@ const RESULT_INSTRUCTION = `完成后,在回复末尾输出一个 \`\`\`json 代
 memoryCandidates 只写确有价值、跨会话稳定的事实;没有就留空数组。
 若缺少完成任务所必需的信息,把 status 设为 "partial" 并加 "question":"需要用户补充的问题",任务会暂停等待用户回答。`;
 
-// 阶段 4:code 模式子智能体的工具调用协议(无 function calling 依赖,JSON 块约定)。
-const MAX_TOOL_CALLS = 5;
+// B1:子智能体走原生工具调用(runAgent),不再用 ```tool 文本协议。
+// 各角色可用工具:写角色有全部工具,只读角色去掉写类,辅导/记忆角色不给工具
+const ROLE_TOOL_NAMES: Record<string, string[] | "all"> = {
+  coder: "all",
+  tester: ["read_file", "list_files", "grep", "bash", "git_status", "git_diff"],
+  reviewer: ["read_file", "list_files", "grep", "bash", "git_status", "git_diff"],
+  researcher: ["read_file", "list_files", "grep", "bash", "git_status", "git_diff"],
+  tutor: [],
+  memory: [],
+};
 
-const TOOL_INSTRUCTION = `你可以调用工具完成工作。每次只调用一个,格式:
-\`\`\`tool
-{"tool":"<工具名>","args":{...}}
-\`\`\`
-工具结果会以用户消息返回,可继续调用下一个工具;全部完成后输出最终回复和 \`\`\`json 结果块。
-- files.list {"path":"相对目录,默认 ."} 列出工作区文件
-- files.read {"path":"相对路径"} 读取工作区文件
-- files.write {"path":"相对路径","content":"完整内容"} 写文件(仅 coder)
-- shell.exec {"command":"只读命令"} 执行命令(需要确认的命令会被拒绝)
-- git.status / git.diff 查看仓库状态与未提交改动
-工作区外的路径和危险命令会被直接拒绝。`;
-
-function parseToolCall(text: string): { tool: string; args: Record<string, unknown> } | null {
-  const m = text.match(/```tool\s*([\s\S]*?)```/);
-  if (!m) return null;
-  try {
-    const o = JSON.parse(m[1]) as { tool?: unknown; args?: unknown };
-    if (typeof o.tool !== "string" || !o.tool) return null;
-    return { tool: o.tool, args: typeof o.args === "object" && o.args !== null ? (o.args as Record<string, unknown>) : {} };
-  } catch {
-    return null;
-  }
-}
+const SUBTASK_MAX_STEPS = 12;
 
 function parseResult(raw: string): TaskResult {
   const m = raw.match(/```json\s*([\s\S]*?)```/);
@@ -89,6 +80,8 @@ interface TaskRow {
   mode: string; workspace: string; depends_on: string | null; result: string | null; error: string | null;
   question: string | null;
   created_at: string; started_at: string | null; finished_at: string | null; duration_ms: number | null;
+  worktree: string | null; branch: string | null; base_sha: string | null;
+  steps: number | null; usage: string | null; diff_stat: string | null;
 }
 
 function toTask(r: TaskRow): SubagentTask {
@@ -99,6 +92,9 @@ function toTask(r: TaskRow): SubagentTask {
     dependsOn: r.depends_on, result: r.result ? (JSON.parse(r.result) as TaskResult) : null,
     error: r.error, question: r.question ?? null, createdAt: r.created_at, startedAt: r.started_at, finishedAt: r.finished_at,
     durationMs: r.duration_ms,
+    worktree: r.worktree ?? null, branch: r.branch ?? null, baseSha: r.base_sha ?? null,
+    steps: r.steps ?? null, usage: r.usage ? (JSON.parse(r.usage) as TokenUsage) : null,
+    diffStat: r.diff_stat ?? null,
   };
 }
 
@@ -162,10 +158,71 @@ export class TaskStore {
     );
   }
 
+  // L4:补写隔离工作区与运行指标(只写传入的字段)
+  patch(id: string, p: {
+    worktree?: string | null; branch?: string | null; baseSha?: string | null;
+    steps?: number | null; usage?: TokenUsage | null; diffStat?: string | null;
+  }): void {
+    const sets: string[] = [];
+    const vals: Array<string | number | null> = [];
+    const put = (col: string, v: string | number | null) => {
+      sets.push(`${col} = ?`);
+      vals.push(v);
+    };
+    if (p.worktree !== undefined) put("worktree", p.worktree);
+    if (p.branch !== undefined) put("branch", p.branch);
+    if (p.baseSha !== undefined) put("base_sha", p.baseSha);
+    if (p.steps !== undefined) put("steps", p.steps);
+    if (p.usage !== undefined) put("usage", p.usage ? JSON.stringify(p.usage) : null);
+    if (p.diffStat !== undefined) put("diff_stat", p.diffStat);
+    if (!sets.length) return;
+    vals.push(id);
+    this.db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
+  }
+
   // Server 重启恢复:queued/running 的任务重置为 queued,由 Scheduler 重新拉起。
   recoverInterrupted(): number {
     const r = this.db.prepare("UPDATE tasks SET status = 'queued' WHERE status IN ('queued', 'running')").run();
     return Number(r.changes);
+  }
+}
+
+// L4:任务事件总线。前端订阅单个任务的实时进度(每步工具、状态变化、隔离分支就绪)。
+export interface TaskEvent {
+  id: number; // events 表自增 id(前端据此去重)
+  type: string;
+  payload: unknown;
+  createdAt: string;
+}
+
+export class TaskEventBus {
+  private listeners = new Map<string, Set<(e: TaskEvent) => void>>();
+
+  // 发布任务事件
+  publish(taskId: string, e: TaskEvent): void {
+    const set = this.listeners.get(taskId);
+    if (!set) return;
+    for (const fn of [...set]) {
+      try {
+        fn(e);
+      } catch {
+        // 单个订阅者异常不影响其他订阅者
+      }
+    }
+  }
+
+  // 订阅某个任务的事件;返回取消订阅函数
+  subscribe(taskId: string, fn: (e: TaskEvent) => void): () => void {
+    let set = this.listeners.get(taskId);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(taskId, set);
+    }
+    set.add(fn);
+    return () => {
+      set!.delete(fn);
+      if (!set!.size) this.listeners.delete(taskId);
+    };
   }
 }
 
@@ -175,6 +232,11 @@ export interface SchedulerDeps {
   registry: () => ModelRegistry; // 每次执行时取最新注册表(配置可能已改)
   onEvent?: (type: string, payload: unknown) => void;
   skillsFor?: (mode: string, role: string, query?: string) => string; // 阶段 6:启用 Skill 注入;query 用于渐进注入选相关 Skill
+  // L5:子任务用量记入成本账本(按 provider 配置里的价格计算)
+  usage?: (entry: {
+    sessionId?: string | null; taskId?: string | null; providerId?: string | null;
+    model?: string | null; usage: TokenUsage | null; pricing?: ModelPricing;
+  }) => void;
 }
 
 export class Scheduler {
@@ -198,29 +260,94 @@ export class Scheduler {
     return chain.length > 0 ? { chain } : { chain: [], error: `角色 ${task.role} 未绑定模型,且不允许自动回退` };
   }
 
-  // 工具循环:模型输出 ```tool 块则执行并把结果喂回,最多 MAX_TOOL_CALLS 轮。
-  // 子智能体没有确认通道,需要确认/危险命令会被工具层拒绝并以错误文本返回给模型。
+  // 子智能体走 runAgent:无确认通道,写操作由 policy 钩子按角色决定。
+  // coder 的写操作直接放行(等价于原来的 files.write);其余角色的 bash 需要确认时一律拒绝。
   private async converse(
     provider: ChatProvider,
     messages: ChatMessage[],
     signal: AbortSignal,
-    tools: string[],
+    tools: AgentTool[],
     workspace: string,
-  ): Promise<string> {
-    for (let i = 0; ; i++) {
+    taskId: string,
+  ): Promise<{ text: string; usage: TokenUsage | null; steps: number }> {
+    if (!tools.length) {
       let full = "";
       for await (const delta of provider.streamChat(messages, { signal })) full += delta;
-      const call = i < MAX_TOOL_CALLS && tools.length > 0 ? parseToolCall(full) : null;
-      if (!call || !tools.includes(call.tool)) return full;
-      let out: string;
-      try {
-        out = await runTool(call.tool, call.args, { workspace });
-      } catch (e) {
-        out = `工具调用失败:${e instanceof Error ? e.message : String(e)}`;
+      return { text: full, usage: null, steps: 1 };
+    }
+    if (!provider.streamEvents) {
+      // Provider 不支持原生工具调用时退回纯文本
+      let full = "";
+      for await (const delta of provider.streamChat(messages, { signal })) full += delta;
+      return { text: full, usage: null, steps: 1 };
+    }
+    const builder = new BlockBuilder(() => {});
+    const result = await runAgent({
+      provider,
+      messages,
+      tools,
+      workspace,
+      signal,
+      builder,
+      maxSteps: SUBTASK_MAX_STEPS,
+      policy: (req) => {
+        // coder 的 Edit / Write 放行;bash 与只读角色的写操作一律拒绝
+        if (req.name === "edit_file" || req.name === "write_file") return "allow";
+        return "deny";
+      },
+      onToolEnd: (info) =>
+        this.deps.onEvent?.("task.tool", { taskId, tool: info.name, workspace, status: info.status }),
+    });
+    return { text: result.finalText, usage: result.usage, steps: result.steps };
+  }
+
+  // L4:能否给这个任务开隔离 worktree。
+  // 只对「并行组 + code 模式 + 写角色 + 工作区是 git 仓库」生效:
+  // 这类任务原本要在同一工作区串行,隔离后可以真正并发,各改各的文件。
+  private async canIsolate(task: SubagentTask): Promise<boolean> {
+    if (task.schedule !== "parallel") return false;
+    if (task.mode !== "code") return false;
+    if (READONLY_ROLES.has(task.role)) return false;
+    if (!task.workspace) return false;
+    return isGitRepo(task.workspace);
+  }
+
+  // 复用任务已有的 worktree(waiting_for_user 恢复时继续用同一个),否则新建
+  private async prepareWorktree(task: SubagentTask): Promise<WorktreeInfo> {
+    if (task.worktree && task.branch && task.baseSha && existsSync(task.worktree))
+      return { path: task.worktree, branch: task.branch, baseSha: task.baseSha, root: task.workspace };
+    return createWorktree(task.workspace, task.id);
+  }
+
+  // L4:任务收尾。有改动就把改动提交到隔离分支并记下变更统计(等用户确认后再合并 / 推送);
+  // 失败、取消或没有改动时把 worktree 与分支一并清理掉。
+  private async finalizeWorktree(
+    taskId: string,
+    outcome: "ok" | "failed" | "waiting" | "cancelled",
+    wt: WorktreeInfo | null,
+  ): Promise<void> {
+    if (!wt) return;
+    const store = this.deps.store;
+    const task = store.get(taskId);
+    try {
+      if (outcome === "ok") {
+        if (await hasChanges(wt.path)) {
+          await commitAll(wt.path, `子任务 ${task?.role ?? ""}:${task?.title ?? taskId}`);
+          const stat = await diffStat(wt.root, wt.baseSha, wt.branch);
+          store.patch(taskId, { diffStat: stat });
+          this.deps.onEvent?.("task.changed", { taskId, branch: wt.branch, diffStat: stat });
+          return;
+        }
       }
-      this.deps.onEvent?.("task.tool", { tool: call.tool, workspace });
-      messages.push({ role: "assistant", content: full });
-      messages.push({ role: "user", content: `[工具 ${call.tool} 结果]\n${out.slice(0, 8000)}` });
+      if (outcome !== "waiting") {
+        await removeWorktree(wt.root, wt.path, wt.branch);
+        store.patch(taskId, { worktree: null, branch: null, diffStat: null });
+      }
+    } catch (e) {
+      // 清理失败不改变任务结果,只记事件
+      this.deps.onEvent?.("task.worktree_cleanup_failed", {
+        taskId, error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 
@@ -236,18 +363,37 @@ export class Scheduler {
       return;
     }
 
+    // L4:能隔离的任务先开 worktree,子智能体在隔离目录里改文件,改动落在分支上,不碰用户工作区
+    let wt: WorktreeInfo | null = null;
+    if (await this.canIsolate(task)) {
+      try {
+        wt = await this.prepareWorktree(task);
+        store.patch(taskId, { worktree: wt.path, branch: wt.branch, baseSha: wt.baseSha });
+        this.deps.onEvent?.("task.worktree", { taskId, branch: wt.branch, worktree: wt.path });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        store.setStatus(taskId, "failed", { error: `创建隔离工作区失败:${msg}` });
+        this.deps.onEvent?.("task.failed", { taskId, error: msg });
+        return;
+      }
+    }
+    const agentWorkspace = wt?.path ?? task.workspace;
+
     // 子智能体只读筛选后的模式/工作区记忆,不能直接写长期记忆。
     const memories = memory
       .search(task.prompt, 5, [task.mode, task.workspace])
       .map((f) => `- ${f.content}`);
-    // code 模式且角色有工具时,注入工具协议(阶段 4)。
-    const roleTools = task.mode === "code" ? (ROLE_TOOLS[task.role] ?? []) : [];
+    // code 模式且角色有工具时下发工具定义
+    const wanted = task.mode === "code" ? (ROLE_TOOL_NAMES[task.role] ?? []) : [];
+    const roleTools =
+      wanted === "all" ? toolsForMode("code") : ALL_TOOLS.filter((t) => wanted.includes(t.def.name));
     const skillsText = this.deps.skillsFor?.(task.mode, task.role, task.prompt) ?? "";
     const system = [
       ROLE_PRESETS[task.role],
       skillsText && `# 已启用 Skill\n${skillsText}`,
-      task.mode === "code" && `工作区:${task.workspace}(所有文件路径相对于该目录)`,
-      roleTools.length > 0 && TOOL_INSTRUCTION,
+      task.mode === "code" && `工作区:${agentWorkspace}(所有文件路径相对于该目录)`,
+      roleTools.length > 0 &&
+        "你可以使用工具读取代码、执行命令和修改文件;完成后输出最终回复和 ```json 结果块。写操作以外的命令可能需要确认,无法确认时会返回拒绝。",
       memories.length && `# 相关记忆\n${memories.join("\n")}`,
       priorSummary && `# 上游任务结果摘要\n${priorSummary}`,
       extraContext && `# 用户补充\n${extraContext}`,
@@ -260,13 +406,25 @@ export class Scheduler {
     ];
 
     let lastError: string | null = null;
+    let outcome: "ok" | "failed" | "waiting" | "cancelled" = "failed";
+    // 终态状态在收尾之后才写:隔离任务要先完成自动提交与变更统计,
+    // 否则外部看到「已完成」时分支上还没有改动,合并会变成空合并。
+    let finalResult: TaskResult | null = null;
+    let finalQuestion: string | null = null;
     for (const provider of chain) {
       const controller = new AbortController();
       this.controllers.set(taskId, controller);
       store.setStatus(taskId, "running", { model: provider.config.model });
       try {
-        const full = await this.converse(provider, messages, controller.signal, roleTools, task.workspace);
-        const result = parseResult(full);
+        const conv = await this.converse(
+          provider, messages, controller.signal, roleTools, agentWorkspace, taskId,
+        );
+        store.patch(taskId, { steps: conv.steps, usage: conv.usage });
+        this.deps.usage?.({
+          sessionId: task.sessionId, taskId, providerId: provider.config.id,
+          model: provider.config.model, usage: conv.usage, pricing: pricingOf(provider.config),
+        });
+        const result = parseResult(conv.text);
         // 子智能体的记忆产出只进候选区,等待用户确认。
         for (const c of result.memoryCandidates) {
           memory.addCandidate({
@@ -276,15 +434,19 @@ export class Scheduler {
           });
         }
         if (result.question) {
-          store.setStatus(taskId, "waiting_for_user", { result, question: result.question });
-          this.deps.onEvent?.("task.waiting", { taskId, question: result.question });
+          finalResult = result;
+          finalQuestion = result.question;
+          outcome = "waiting";
         } else {
-          store.setStatus(taskId, "completed", { result });
-          this.deps.onEvent?.("task.completed", { taskId, status: result.status });
+          finalResult = result;
+          outcome = "ok";
         }
-        return;
+        break;
       } catch (e) {
-        if (controller.signal.aborted) return; // cancel 已写状态
+        if (controller.signal.aborted) {
+          outcome = "cancelled"; // cancel 已写状态
+          break;
+        }
         lastError = e instanceof Error ? e.message : String(e);
         this.deps.onEvent?.("task.provider_failed", { taskId, model: provider.config.model, error: lastError });
         // 链内还有已授权模型则继续回退
@@ -292,8 +454,23 @@ export class Scheduler {
         this.controllers.delete(taskId);
       }
     }
-    store.setStatus(taskId, "failed", { error: lastError ?? "无可用模型" });
-    this.deps.onEvent?.("task.failed", { taskId, error: lastError });
+
+    await this.finalizeWorktree(taskId, outcome, wt);
+
+    if (outcome === "ok") {
+      store.setStatus(taskId, "completed", { result: finalResult ?? undefined });
+      this.deps.onEvent?.("task.completed", { taskId, status: finalResult?.status });
+    } else if (outcome === "waiting") {
+      store.setStatus(taskId, "waiting_for_user", {
+        result: finalResult ?? undefined,
+        question: finalQuestion,
+      });
+      this.deps.onEvent?.("task.waiting", { taskId, question: finalQuestion });
+    }
+    if (outcome === "failed") {
+      store.setStatus(taskId, "failed", { error: lastError ?? "无可用模型" });
+      this.deps.onEvent?.("task.failed", { taskId, error: lastError });
+    }
   }
 
   // 单个任务
@@ -302,15 +479,26 @@ export class Scheduler {
   }
 
   // 并行组:只读角色并行;写角色(coder/tester)同工作区串行接入既有链。
+  // L4:能开隔离 worktree 的写任务改在各自 worktree 里跑,互不干扰,可真正并发。
   parallel(taskIds: string[]): void {
-    for (const id of taskIds) {
-      const task = this.deps.store.get(id);
-      if (!task) continue;
-      if (READONLY_ROLES.has(task.role)) {
-        void this.execute(id);
+    void this.runParallel(taskIds);
+  }
+
+  private async runParallel(taskIds: string[]): Promise<void> {
+    const tasks = taskIds
+      .map((id) => this.deps.store.get(id))
+      .filter((t): t is SubagentTask => !!t);
+    // 先算清哪些任务能开隔离 worktree(要跑 git 命令),再决定并发策略
+    const isolated = await Promise.all(tasks.map((t) => this.canIsolate(t)));
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i];
+      if (isolated[i]) {
+        void this.execute(task.id); // 各自 worktree,互不干扰,直接并发
+      } else if (READONLY_ROLES.has(task.role)) {
+        void this.execute(task.id);
       } else {
         const prev = this.runningByWorkspace.get(task.workspace) ?? Promise.resolve();
-        const next = prev.then(() => this.execute(id));
+        const next = prev.then(() => this.execute(task.id));
         this.runningByWorkspace.set(task.workspace, next.catch(() => {}));
         void next;
       }

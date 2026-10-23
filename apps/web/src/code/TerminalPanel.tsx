@@ -19,10 +19,14 @@ export interface TerminalPanelProps {
   cmd: string;
   onCmd: (v: string) => void;
   running: boolean;
-  pending: { command: string } | null;
+  pending: { command: string; rule?: string; reason?: string } | null;
   onRun: () => void;
   onConfirm: () => void;
+  // 本项目始终允许:先写入规则再执行
+  onAlwaysAllow?: () => void;
   onCancelPending: () => void;
+  // 正在执行的命令的实时输出(F7)
+  liveOutput?: string;
   runs: TerminalRun[];
   onClear: () => void;
 }
@@ -141,9 +145,18 @@ export function TerminalPanel(props: TerminalPanelProps) {
           <RunCard key={r.id} run={r} />
         ))}
         {running && (
-          <div className="flex h-8 items-center gap-2 px-1 font-mono text-xs text-muted" role="status">
-            <LoaderCircle size={13} strokeWidth={2} className="animate-spin text-accent" aria-hidden />
-            <span className="truncate">正在执行 {props.cmd || pending?.command}</span>
+          <div className="overflow-hidden rounded-lg border border-line bg-code">
+            <div className="flex h-8 items-center gap-2 border-b border-line bg-surface/60 px-3 font-mono text-xs text-muted" role="status">
+              <LoaderCircle size={13} strokeWidth={2} className="animate-spin shrink-0 text-accent" aria-hidden />
+              <span className="min-w-0 flex-1 truncate">正在执行 {props.cmd || pending?.command}</span>
+            </div>
+            {props.liveOutput ? (
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-xs leading-relaxed text-code-fg">
+                {props.liveOutput}
+              </pre>
+            ) : (
+              <p className="px-3 py-1.5 font-mono text-2xs text-subtle">(等待输出…)</p>
+            )}
           </div>
         )}
         {pending && (
@@ -155,14 +168,29 @@ export function TerminalPanel(props: TerminalPanelProps) {
                   <ShieldAlert size={12} strokeWidth={1.75} />
                   确认执行
                 </Button>
+                {props.onAlwaysAllow && props.pending?.rule && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={props.onAlwaysAllow}
+                    title={`写入规则:${props.pending.rule}`}
+                  >
+                    本项目始终允许
+                  </Button>
+                )}
                 <Button size="xs" variant="ghost" onClick={props.onCancelPending}>
                   取消
                 </Button>
               </>
             }
           >
-            <p>命令需要确认:</p>
+            <p>命令需要确认{pending.reason ? `:${pending.reason}` : ":"}</p>
             <code className="mt-0.5 block break-all font-mono text-fg">{pending.command}</code>
+            {pending.rule && (
+              <p className="mt-1 break-all font-mono text-2xs text-subtle">
+                始终允许将写入:<span className="text-fg">{pending.rule}</span>
+              </p>
+            )}
           </Notice>
         )}
       </div>

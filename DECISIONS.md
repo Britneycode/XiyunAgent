@@ -106,3 +106,81 @@ Skill:目录或 ZIP 只有 `SKILL.md` 时,从 frontmatter 的 name / description
 
 外部导入:前端解开官方导出 ZIP(`settings/zip.ts`,只读中央目录,支持 stored / deflate,用浏览器自带 `DecompressionStream`,不支持 ZIP64,此时提示先解压),取层级最浅的 `conversations.json` 原文发给 `POST /admin/import/external/preview`(返回来源、对话数、消息数、重复数、空对话数、时间范围)与 `POST /admin/import/external`(`external.ts`)。按结构识别来源:每项有 `mapping` 是 ChatGPT,有 `chat_messages` 是 Claude,否则 400"无法识别的导出文件"。ChatGPT:mapping 本身是树,只保留 author 为 user / assistant、recipient 为 all、未标记隐藏、content_type 为 text / multimodal_text 的节点,图片部分记为"[图片]";被跳过的节点(系统提示、自定义指令、工具调用与结果、思考)的子节点接到最近的可见祖先上;同角色且是唯一子节点的连续消息合并(一次回复中间夹工具调用时会被拆成多条);`current_node` 映射为 head。Claude:有 `parent_message_uuid` 时按它成树(根哨兵 uuid 视为无父),否则按顺序成单链;sender human / assistant 对应 user / assistant;正文取 content 里的 text 块(跳过 thinking / tool_use),没有则用 text;附件抽取的文本按"[附件:文件名]"并入(单个 2 万字截断),上传的文件记为"[文件:文件名]";`current_leaf_message_uuid` 映射为 head。每个有内容的对话成为一个 Chat 会话(标题、创建时间沿用原对话,更新时间取原对话与最后一条消息的较晚者),v12 迁移给 sessions 加 `external_source` / `external_id` 并建部分唯一索引,同一来源同一对话重复导入直接跳过;整批在一个事务里,失败回滚。导入的消息走已有触发器进入全文索引,不提取记忆(避免一次导入大量历史时消耗模型调用)。取舍:不导入原图与 Claude 的项目 / 知识库;时间戳统一转成 ISO;请求体就是 conversations.json 原文,很大的导出(数百 MB)会占用相应内存,暂不做流式解析。
 
+
+## D-024:Agent 工具循环、权限规则与终端流式输出(2026-10-22)
+
+工具循环:`packages/server/src/agent.ts` 定义 `AgentTool { def; perm; run }`,内置 read_file / list_files / grep / edit_file / write_file / bash / git_status / git_diff 八个工具,按会话模式下发——code 全部,work 只读五项,chat 不给。下发条件从旧的 `XIYUN_EXPOSE_TOOLS=1` 门控改为:模式为 code / work、会话有工作区、Provider 有 `streamEvents`、capabilities 未声明或含 tools、且 `XIYUN_AGENT !== "0"`(保留一个整体关闭开关用于排错)。`runAgent` 逐轮调用 `provider.streamEvents`,收到工具调用后先把 assistant 消息(含 toolCalls 与协议 raw)压入请求,再逐个执行并回传 `role: "tool"` 结果;首步尚无输出却报 400/422 时去掉工具重试一次(网关不支持 function calling);多步用量求和并填 `steps` / `contextTokens`,单步保持原样以免破坏旧测试的精确比较;达到步数上限追加「回复"继续"」提示。
+
+块与流式:`BlockBuilder` 从 app.ts 原有的 closeOpen / ensureText / finishTool 抽出,新增三点——状态每次变化都发 `block_end` 快照(前端按 id 覆盖),`tool_output` 按 80ms 合并节流,块 id 与回传给模型的 wireId 分开保存(各协议调用 id 跨步可能重复,如 Gemini 每步都是 `call_0`,块 id 用全局递增的 `tc<n>`)。
+
+权限:每次工具执行前重新 `loadPermissions` + `decide`,这样「本项目始终允许」写入后立即生效。deny 直接拒绝且不可被 allow 覆盖(`DENY_RE` 优先);ask 时若有确认回调则置 `awaiting`、下发 `runId` / `rule`(suggestRule 给出的建议规则)/ `reason`,挂起等 `POST /runs/:id/confirm`;选 always 时 `addAllowRule` 写入 `<ws>/.xiyun/settings.json`;没有确认通道(子任务)时交给 policy 钩子,默认拒绝并说明当前环境无法确认。子任务里 coder 的 Edit / Write 放行(等价于原 files.write),其余角色的写操作与需要确认的 bash 一律拒绝。
+
+确认通道:`Run.awaitConfirm(callId)` / `confirm(callId, decision)` / `awaiting()`;中断时所有等待中的确认按 `deny` 收尾,避免 agent 循环挂死;确认不设超时。`POST /runs/:id/confirm` 同时接受 `{callId, decision}` 与 `{callId, allow, remember}` 两种写法,run 不存在 404、callId 不在等待中 409。
+
+终端:shellExec 的 `onData` / `signal` 在 E4 已就位,本批新增 `POST /tools/shell/stream`(SSE 逐块推 `{type:"output",stream,data}`,最后一条 `{type:"result"}`),客户端断开时结束进程树;`/tools/shell` 改为先按规则判定,deny 403、ask 且未确认 409 并带回 `rule` / `reason`;新增 `GET /tools/permissions` 与 `POST /tools/permissions/allow`。`gitExec` 从模块私有改为导出,供 git_status / git_diff 使用(argv 直传,不经 shell)。
+
+审计与安全:每次工具执行写一条 `tool.agent` 事件,内容为 `{sessionId, name, 参数摘要(截断 300 字符), status, exitCode}`,**不记录文件内容**;所有路径经 `assertInside` 校验,越界路径不填 `target.path` 并返回错误结果。
+
+前端:ToolBlock 补 awaiting(警告色、自动展开、显示 reason 与将要写入的规则原文、允许 / 本项目始终允许 / 拒绝三个按钮,点击后禁用等服务端 block_end)、running(等宽输出区自动滚动)、rejected 与 result 展示(edit_file 的 diff 按 -/+ 着色,bash 显示 exit 徽标与耗时);删除「当前版本不会自动执行」文案,pending 改为「未执行(当前会话未开放工具)」。终端面板改用流式接口,运行中实时显示输出,确认条增加「本项目始终允许」。
+
+取舍:`toolDigest` 把上一轮的工具调用摘要附在 assistant 内容后(而不是新增字段),这样历史装配与预算计算无需改动;结果回传模型截到 30k(保留开头 40% 与结尾 60%),界面展示截到 10k;流式输出只保留尾部 64KB;子任务步数上限 12、主对话 30。tasks.ts 的旧文本 ```tool 协议与 ROLE_TOOLS / runTool 一并删除,`tools.test.ts` 保留其余用例。
+
+## D-025:工作区快照与回退,以及 MCP 客户端(2026-10-22)
+
+工作区快照(L1):每个工作区一个影子仓库 `<dataDir>/checkpoints/<sha1(realpath(ws)) 前16位>.git`,所有命令都用 `--git-dir` / `--work-tree` 指向它,**完全不碰用户自己的 `.git`**(有测试断言用户仓库的 HEAD 与工作区状态在快照前后不变)。`info/exclude` 固定写入 `.git/ node_modules/ .xiyun-wt/ dist/ build/ .next/ target/ .xiyun/`,并设 `core.autocrlf=false`(避免 Windows 上换行配置造成内容漂移)。快照 = `add -A` + `write-tree`,树与 HEAD 相同就复用 HEAD,否则 `commit-tree -p HEAD` + `update-ref HEAD`;超时 30 秒,失败只记审计事件、不影响对话。保护:工作区是用户主目录或磁盘根目录、或文件数超过 2 万时关闭快照并给出原因(`CheckpointStore.ensure` 返回原因,`snapshot` 返回 null)。拍快照的时机:code 模式每轮开始前一次(user 消息落 `messages.checkpoint_sha`,v13 迁移新增),以及 write_file / edit_file / bash 执行前一次(记在工具块的 `checkpoint` 字段)。
+
+回退:`POST /sessions/:id/rewind {messageId, code, chat}`。`code=true` 时先拍一份 `pre-rewind` 快照得到 `undoSha`,再 `read-tree -u --reset <sha>`;**`read-tree` 不会删除快照之后新增的文件**,所以先 `add -A` 并用 `diff --name-only --diff-filter=A` 找出这些路径逐个删除(被忽略的目录不在快照里,因此不受影响)。`chat=true` 把 head 直接设为该消息的父消息——不能用 `switchHead`,它在消息已位于当前路径上时不做任何事。返回 `{ok, undoSha, text, messages}`,前端直接用返回的 messages 替换本地列表。`POST /sessions/:id/rewind/undo {sha}` 撤销回退。`GET /checkpoints/diff?sessionId&from` 列出将要还原的文件与 patch,供确认对话框展示。
+
+`loadTree` 的 head 兜底语义修正:原来"head 为 null 且不是老库"会自动回退到最新一条消息,这会让"回退到第一条消息之前"(head=null)立刻被撤销。改为只在 head **指向已删除消息**时失效;老库(所有消息都没有 parent)仍按 id 顺序取最后一条作为 head。同时 `linear` 收紧为"老库单链"——它只用于让展示层省略 parentId / siblings,head 为 null 的新库是空会话,路径为空,不能当单链。
+
+MCP(B3):依赖 `@modelcontextprotocol/sdk`。配置分两级——用户级 `~/.xiyun/mcp.json`(与 `claude_desktop_config.json` 同格式,另支持 `{type: "http" | "sse", url, headers}`)、项目级 `<ws>/.mcp.json`(Claude Code 格式)。项目级配置**首次使用前必须在设置里批准**,批准结果按"配置内容的 sha256 前 16 位"记到 `~/.xiyun/mcp-trust.json`,配置一改就失效、需要重新批准——这样别人在仓库里塞一个 `.mcp.json` 不会静默执行命令。合并规则:项目级同名覆盖用户级;未信任时整个项目级被忽略。
+
+连接:stdio 用 `StdioClientTransport`,环境变量 = `getDefaultEnvironment()` + 配置的 env(不带 `process.env`,避免泄漏本机密钥);**Windows 下 `npx` / `npm` / `pnpm` / `yarn` / `bunx` 必须包一层 `cmd /c`**,否则 spawn 找不到 `.cmd`。http 用 `StreamableHTTPClientTransport`,失败时回退 `SSEClientTransport` 一次。惰性连接(首次需要工具时才启动),连接超时 30 秒,stderr 保留尾部 8KB 用于排错。工具列表处理 `nextCursor` 分页。工具名规范化为 `mcp__<server>__<tool>`,字符限定 `[a-zA-Z0-9_-]`,超过 64 字符时截断并追加 8 位短哈希(原名与规范名的映射保留在 `McpToolInfo.originalName`)。`callTool` 超时 120 秒、支持 signal 中断;返回内容 text 拼接、image 转 `[图片 mime]` 占位、resource 取 text 或 uri,整体截到 30k。
+
+接入 agent:MCP 工具并入工具注册表,code / work 模式默认开放;权限类型为 `Mcp`,默认需要确认;规则沿用 E3 的 `mcp__github` / `mcp__github__*` / `mcp__github__create_issue`。接口:`GET /mcp/servers`(状态 / 工具数 / 错误 / stderr)、`GET` / `PUT /mcp/config`(写入前校验每个服务器必须有 command 或 url)、`POST /mcp/servers/:name/restart`、`POST /mcp/trust`、`POST /mcp/import/claude-desktop/preview` 与 `/apply`(同名只列冲突、不覆盖)。设置页的「插件」占位替换为 MCP 区块。
+
+两处顺带修复:`shellExec` 中断时原来只 `killTree` 不 settle,进程树杀不干净时 `close` 事件迟迟不来,Promise 会挂住——改为中断立即以 AbortError 拒绝(仍调用 killTree 结束进程),并用 `settled` 标志避免重复 settle。新增 `vitest.config.ts` 设 `fileParallelism: false`:测试会启动真实子进程(git / node / shell)并操作临时目录,并行时互相抢 CPU 与磁盘,表现为随机超时(排查时观察到失败文件在漂移)。
+
+取舍:快照不记录被忽略的目录,所以 `node_modules` 之类的改动无法回退(符合预期);影子仓库每个工作区一份,工作区移动后 key 变化会重新建仓;MCP 的 http 传输不做 OAuth;工具列表在连接后缓存,收到 `notifications/tools/list_changed` 时自动重新拉取;chat 模式默认不开放 MCP 工具。
+
+## D-026:用导入历史初始化记忆,以及文档分块检索(2026-10-22)
+
+L2(导入历史初始化记忆):记忆事实与候选各加 `source_message_id` / `source_kind` / `source_session_id` 三列(v14 迁移),`extract.ts` 的提示词要求模型为每条事实标注它来自对话里的第几条消息(字段 `index`),解析后映射回原消息 id;长会话按约 6k tokens 分片(chunkHistory),避免一次塞爆上下文。`MemoryJobRunner` 一次只跑一个会话,会话之间默认间隔 2 秒(可配);429 指数退避重试最多 3 次;支持暂停 / 继续 / 取消;**服务重启后状态为 running 的作业转为 paused**(构造时改一次),不会在没人看着的情况下继续烧额度。`shouldProcess` 钩子过滤"至少 2 轮"(2 条 user)的会话,单轮的寒暄不值得调模型。作业的 `source` 固定为 `import:chatgpt` / `import:claude`,`scope` 为 global。触发点在 M1 的导入预览对话框:勾选「导入后从这些对话中提取记忆」后随 `?extract=1` 传参(请求体是原始导出数组,放不下这个标志),预览同时给出可提取会话数与 token 估算。
+
+撤销按来源批量做:`POST /memory/facts/revoke {sourceKind}` 走软删除(与单条删除同语义,数据保留、检索不可见),返回撤销条数并写 `memory.revoke` 审计;前端做两次确认。「查看出处」用 `source_session_id` + `source_message_id` 定位到原会话的原消息:先切到该会话所在模式,再用已有的 `requestFocus` 机制滚动并高亮——不新造跳转通道。`GET /sessions/:id` 补了单会话元信息接口(记忆页按 id 查会话标题与模式)。
+
+F8(文档检索):`doc_chunks(id, doc_id, ord, start, end, text)` 按段落累积到约 800 字符、相邻块重叠 100 字符;`doc_chunks_fts` 用 FTS5 `trigram` 分词(中文子串可搜),触发器与 `doc_chunks` 同步,导入或更新文档时重建该文档的块,启动时给缺块的老文档补建(可重复执行,补建失败不影响启动)。检索:查询词 ≥3 字符时每个词加引号转义、OR 连接、按 `bm25()` 排序,**每篇文档只取得分最高的块**;不足 3 字符退回 LIKE;整句自然语言提问(没有空格的长串)拼不出短语时再退化为 3 字滑窗 OR——沿用旧的 LIKE 兜底口径,保持召回行为不变。高亮由 `highlight()` 统一生成:相邻或重叠的命中合并成一段(否则 3 字滑窗会把词切碎),用 `\u0001` / `\u0002` 包住,前端拆成 `<mark>`。
+
+Work 模式注入改为**命中块的原文**(不再整篇截断),并标注「来源:标题 §段号」,让结论能回链到具体段落。`GET /work/docs/search` 返回命中块(必须注册在 `/work/docs/:id` 之前,否则 "search" 会被当成 id),前端在资料面板里显示高亮片段、点击定位到该块并高亮。
+
+PDF / Word 转换新建 `convert.ts`(依赖 `unpdf` 与 `mammoth`):PDF 用 `extractText` 逐页取文字,docx 用 `extractRawText`;**每页提取出的文字少于 50 字时提示"可能是扫描件(没有文字层),需要 OCR"**——扫描件不是解析失败,必须让用户知道原因;单文件上限 30MB。转换路径只有一条:Work 导入、B2 附件上传、Work 页拖入 PDF / Word 都走 `convertToText`,转成文本后按文本处理(附件存为 `原名.txt`,拖入的资料来源记文件名)。拖入的 PDF / Word **只转文本存为资料,不写进用户工作区**——避免污染用户目录。
+
+取舍:记忆作业不追求并发,一次一个会话 + 2 秒间隔是刻意的保守选择(批量调模型容易触发限流且难以观察);限流退避只针对 429,其它错误直接记 failed 继续下一个会话;文档检索不做向量检索,BM25 + trigram 够用且零额外依赖;`unpdf` / `mammoth` 引入后打包体积增加,只在这两条路径动态 import,不用 PDF 的用户不承担加载成本。
+
+## D-027:子任务隔离 worktree,以及跨厂商回退与成本账本(2026-10-22)
+
+L4(后台并行任务):隔离目录固定在 `<工作区>/.xiyun-wt/<taskId>`,并写进 `.git/info/exclude`——放在工作区里面是为了让 PathGuard 与文件工具的"必须在工作区内"约束继续成立,写 exclude 是为了不污染用户的 `git status`;不用系统临时目录,因为跨盘的 `git worktree` 在 Windows 上会退化。分支名由 taskId 派生,起点取用户工作区当时的 HEAD 并记为 `baseSha`,后续 diffstat 与合并都以它为基准。**只有「并行组 + code 模式 + 写角色 + 工作区是 git 仓库」才开隔离**:单个任务没有并发冲突,给它开 worktree 只会让用户多一步合并;只读角色本来就能并行,不需要隔离;work 模式不写代码。能隔离的写任务因此可以真正并发(原来同工作区必须串行),不能隔离的沿用「只读并行、写串行」。`waiting_for_user` 恢复时复用同一个 worktree 与分支,否则用户等待期间已有的改动会丢。失败、取消或没有改动时把 worktree 与分支一并清理,清理失败只记 `task.worktree_cleanup_failed` 事件、不影响任务状态。合并 / 推送 / 建 PR / 丢弃四个操作都要前端 `window.confirm` 后带 `confirm: true`,服务端缺这个字段直接拒绝——这些操作会改用户仓库或远端,不能由模型或误点触发。建 PR 失败时回 `compareUrl`(GitHub 手动建 PR 的对比页),而不是只回错误:没有 `gh` 或未登录时用户仍能一键打开网页完成。`GET /tasks/:id/events` 先回放历史再实时推送,前端断线重连不需要额外补偿逻辑。
+
+L5(跨厂商切换):回退判定刻意收紧为**第 0 步、尚未产出任何内容、错误可重试**三条同时成立。已经产出内容再换家,用户会看到一段话说到一半换了个模型,而且前半段已经计费;非第 0 步的工具循环中途换家会让工具调用上下文错位。可重试的判定用 `isRetryableModelError`:429 / 限流 / 超时 / 连接失败 / 上下文超长算可重试,400 / 401 / 403 / 模型不存在这类配置错误不算——配置错了换一家只会掩盖问题。链耗尽时抛最后一个错误,保留原始原因。
+
+成本账本:价格挂在模型上(`ModelInfo.pricing`,单位是每百万 tokens),因为同一家服务商不同模型价格差几十倍,挂 provider 级没有意义。`cachedInput` 缺省按 `input` 计,是保守取值(宁高勿低)。`usage_ledger` 在 `/chat` 的 `finally` 里写入,失败不影响回复;子任务通过 `SchedulerDeps.usage` 钩子在 `store.patch` 之后写同一条账。日预算只做**降级**不做**拦截**:超预算时优先换到更便宜的已定价模型,没有更便宜的候选就照常执行并在气泡上提示——直接拒绝会让用户在关键时候用不了,而静默降级又会让用户以为换了模型,所以两者都必须在气泡上可见。`fallback` / `downgraded` 只挂在本轮内存里的气泡上,不落库:它们是"这一轮发生了什么"的运行时事实,重放历史时没有意义,落库还会让导出包与迁移变复杂。未定价的模型成本记 0 而不是估算,避免给出看起来精确的假数字。
+
+前端:用量面板没有引入图表库——现有依赖里没有,为一张柱状图加一个依赖不值得;用 flex + 百分比高度手写,数据量(按天最多几十根柱子)完全够用。价格标记复用「模型列表」这一个文本框(`$输入/输出` 或 `$输入/缓存/输出`),不新增输入控件:模型行本来就是"一行一个模型 + 若干空格分隔的标记",价格只是又一个标记,这样编辑、回填、拉取合并三条路径都不用改。取舍:worktree 隔离要求工作区本身是 git 仓库,非 git 工作区仍然串行;不做自动 rebase,合并冲突原样回给用户;账本只记录 `/chat` 与子任务的模型调用,记忆提取等后台作业暂不计价;`/usage` 的 from / to 是闭区间日期字符串,不做时区换算(按本地日期存)。
+
+## D-028:补齐 L4 / L5 的验收差距(任务详情、预算降级与回退落库的用例)(2026-10-22)
+
+第 H 批交付后按方案逐条回查,补三处差距和一处口径不一致。
+
+L4 任务卡片展开:方案要求「展开后显示 diff(`base_sha...branch`)和每步工具」,原实现只有 `diffStat`(统计)和运行中的当前工具。新增 `GET /tasks/:id/detail`,一次返回 `{branch, baseSha, patch, tools}`。`patch` 由新增的 `worktree.diffText` 产出(`git diff baseSha..branch`,与 `diffStat` 同源,超时 60 秒),截到 200KB;`tools` 从 `events` 表读 `task.tool`,按 `id` 升序、`payload LIKE '%"taskId":"<id>"%'` 过滤、上限 200 条,解析失败的行跳过。**为什么不复用事件流**:前端只在任务处于 queued / running 时订阅 `/tasks/:id/events`,任务结束就断开,重新展开时不会重订阅,历史工具只能从库里补;把 diff 和工具合并在一个接口里,是为了避免展开时发两次请求、也避免再开一条只在任务结束后才有用的路由。前端展开卡片时拉取(`open` / `task.status` 变化时重新拉),工具列表逐条显示,`error` / `rejected` 标红;完整 diff 收在可折叠的 `<details>` 里——diff 可能很长,默认展开会把卡片撑开。
+
+确认口径:方案把「停止」也列进需要确认的按钮,原来的「取消」直接调用、无确认。改为「停止」并加 `window.confirm`,提示文案说明「已产生的改动会保留在隔离分支上」——用户需要知道停止不等于丢弃。落地四键(合并 / 推送 / 建 PR / 丢弃)本来就有确认,未改。
+
+测试补三块此前零覆盖的行为,都放在 app 级(校验 `/chat` 实际发出的请求与落库结果),而不是 agent 级:
+- **超预算降级**:`app.ts` 的预算分支与 `cheapestPriced` 此前没有任何用例。新用例把日预算设为 1、往 `usage_ledger` 塞一条成本 5 的记录,断言下发了 `downgraded`、请求真的发给了最低价模型(`gpt-cheap`)、落库也记它。
+- **显式指定不降级**:同一预算下 `providerId` 指定第二家,断言只提示「按你指定的模型继续」、请求仍发给指定模型。
+- **回退后落库模型**:此前的回退用例只断言 agent 返回的 `result.provider.config.id`,没验证 DB。新用例让第一家返回 503(`retry-after-ms: 0` 让适配器自身重试立即结束,不拖慢用例)、第二家返回 Anthropic SSE,断言接手方真的收到请求、且 assistant 消息的 `model` 是接手方的模型。
+- **任务详情接口**:真实临时仓库 + worktree + 一次提交,插入本任务的两条 `task.tool` 与另一任务的一条,断言只返回本任务的工具且顺序正确、`patch` 含改动行、未知任务 404。
+
+偏差说明:方案把分支 / 推送 / 合并 / worktree 相关函数归在 `tools.ts`,实现放在独立的 `worktree.ts`。保持独立模块的理由是这些函数都依赖 git worktree 语义、与 `tools.ts` 的工具注册表没有耦合,单独成文件边界更清楚;`diffText` 也放在这里与 `diffStat` 相邻。此偏差不影响接口与行为。
+
+取舍:详情接口的 diff 上限 200KB、工具上限 200 条,超出部分截断而不是分页——任务卡片是速览入口,不是完整的 diff 浏览器,真要全量 diff 用户会去 `git` 里看;`tools` 只记工具名与状态,不含参数与输出,与审计事件「不记录文件内容」的口径一致;展开时每次重新拉取而不缓存,任务运行中 diff 会持续变化,缓存反而会给出过时内容。

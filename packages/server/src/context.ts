@@ -99,9 +99,10 @@ export function planHistory(path: PathMessage[], budget: number, opts: PlanOptio
     } else if (atts.length) {
       content = [content, attachmentNote(atts)].filter(Boolean).join("\n\n");
     }
-    // assistant 有实测用量时以输出 tokens 计(推理部分不回传)
+    // assistant 有实测用量时以输出 tokens 计(推理部分不回传)。
+    // 多步 agent 回复的 completionTokens 是各步之和,不代表这条消息的长度,改用估算值
     const cost =
-      (m.role === "assistant" && m.usage
+      (m.role === "assistant" && m.usage && (m.usage.steps ?? 1) <= 1
         ? Math.max(estimateTokens(m.content), m.usage.completionTokens - (m.usage.reasoningTokens ?? 0))
         : estimateTokens(content)) +
       MESSAGE_OVERHEAD +

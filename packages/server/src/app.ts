@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
-import { estimateTokens, type AgentRole, type ChatBlock, type ChatMessage, type ProviderConfig, type SessionMeta, type TaskStatus, type TokenUsage } from "@xiyun/shared";
+import { estimateTokens, modelsOf, pricingOf, type AgentRole, type ChatBlock, type ChatMessage, type ProviderConfig, type SessionMeta, type TaskStatus, type TokenUsage, type ToolDecision } from "@xiyun/shared";
 import type { ChatProvider, ProviderEvent, ToolDef } from "../../runtime/src/index.ts";
 import { MemoryStore } from "./memory.ts";
 import { ProviderStore } from "./providers.ts";
@@ -14,7 +14,11 @@ import { extractMemories } from "./extract.ts";
 import { runMemoryTool } from "./memchat.ts";
 import { WorkStore } from "./docs.ts";
 import { SkillStore } from "./skills.ts";
-import { MAX_GROUP_TASKS, Scheduler, TaskStore } from "./tasks.ts";
+import { MAX_GROUP_TASKS, Scheduler, TaskEventBus, TaskStore } from "./tasks.ts";
+import { cheapestPriced, UsageLedger, type UsageGroupBy } from "./usage.ts";
+import {
+  createPullRequest, diffText, mergeBranch, pushBranch, remoteUrl, removeWorktree,
+} from "./worktree.ts";
 import { detectShells, gitCommit, gitPreview, listTool, readTool, shellExec, writeTool } from "./tools.ts";
 import { DATA_DIR, backupDb } from "./db.ts";
 import { DEFAULT_TITLE, generateTitle, heuristicTitle } from "./title.ts";
@@ -27,6 +31,15 @@ import {
 } from "./context.ts";
 import { AttachmentError, AttachmentStore, MAX_PER_MESSAGE, TEXT_INJECT_CHARS } from "./attachments.ts";
 import { parseExternal, type ExternalConversation, type ExternalSource } from "./external.ts";
+import { BlockBuilder, mcpAgentTools, runAgent, toolDigest, toolsForMode } from "./agent.ts";
+import { CheckpointStore } from "./checkpoints.ts";
+import {
+  applyClaudeDesktopImport, effectiveConfig, isProjectTrusted, loadProjectConfig, loadUserConfig, McpManager,
+  previewClaudeDesktopImport, revokeProjectTrust, saveUserConfig, trustProject,
+} from "./mcp.ts";
+import { addAllowRule, decide, loadPermissions, suggestRule } from "./permissions.ts";
+import { convertToText, isConvertible } from "./convert.ts";
+import { MemoryJobRunner } from "./memory-jobs.ts";
 
 const now = () => new Date().toISOString();
 
@@ -40,7 +53,11 @@ export function createApp(
     chatProvider?: () => ChatProvider;
     titleProvider?: () => ChatProvider | undefined;
     summaryProvider?: () => ChatProvider | undefined;
+    // 记忆提取用的模型(测试可注入);缺省按 memory 角色 → main → 激活顺序取
+    memoryProvider?: () => ChatProvider | undefined;
     dataDir?: string; // 附件存放目录的上级(缺省 DATA_DIR;测试用临时目录)
+    // L1:工作区快照。缺省按 dataDir 建;测试可注入 skipGuards 跳过 home / 根目录与文件数检查
+    checkpoints?: CheckpointStore;
   },
 ) {
   const app = new Hono();
@@ -50,8 +67,14 @@ export function createApp(
   app.use("*", cors({ origin: (o) => (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(o) ? o : undefined) }));
 
   const taskStore = new TaskStore(db);
+  // L5:成本账本(主对话 + 子任务共用一个库)
+  const usageLedger = new UsageLedger(db);
   // B2:附件。启动时清理一天前上传、但没有随任何消息发出的附件
   const attachments = new AttachmentStore(db, opts?.dataDir ?? DATA_DIR);
+  // L1:工作区快照(影子仓库,不碰用户的 .git)
+  const checkpoints = opts?.checkpoints ?? new CheckpointStore({ dataDir: opts?.dataDir ?? DATA_DIR });
+  // B3:MCP 客户端(惰性连接,首次用到工具时才启动)
+  const mcp = new McpManager();
   try {
     attachments.prune();
   } catch {
@@ -59,15 +82,23 @@ export function createApp(
   }
   const work = new WorkStore(db);
   const skills = new SkillStore(db, DATA_DIR);
+  // L4:任务事件总线,供 GET /tasks/:id/events 实时推送
+  const taskEvents = new TaskEventBus();
   const scheduler = new Scheduler({
     store: taskStore,
     memory,
     registry: () => providers.registry(),
     skillsFor: (mode, role, query) => skills.promptFor(mode, role, query),
-    onEvent: (type, payload) =>
-      db.prepare("INSERT INTO events (type, payload, created_at) VALUES (?, ?, ?)").run(
-        type, JSON.stringify(payload), now(),
-      ),
+    // L5:子任务用量同样记账
+    usage: (entry) => usageLedger.record(entry),
+    onEvent: (type, payload) => {
+      const r = db
+        .prepare("INSERT INTO events (type, payload, created_at) VALUES (?, ?, ?)")
+        .run(type, JSON.stringify(payload), now());
+      // L4:任务事件同步推给订阅者(前端可实时看每步工具与状态变化)
+      const taskId = (payload as { taskId?: string } | null)?.taskId;
+      if (taskId) taskEvents.publish(taskId, { id: Number(r.lastInsertRowid), type, payload, createdAt: now() });
+    },
   });
   // 启动恢复:上次中断的 queued/running 任务重新拉起。
   const recovered = scheduler.recover();
@@ -106,7 +137,10 @@ export function createApp(
 
   // 记忆提取专用 Provider:memory 角色优先,回退 main/激活。未配置则不提取。
   const memoryProvider = () =>
-    providers.registry().byRole("memory") ?? providers.registry().byRole("main") ?? providers.activeProvider();
+    opts?.memoryProvider?.() ??
+    providers.registry().byRole("memory") ??
+    providers.registry().byRole("main") ??
+    providers.activeProvider();
 
   // 回复完成后异步提取候选记忆,不阻塞 SSE;失败只记事件(R-004:低置信度只进候选区)。
   const queueExtract = (sessionId: string, mode: string, workspace: string) => {
@@ -191,6 +225,26 @@ export function createApp(
     } catch (e) {
       return c.json({ ok: false, latencyMs: Date.now() - t0, error: e instanceof Error ? e.message : "probe failed" });
     }
+  });
+
+  // ---- L5:用量账本与设置 ----
+  // groupBy:day|session|provider|model;from/to 为 ISO 日期(含端点)
+  app.get("/usage", (c) => {
+    const raw = c.req.query("groupBy") ?? "day";
+    const groupBy: UsageGroupBy = raw === "session" || raw === "provider" || raw === "model" ? raw : "day";
+    const { rows, total } = usageLedger.summary(groupBy, c.req.query("from"), c.req.query("to"));
+    const s = providers.settings();
+    return c.json({
+      groupBy, rows, total,
+      currency: s.currency ?? "USD",
+      budget: s.dailyBudget ?? null,
+      spentToday: usageLedger.spentToday(),
+    });
+  });
+  app.get("/settings", (c) => c.json(providers.settings()));
+  app.patch("/settings", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { dailyBudget?: number | null; currency?: string };
+    return c.json(providers.updateSettings(b));
   });
 
   // 拉取服务商的模型列表(设置页"获取模型");失败返回可读错误
@@ -286,20 +340,37 @@ export function createApp(
   type MsgRow = {
     id: number; role: string; content: string; blocks: string | null; aborted: number; usage: string | null;
     error: string | null; model: string | null; parent_id: number | null; ref_context: string | null;
-    ctx_trim: string | null; created_at: string;
+    ctx_trim: string | null; created_at: string; checkpoint_sha: string | null;
   };
   // 按给定顺序取消息(路径上的 id);缺失的跳过
   const rowsByIds = (ids: number[]): MsgRow[] => {
     if (!ids.length) return [];
     const rows = db
       .prepare(
-        `SELECT id, role, content, blocks, aborted, usage, error, model, parent_id, ref_context, ctx_trim, created_at
+        `SELECT id, role, content, blocks, aborted, usage, error, model, parent_id, ref_context, ctx_trim, checkpoint_sha, created_at
          FROM messages WHERE id IN (SELECT value FROM json_each(?))`,
       )
       .all(JSON.stringify(ids)) as unknown as MsgRow[];
     const byId = new Map(rows.map((r) => [r.id, r]));
     return ids.flatMap((id) => byId.get(id) ?? []);
   };
+  // L2:导入历史的批量记忆提取作业(一次一个会话,支持暂停 / 恢复 / 取消)。
+  // 放在 rowsByIds 之后:作业执行时才会取历史,声明顺序不影响。
+  const memoryJobs = new MemoryJobRunner({
+    db,
+    memory,
+    provider: memoryProvider,
+    historyFor: (sessionId) => {
+      // 只要当前分支的 user / assistant 正文,取最近 200 条,避免长会话一次性塞爆上下文
+      const ids = pathIds(loadTree(db, sessionId)).slice(-200);
+      return rowsByIds(ids)
+        .filter((r) => r.role === "user" || r.role === "assistant")
+        .map((r) => ({ role: r.role as "user" | "assistant", content: r.content, id: r.id }));
+    },
+    // 至少 2 轮(2 条 user)才值得提取
+    shouldProcess: (sessionId) =>
+      (db.prepare("SELECT COUNT(*) c FROM messages WHERE session_id = ? AND role = 'user'").get(sessionId) as { c: number }).c >= 2,
+  });
   const parseTrim = (raw: string | null): ChatMessage["trim"] => {
     if (!raw) return undefined;
     try {
@@ -338,15 +409,19 @@ export function createApp(
         return [];
       }
     });
-  const toPathMessage = (r: MsgRow): PathMessage => ({
-    id: r.id,
-    role: r.role as PathMessage["role"],
-    content: r.content,
-    refContext: r.ref_context,
-    refs: r.role === "user" ? refBlocksOf(r.blocks) : undefined,
-    attachments: r.role === "user" ? attachmentBlocksOf(r.blocks) : undefined,
-    usage: parseUsage(r.usage),
-  });
+  const toPathMessage = (r: MsgRow): PathMessage => {
+    // B1:assistant 消息把工具调用摘要附在正文后,否则下一轮模型不知道上一轮做过什么
+    const digest = r.role === "assistant" ? toolDigest(parseBlocks(r.blocks) ?? []) : "";
+    return {
+      id: r.id,
+      role: r.role as PathMessage["role"],
+      content: digest ? `${r.content}\n\n[上一步工具调用] ${digest}` : r.content,
+      refContext: r.ref_context,
+      refs: r.role === "user" ? refBlocksOf(r.blocks) : undefined,
+      attachments: r.role === "user" ? attachmentBlocksOf(r.blocks) : undefined,
+      usage: parseUsage(r.usage),
+    };
+  };
   // 当前分支的消息(会话展示用),带父消息与兄弟版本
   const listPath = (sessionId: string): ChatMessage[] => {
     const tree = loadTree(db, sessionId);
@@ -362,10 +437,23 @@ export function createApp(
       parentId: tree.linear ? undefined : (tree.parent.get(r.id) ?? null),
       siblings: siblingsOf(tree, r.id),
       trim: parseTrim(r.ctx_trim),
+      checkpointSha: r.checkpoint_sha ?? undefined,
     }));
   };
 
   app.get("/sessions/:id/messages", (c) => c.json(listPath(c.req.param("id"))));
+  // L2:单个会话的元信息(记忆页「查看出处」要按 id 定位会话)
+  app.get("/sessions/:id", (c) => {
+    const r = db.prepare("SELECT * FROM sessions WHERE id = ?").get(c.req.param("id")) as
+      | { id: string; title: string; mode: string; workspace: string; created_at: string; updated_at: string | null; archived: number }
+      | undefined;
+    if (!r) return c.json({ error: "会话不存在" }, 404);
+    return c.json({
+      id: r.id, title: r.title, mode: r.mode, workspace: r.workspace,
+      createdAt: r.created_at, updatedAt: r.updated_at || r.created_at,
+      archived: Number(r.archived) === 1,
+    });
+  });
   // 切换分支:messageId 已在当前路径上则不变,否则切到它所在分支的最新末端;返回切换后的消息列表
   app.post("/sessions/:id/head", async (c) => {
     const sessionId = c.req.param("id");
@@ -376,6 +464,69 @@ export function createApp(
     if (head == null) return c.json({ error: "message not found" }, 404);
     return c.json({ headId: head, messages: listPath(sessionId) });
   });
+  // L1:回退到某条消息。code=true 还原工作区到该消息的快照(先拍 pre-rewind 以便撤销);
+  // chat=true 把对话 head 退到该消息的父消息,并返回原消息文本供前端填回输入框。
+  app.post("/sessions/:id/rewind", async (c) => {
+    const sessionId = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as { messageId?: unknown; code?: unknown; chat?: unknown };
+    if (typeof body.messageId !== "number") return c.json({ error: "缺少 messageId" }, 400);
+    if (runs.active(sessionId)?.status === "running") return c.json({ error: "该会话正在生成,请等待完成或先停止" }, 409);
+    const session = db.prepare("SELECT workspace FROM sessions WHERE id = ?").get(sessionId) as { workspace: string } | undefined;
+    if (!session) return c.json({ error: "session not found" }, 404);
+    const row = db.prepare("SELECT id, role, content, parent_id, checkpoint_sha FROM messages WHERE id = ? AND session_id = ?").get(
+      body.messageId, sessionId,
+    ) as { id: number; role: string; content: string; parent_id: number | null; checkpoint_sha: string | null } | undefined;
+    if (!row) return c.json({ error: "message not found" }, 404);
+
+    let undoSha: string | null = null;
+    if (body.code === true) {
+      if (!row.checkpoint_sha) return c.json({ error: "该消息没有代码快照" }, 400);
+      if (!session.workspace) return c.json({ error: "会话没有工作区" }, 400);
+      // 先拍当前状态,供"撤销回退"
+      const undo = await checkpoints.snapshot(session.workspace, "pre-rewind");
+      if (!undo) return c.json({ error: "快照不可用(工作区过大或未初始化)" }, 409);
+      const ok = await checkpoints.restore(session.workspace, row.checkpoint_sha);
+      if (!ok) return c.json({ error: "还原失败" }, 500);
+      undoSha = undo.sha;
+      auditTool("checkpoint.rewind", { sessionId, messageId: row.id, to: row.checkpoint_sha, undo: undoSha });
+    }
+    if (body.chat === true) {
+      // 直接设 head 为该消息的父消息(而不是 switchHead——它在消息已在路径上时不会回退)。
+      // 该消息及其后的内容仍在库里,只是不在当前路径上,之后可用版本切换找回。
+      setHeadId(db, sessionId, row.parent_id ?? null);
+    }
+    return c.json({
+      ok: true,
+      undoSha,
+      ...(body.chat === true ? { text: row.content, messages: listPath(sessionId) } : {}),
+    });
+  });
+
+  // L1:撤销回退(把工作区还原到 rewind 之前拍的那份快照)
+  app.post("/sessions/:id/rewind/undo", async (c) => {
+    const sessionId = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as { sha?: unknown };
+    if (typeof body.sha !== "string") return c.json({ error: "缺少 sha" }, 400);
+    const session = db.prepare("SELECT workspace FROM sessions WHERE id = ?").get(sessionId) as { workspace: string } | undefined;
+    if (!session?.workspace) return c.json({ error: "会话没有工作区" }, 400);
+    const ok = await checkpoints.restore(session.workspace, body.sha);
+    if (!ok) return c.json({ error: "撤销失败" }, 500);
+    auditTool("checkpoint.undo", { sessionId, sha: body.sha });
+    return c.json({ ok: true });
+  });
+
+  // L1:快照与当前工作区的差异(确认对话框列出将要还原的文件)
+  app.get("/checkpoints/diff", async (c) => {
+    const sessionId = c.req.query("sessionId") ?? "";
+    const from = c.req.query("from") ?? "";
+    if (!sessionId || !from) return c.json({ error: "缺少 sessionId 或 from" }, 400);
+    const session = db.prepare("SELECT workspace FROM sessions WHERE id = ?").get(sessionId) as { workspace: string } | undefined;
+    if (!session?.workspace) return c.json({ error: "会话没有工作区" }, 400);
+    const files = await checkpoints.diffFiles(session.workspace, from);
+    const patch = await checkpoints.diffText(session.workspace, from);
+    return c.json({ files, patch: patch.slice(0, 200_000) });
+  });
+
   // 分支:把某条消息(含)及其祖先(缺省为当前分支全部)复制到一个新会话,返回新会话。
   app.post("/sessions/:id/branch", async (c) => {
     const sessionId = c.req.param("id");
@@ -427,10 +578,21 @@ export function createApp(
     const file = form?.file;
     if (!file || typeof file === "string") return c.json({ error: "缺少文件(multipart 字段 file)" }, 400);
     try {
-      return c.json(attachments.save(file.name, file.type, new Uint8Array(await file.arrayBuffer())));
+      let bytes = new Uint8Array(await file.arrayBuffer());
+      let name = file.name;
+      let mime = file.type;
+      // F8:PDF / Word 附件先转文本,再按文本附件存;转换失败按原类型交给后续校验
+      if (isConvertible(name)) {
+        const r = await convertToText(name, Buffer.from(bytes));
+        if (!r.text.trim()) return c.json({ error: r.warning ?? "文件没有可提取的文字" }, 415);
+        bytes = new TextEncoder().encode(r.text);
+        name = `${name}.txt`;
+        mime = "text/plain";
+      }
+      return c.json(attachments.save(name, mime, bytes));
     } catch (e) {
       if (e instanceof AttachmentError) return c.json({ error: e.message }, e.status);
-      throw e;
+      return c.json({ error: e instanceof Error ? e.message : "附件处理失败" }, 400);
     }
   });
   // 只按内容哈希取;文本一律按纯文本返回,图片按识别出的类型,禁止嗅探
@@ -477,6 +639,22 @@ export function createApp(
   // 唯一的中止入口:断开连接不会停止生成
   app.post("/runs/:id/cancel", (c) => c.json({ ok: runs.cancel(c.req.param("id")) }));
 
+  // B1:工具确认。兼容 { callId, decision } 与 { callId, allow, remember } 两种写法
+  app.post("/runs/:id/confirm", async (c) => {
+    const run = runs.get(c.req.param("id"));
+    if (!run) return c.json({ error: "run not found" }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      callId?: string; decision?: string; allow?: boolean; remember?: boolean;
+    };
+    const callId = typeof body.callId === "string" ? body.callId : "";
+    if (!callId) return c.json({ error: "缺少 callId" }, 400);
+    let decision: ToolDecision;
+    if (body.decision === "allow" || body.decision === "always" || body.decision === "deny") decision = body.decision;
+    else if (typeof body.allow === "boolean") decision = body.allow ? (body.remember ? "always" : "allow") : "deny";
+    else return c.json({ error: "decision 必须是 allow / always / deny" }, 400);
+    return run.confirm(callId, decision) ? c.json({ ok: true }) : c.json({ error: "该调用不在等待确认" }, 409);
+  });
+
   // ---- Chat:规则文件 + 相关记忆 + 历史,流式回复,落库 ----
   app.post("/chat", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -514,9 +692,41 @@ export function createApp(
     const pick = typeof body.providerId === "string" && body.providerId
       ? { id: body.providerId, model: body.model ?? null }
       : { id: session.provider_id, model: session.model };
-    const provider = opts?.chatProvider?.() ?? providers.resolve(pick.id, pick.model) ?? providers.registry().byRole("main");
+    // 用户本轮显式选了模型:预算超支时只提示,不擅自换模型
+    const explicitPick = typeof body.providerId === "string" && !!body.providerId;
+    let provider = opts?.chatProvider?.() ?? providers.resolve(pick.id, pick.model) ?? providers.registry().byRole("main");
     if (!provider) return c.json({ error: "no provider configured" }, 400);
-    const modelName = provider.config.model || null; // 落到 assistant 消息上,前端气泡显示
+    let modelName = provider.config.model || null; // 落到 assistant 消息上,前端气泡显示
+
+    // L5:日预算。已超支且用户没指定模型时,降级到已定价模型里最便宜的一个。
+    const dailyBudget = providers.settings().dailyBudget ?? null;
+    const spentToday = usageLedger.spentToday();
+    let downgraded: { from: string; to: string; reason: string } | null = null;
+    if (dailyBudget != null && spentToday >= dailyBudget) {
+      const cheap = cheapestPriced(
+        providers.configs().flatMap((c) =>
+          modelsOf(c).map((m) => ({ providerId: c.id, model: m.id, pricing: m.pricing })),
+        ),
+      );
+      const curModel = provider.config.model;
+      if (cheap && cheap.model !== curModel && !explicitPick) {
+        const next = providers.resolve(cheap.providerId, cheap.model);
+        if (next) {
+          downgraded = {
+            from: curModel,
+            to: cheap.model,
+            reason: `今日已花费 ${spentToday.toFixed(2)} 超出日预算 ${dailyBudget.toFixed(2)},已降级到最低价模型`,
+          };
+          provider = next;
+          modelName = next.config.model || null;
+        }
+      } else if (explicitPick) {
+        downgraded = {
+          from: curModel, to: curModel,
+          reason: `今日已花费 ${spentToday.toFixed(2)} 超出日预算 ${dailyBudget.toFixed(2)},本轮按你指定的模型继续`,
+        };
+      }
+    }
     // 同一会话同时只允许一个生成(F1):先拦下,避免记忆工具等副作用
     const busyMsg = "该会话正在生成,请等待完成或先停止";
     if (runs.active(sessionId)?.status === "running") return c.json({ error: busyMsg }, 409);
@@ -571,6 +781,30 @@ export function createApp(
     // 能力未声明时不拦(按 Provider 实际报错为准);声明了但没有 vision 时不发图片
     const caps = provider.config.capabilities ?? [];
     const vision = caps.length === 0 || caps.includes("vision");
+    // B1:Code / Work 模式下发工具(chat 不给)。capabilities 未声明时按 Provider 实际能力为准;
+    // XIYUN_AGENT=0 可整体关闭 agent 循环(排错用)
+    const agentEnabled =
+      (session.mode === "code" || session.mode === "work") &&
+      !!session.workspace &&
+      !!provider.streamEvents &&
+      (caps.length === 0 || caps.includes("tools")) &&
+      process.env.XIYUN_AGENT !== "0";
+    let agentTools = agentEnabled ? toolsForMode(session.mode) : [];
+    // B3:MCP 工具并入注册表(code / work 默认开放,chat 由设置开关控制——当前仅 code / work)
+    if (agentEnabled) {
+      try {
+        const mcpTools = await mcp.tools(session.workspace);
+        if (mcpTools.length)
+          agentTools = [
+            ...agentTools,
+            ...mcpAgentTools(mcpTools, (server, toolName, args, signal) =>
+              mcp.callTool(session.workspace, server, toolName, args, signal),
+            ),
+          ];
+      } catch {
+        // MCP 不可用不影响内置工具
+      }
+    }
     const curImages = attBlocks.filter((a) => a.type === "image");
     if (curImages.length && !vision)
       return c.json({ error: "当前模型未声明图片能力(vision):请换用支持图片的模型,或在设置里为该模型加上 vision" }, 400);
@@ -597,12 +831,28 @@ export function createApp(
         : isWork
           ? `你是 XiyunAgent 的 Work 助手,在工作目录(${session.workspace})中帮助用户整理需求、会议资料、网页调研和待办。结论必须标注来源(文档标题或 URL);外部发送、修改原文件和批量操作只能建议,由用户确认后执行。`
           : "你是 XiyunAgent 的 Chat 助手,帮助用户学习、总结、解释和复习。",
+      // B1:工具使用指引(只在真正下发了工具时出现,避免模型在无工具会话里空谈)
+      agentTools.length > 0 &&
+        (isCode
+          ? [
+              "# 工具使用",
+              "你可以读写文件、搜索、执行命令和查看 git 状态。请遵守:",
+              "1. 修改前先用 read_file / grep 看清现有实现,不要凭猜测改。",
+              "2. 小范围修改优先用 edit_file(精确替换),整份重写才用 write_file。",
+              "3. 改完运行相关测试或命令验证,不要只声称完成。",
+              "4. 写操作和非常用命令可能需要用户确认;被拒绝时不要重复尝试,向用户说明并询问下一步。",
+            ].join("\n")
+          : [
+              "# 可用工具",
+              "你可以用 read_file / list_files / grep 查看工作区内的资料(只读,不会修改文件)。",
+              "需要修改或执行命令时,说明需要用户手动操作。",
+            ].join("\n")),
       memNote && `# 记忆操作\n${memNote}\n请在回复中向用户确认该操作结果。`,
       rules && `# 规则\n${rules}`,
       skillText && `# 已启用 Skill\n${skillText}`,
       memories.length && `# 相关记忆\n${memories.join("\n")}`,
       docHits.length > 0 &&
-        `# 相关资料(引用时标注来源)\n${docHits.map((d) => `## ${d.title}(来源:${d.source})\n${d.snippet}`).join("\n\n")}`,
+        `# 相关资料(引用时标注来源)\n${docHits.map((d) => `## ${d.title}(来源:${d.source} §${(d.ord ?? 0) + 1})\n${d.text}`).join("\n\n")}`,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -662,9 +912,15 @@ export function createApp(
         });
       const all = [...refBlocks, ...attBlocks];
       const blocks = all.length ? JSON.stringify(all) : null;
+      // L1:本轮开始前拍快照,供"回退到这里"。失败不影响对话
+      const cp = session.mode === "code" && session.workspace
+        ? await checkpoints.snapshot(session.workspace, `chat ${new Date().toISOString()}`).catch(() => null)
+        : null;
       const r = db
-        .prepare("INSERT INTO messages (session_id, role, content, blocks, parent_id, ref_context, created_at) VALUES (?, 'user', ?, ?, ?, ?, ?)")
-        .run(sessionId, message, blocks, parentId, context || null, now());
+        .prepare(
+          "INSERT INTO messages (session_id, role, content, blocks, parent_id, ref_context, checkpoint_sha, created_at) VALUES (?, 'user', ?, ?, ?, ?, ?, ?)",
+        )
+        .run(sessionId, message, blocks, parentId, context || null, cp?.sha ?? null, now());
       userMessageId = Number(r.lastInsertRowid);
       setHeadId(db, sessionId, userMessageId);
       touchSession(sessionId);
@@ -689,29 +945,18 @@ export function createApp(
       userMessageId = regenUserId;
     }
 
-    // D2:工具定义默认不下发,需显式开启环境变量且 Provider 声明 tools 能力
-    const READONLY_TOOLS: ToolDef[] = [
-      {
-        name: "list_files",
-        description: "列出工作区内的文件(相对路径)",
-        parameters: { type: "object", properties: { path: { type: "string", description: "子目录,默认 ." } } },
-      },
-      {
-        name: "read_file",
-        description: "读取工作区内的文件内容",
-        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-      },
-    ];
-    const exposeTools =
-      provider.config.capabilities?.includes("tools") && process.env.XIYUN_EXPOSE_TOOLS === "1" && !!session.workspace;
-    const tools = exposeTools ? READONLY_TOOLS : undefined;
+    const tools = agentTools.length ? agentTools.map((t) => t.def) : undefined;
 
     // F1:生成在后台执行,不随本次连接断开而中止;只有 POST /runs/:id/cancel 触发 ac
     run.userMessageId = userMessageId;
     const ac = run.ac;
     const send = (obj: unknown) => run.emit(obj);
     // 先下发已落库的 user 消息 id 与 runId:中断或出错时客户端也能立即编辑 / 分支,断线后可凭 runId 续订
-    send({ type: "meta", userMessageId, runId: run.id, model: modelName, ...(trim ? { trim } : {}) });
+    send({
+      type: "meta", userMessageId, runId: run.id, model: modelName,
+      ...(trim ? { trim } : {}),
+      ...(downgraded ? { downgraded } : {}),
+    });
     // 运行结束后 emit 自动忽略,标题晚到时只落库
     void titlePending?.then((title) => {
       if (title) send({ type: "title", title });
@@ -720,177 +965,76 @@ export function createApp(
 
     void (async () => {
 
-      const blocks: ChatBlock[] = [];
-      const toolBlocks = new Map<string, Extract<ChatBlock, { kind: "tool" }>>();
-      // 已收到 tool_end 的调用;中断时据此区分已结束与半截的工具
-      const finishedTools = new Set<string>();
-      // open 记录已入列块的下标,关闭时原地更新,避免同一段内容入列两次
-      let open: { kind: "text" | "thinking" | "tool"; id: string; text: string; t0: number; idx: number } | null = null;
-      let seq = 0;
+      const builder = new BlockBuilder(send);
+      const blocks = builder.blocks;
       let finishReason: string | null = null;
-      // 模型返回的真实用量;中断时通常拿不到(usage 在最后一个分片)
       let usage: TokenUsage | null = null;
+      // L5:记账要用实际完成本次运行的模型(可能已回退)
+      let finalProvider = provider;
+      let persistedId: number | null = null;
 
-      const closeOpen = () => {
-        const b = open;
-        if (!b) return;
-        open = null;
-        if (b.kind === "thinking") {
-          const block: ChatBlock = { id: b.id, kind: "thinking", text: b.text, durationMs: Date.now() - b.t0 };
-          blocks[b.idx] = block;
-          void send({ type: "block_end", id: b.id, block });
-        } else if (b.kind === "text") {
-          const block: ChatBlock = { id: b.id, kind: "text", text: b.text };
-          blocks[b.idx] = block;
-          void send({ type: "block_end", id: b.id, block });
-        }
-      };
-
-      const ensureText = () => {
-        if (open?.kind === "text") return open;
-        closeOpen();
-        seq += 1;
-        const block: ChatBlock = { id: `t${seq}`, kind: "text", text: "" };
-        const idx = blocks.push(block) - 1;
-        open = { kind: "text", id: block.id, text: "", t0: Date.now(), idx };
-        void send({ type: "block", id: block.id, block: { kind: "text" } });
-        return open;
-      };
-
-      const finishTool = (id: string) => {
-        const b = toolBlocks.get(id);
-        if (!b) return;
-        try {
-          b.args = JSON.parse(b.rawArgs || "{}") as unknown;
-          b.status = "pending";
-        } catch (e) {
-          b.argsError = e instanceof Error ? e.message : "参数解析失败";
-          b.status = "error";
-        }
-        // target 由服务端填写:工作区来自 session,路径必须落在工作区内
-        if (session.workspace) {
-          b.target = { workspace: session.workspace };
-          const p = (b.args as { path?: unknown } | undefined)?.path;
-          if (typeof p === "string") {
-            try {
-              assertInside(session.workspace, p);
-              b.target.path = p;
-            } catch {
-              // 越界路径不填 target.path
-            }
-          }
-        }
-        finishedTools.add(id);
-        if (open?.kind === "tool" && open.id === id) open = null;
-        void send({ type: "block_end", id, block: b });
-      };
-
-      // 中断收尾:没等到 tool_end 的调用标记为 error 并补发 block_end,避免客户端卡片停在 pending
-      const closeUnfinishedTools = (note = "已中断") => {
-        for (const [id, b] of toolBlocks) {
-          if (finishedTools.has(id)) continue;
-          b.status = "error";
-          b.note = note;
-          finishedTools.add(id);
-          void send({ type: "block_end", id, block: b });
-        }
-        open = null;
-      };
-
-      let it: AsyncIterator<ProviderEvent> | null = null;
       try {
-        const iter: AsyncIterable<ProviderEvent> = provider.streamEvents
-          ? provider.streamEvents(messages, { signal: ac.signal, tools })
-          : (async function* () {
-              for await (const d of provider.streamChat(messages, { signal: ac.signal })) {
-                yield { type: "text", delta: d } as ProviderEvent;
-              }
-            })();
-        it = iter[Symbol.asyncIterator]();
-
-        // 与中断竞速:Provider 不响应 signal 时也能立即收尾落库,不把流挂死
-        const interrupted = new Promise<{ aborted: true }>((resolve) => {
-          const onAbort = () => resolve({ aborted: true });
-          if (ac.signal.aborted) onAbort();
-          else ac.signal.addEventListener("abort", onAbort, { once: true });
-        });
-        for (;;) {
-          // 已中断时不再等待 Provider
-          const step = ac.signal.aborted
-            ? ({ aborted: true } as const)
-            : await Promise.race([it.next(), interrupted]);
-          if ("aborted" in step) throw Object.assign(new Error("aborted"), { name: "AbortError" });
-          if (step.done) break;
-          const ev = step.value;
-          if (ev.type === "text") {
-            const o = ensureText();
-            o.text += ev.delta;
-            const cur = blocks[o.idx];
-            if (cur?.kind === "text") cur.text = o.text;
-            void send({ delta: ev.delta, id: o.id });
-          } else if (ev.type === "thinking") {
-            if (open?.kind !== "thinking") {
-              closeOpen();
-              seq += 1;
-              const idx = blocks.push({ id: `r${seq}`, kind: "thinking", text: "" }) - 1;
-              open = { kind: "thinking", id: `r${seq}`, text: "", t0: Date.now(), idx };
-              void send({ type: "block", id: open.id, block: { kind: "thinking" } });
+        // L5:回退链 = 当前模型之后,同 main 角色的其他模型(去重)。
+        // 注入了 chatProvider(测试)时不启用,保证用例可复现。
+        const chain = opts?.chatProvider
+          ? []
+          : providers.registry().byRoleAll("main").filter((p) => p.config.id !== provider.config.id);
+        const result = await runAgent({
+          provider,
+          messages,
+          tools: agentTools,
+          workspace: session.workspace,
+          signal: ac.signal,
+          builder,
+          homeDir: homedir(),
+          maxSteps: 30,
+          fallbacks: chain,
+          onFallback: ({ from, to, reason }) => {
+            modelName = to;
+            send({ type: "meta", userMessageId, runId: run.id, model: to, fallback: { from, to, reason } });
+          },
+          // 确认回调:写入 runId 后挂起,等 POST /runs/:id/confirm
+          confirm: async (req) => {
+            const b = builder.tool(req.blockId);
+            if (b) {
+              b.runId = run.id;
+              builder.update(req.blockId);
             }
-            open.text += ev.delta;
-            const cur = blocks[open.idx];
-            if (cur?.kind === "thinking") cur.text = open.text;
-            void send({ type: "block_delta", id: open.id, delta: ev.delta });
-          } else if (ev.type === "tool_start") {
-            closeOpen();
-            const block: Extract<ChatBlock, { kind: "tool" }> = {
-              id: ev.id, kind: "tool", name: ev.name, rawArgs: "", status: "pending",
-            };
-            toolBlocks.set(ev.id, block);
-            const idx = blocks.push(block) - 1;
-            open = { kind: "tool", id: ev.id, text: "", t0: Date.now(), idx };
-            void send({ type: "block", id: ev.id, block: { kind: "tool", name: ev.name, status: "pending" } });
-          } else if (ev.type === "tool_args") {
-            const b = toolBlocks.get(ev.id);
-            if (b) b.rawArgs += ev.delta;
-            void send({ type: "block_delta", id: ev.id, delta: ev.delta });
-          } else if (ev.type === "tool_end") {
-            const b = toolBlocks.get(ev.id);
-            if (b) b.rawArgs = ev.args;
-            finishTool(ev.id);
-          } else if (ev.type === "usage") {
-            usage = ev.usage;
-            void send({ type: "usage", usage });
-          } else if (ev.type === "finish") {
-            finishReason = ev.reason;
-          }
-        }
-
-        closeOpen();
-
-        // 仅 tool_calls 且无正文时兜底,保证 content 非空
-        const hasText = blocks.some((b) => b.kind === "text" && b.text.trim());
-        if (finishReason === "tool_calls" && !hasText) {
-          seq += 1;
-          const id = `t${seq}`;
-          const note = "（模型请求调用工具，当前版本不执行工具。）";
-          const block: ChatBlock = { id, kind: "text", text: note };
-          blocks.push(block);
-          void send({ type: "block", id, block: { kind: "text" } });
-          void send({ delta: note, id });
-          void send({ type: "block_end", id, block });
-        }
+            return run.awaitConfirm(req.blockId);
+          },
+          // L1:写操作 / 命令执行前拍快照
+          beforeWrite: async ({ name, args }) => {
+            const cp = await checkpoints.snapshot(session.workspace, `${name} ${JSON.stringify(args).slice(0, 120)}`);
+            return cp?.sha ?? null;
+          },
+          // 每次工具执行写一条审计事件;只记参数摘要,不记文件内容
+          onToolEnd: (info) => {
+            const summary = JSON.stringify(info.args).slice(0, 300);
+            db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('tool.agent', ?, ?)").run(
+              JSON.stringify({ sessionId, name: info.name, args: summary, status: info.status, exitCode: info.exitCode }), now(),
+            );
+          },
+        });
+        finishReason = result.finishReason;
+        usage = result.usage;
+        finalProvider = result.provider;
+        builder.closeOpen();
 
         if (ac.signal.aborted) {
-          // 中断时为未结束的工具补 error/note
-          closeUnfinishedTools();
-          const content = textOf(blocks);
-          // 全空则什么都不落,避免留下空 assistant 行
-          const messageId = content || blocks.length ? persist({ content, blocks, aborted: true }) : null;
+          builder.closeUnfinished();
+          const content = builder.textOf();
+          let messageId: number | null = null;
+          try {
+            if (content || blocks.length) messageId = persist({ content, blocks, aborted: true });
+          } catch {
+            // 落库失败也要让客户端收尾
+          }
           send({ type: "cancelled", messageId, userMessageId });
           return;
         }
-        const content = textOf(blocks);
+        const content = builder.textOf();
         const messageId = persist({ content, blocks, aborted: false });
+        persistedId = messageId;
         db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('chat', ?, ?)").run(
           JSON.stringify({ sessionId, user: message, assistant: content }), now(),
         );
@@ -900,12 +1044,11 @@ export function createApp(
         // 标题通常早于回复完成;还没好时最多再等 1.5s,超时则只落库,下次刷新列表可见
         if (titlePending) await Promise.race([titlePending, new Promise((r) => setTimeout(r, 1500))]);
       } catch (e) {
-        // 中断后不再消费 Provider;主动关闭迭代器,让上游连接释放
-        if (ac.signal.aborted) void it?.return?.();
-        closeOpen();
+        // 中断后不再消费 Provider;runAgent 内部已关闭迭代器
+        builder.closeOpen();
         if (ac.signal.aborted) {
-          closeUnfinishedTools();
-          const content = textOf(blocks);
+          builder.closeUnfinished();
+          const content = builder.textOf();
           let messageId: number | null = null;
           try {
             if (content || blocks.length) messageId = persist({ content, blocks, aborted: true });
@@ -919,8 +1062,8 @@ export function createApp(
         // 出错时保留已生成的半截并标记 error,刷新后仍可见、可重试;
         // regenerate 出错时旧回答作为兄弟版本保留,不会被覆盖
         const error = (e instanceof Error ? e.message : "provider error").slice(0, 500);
-        closeUnfinishedTools("生成出错");
-        const content = textOf(blocks);
+        builder.closeUnfinished("生成出错");
+        const content = builder.textOf();
         let messageId: number | null = null;
         if (content || blocks.length) {
           try {
@@ -931,14 +1074,19 @@ export function createApp(
         }
         void send({ error, messageId, userMessageId });
       } finally {
+        // L5:有用量就记一行账(取消时也记,已经消耗的 token 是真实成本)
+        if (usage) {
+          try {
+            usageLedger.record({
+              sessionId, messageId: persistedId, providerId: finalProvider.config.id,
+              model: finalProvider.config.model || null, usage,
+              pricing: pricingOf(finalProvider.config), currency: providers.settings().currency,
+            });
+          } catch {
+            // 记账失败不影响回复
+          }
+        }
         runs.finish(run, ac.signal.aborted ? "cancelled" : outcome);
-      }
-
-      function textOf(list: ChatBlock[]): string {
-        return list
-          .filter((b): b is Extract<ChatBlock, { kind: "text" }> => b.kind === "text")
-          .map((b) => b.text)
-          .join("");
       }
 
       // 新回复挂在本轮 user 消息下并成为分支末端(F6)。regenerate 时旧回复作为兄弟版本保留,
@@ -1041,6 +1189,43 @@ export function createApp(
     return c.json({ candidates: n });
   });
 
+  // ---- L2:批量提取作业(导入历史后初始化记忆)----
+  app.get("/memory/jobs", (c) => c.json(memoryJobs.list()));
+  app.get("/memory/jobs/:id", (c) => {
+    const job = memoryJobs.get(c.req.param("id"));
+    if (!job) return c.json({ error: "作业不存在" }, 404);
+    return c.json({ ...job, items: memoryJobs.items(job.id) });
+  });
+  app.post("/memory/jobs", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { source?: string; sessionIds?: string[]; scope?: string };
+    const source = (b.source ?? "import").trim();
+    const ids = Array.isArray(b.sessionIds) ? b.sessionIds.filter((x) => typeof x === "string" && x) : [];
+    if (!ids.length) return c.json({ error: "缺少要处理的会话(sessionIds)" }, 400);
+    if (!memoryProvider()) return c.json({ error: "没有可用的记忆模型,请先在设置里配置" }, 400);
+    const job = memoryJobs.create({ source, sessionIds: ids, scope: b.scope ?? "global" });
+    void memoryJobs.run(job.id);
+    return c.json(memoryJobs.get(job.id));
+  });
+  app.post("/memory/jobs/:id/pause", (c) => {
+    if (!memoryJobs.pause(c.req.param("id"))) return c.json({ error: "作业不存在或已结束" }, 400);
+    return c.json(memoryJobs.get(c.req.param("id")));
+  });
+  app.post("/memory/jobs/:id/resume", (c) => {
+    if (!memoryJobs.resume(c.req.param("id"))) return c.json({ error: "作业不存在或不在暂停状态" }, 400);
+    return c.json(memoryJobs.get(c.req.param("id")));
+  });
+  app.post("/memory/jobs/:id/cancel", (c) => {
+    if (!memoryJobs.cancel(c.req.param("id"))) return c.json({ error: "作业不存在或已结束" }, 400);
+    return c.json(memoryJobs.get(c.req.param("id")));
+  });
+  // 按来源撤销全部记忆(软删除;二次确认由前端负责)
+  app.post("/memory/facts/revoke", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { sourceKind?: string };
+    const kind = (b.sourceKind ?? "").trim();
+    if (!kind) return c.json({ error: "缺少来源(sourceKind)" }, 400);
+    return c.json({ revoked: memory.revokeBySource(kind) });
+  });
+
   // ---- 子智能体任务(阶段 3)----
   // 单个:{ role, prompt, ... };批量:{ schedule:"parallel"|"pipeline", tasks:[{ role, prompt, ... }] }
   app.post("/tasks", async (c) => {
@@ -1094,6 +1279,25 @@ export function createApp(
     const t = taskStore.get(c.req.param("id"));
     return t ? c.json(t) : c.json({ error: "not found" }, 404);
   });
+  // L4:任务卡片展开时的详情 —— 完整 diff(base_sha..branch)与每步工具。
+  // 工具来自事件表,任务结束后事件流不再订阅,靠这里一次性补齐。
+  app.get("/tasks/:id/detail", async (c) => {
+    const t = taskStore.get(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    const rows = db
+      .prepare("SELECT payload, created_at FROM events WHERE type = 'task.tool' AND payload LIKE ? ORDER BY id ASC LIMIT 200")
+      .all(`%"taskId":"${t.id}"%`) as Array<{ payload: string; created_at: string }>;
+    const tools = rows.flatMap((r) => {
+      try {
+        const p = JSON.parse(r.payload) as { tool?: string; status?: string };
+        return p.tool ? [{ tool: p.tool, status: p.status ?? "", at: r.created_at }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const patch = t.baseSha && t.branch ? (await diffText(t.workspace, t.baseSha, t.branch)).slice(0, 200_000) : "";
+    return c.json({ branch: t.branch ?? null, baseSha: t.baseSha ?? null, patch, tools });
+  });
   app.post("/tasks/:id/cancel", (c) => {
     return scheduler.cancel(c.req.param("id"))
       ? c.json({ ok: true })
@@ -1110,6 +1314,131 @@ export function createApp(
     return scheduler.resume(c.req.param("id"), b.answer.trim())
       ? c.json({ ok: true })
       : c.json({ error: "任务不存在或未在等待用户" }, 400);
+  });
+
+  // L4:任务事件流(SSE)。先回放历史事件,再实时推送新事件。
+  app.get("/tasks/:id/events", (c) => {
+    const id = c.req.param("id");
+    if (!taskStore.get(id)) return c.json({ error: "not found" }, 404);
+    return streamSSE(c, async (stream) => {
+      let queue: Promise<unknown> = Promise.resolve();
+      let end!: () => void;
+      const ended = new Promise<void>((r) => (end = r));
+      const gone = () => end();
+      stream.onAbort(gone);
+      c.req.raw.signal.addEventListener("abort", gone, { once: true });
+      const seen = new Set<number>();
+      // 先订阅再回放:回放期间到达的事件会重复出现,按 events 表 id 去重
+      const unsub = taskEvents.subscribe(id, (e) => {
+        if (seen.has(e.id)) return;
+        seen.add(e.id);
+        queue = queue
+          .then(() => stream.writeSSE({ id: String(e.id), data: JSON.stringify(e) }))
+          .catch(() => {});
+      });
+      const rows = db
+        .prepare(
+          "SELECT id, type, payload, created_at FROM events WHERE type LIKE 'task.%' AND payload LIKE ? ORDER BY id ASC LIMIT 1000",
+        )
+        .all(`%"taskId":"${id}"%`) as Array<{
+        id: number; type: string; payload: string; created_at: string;
+      }>;
+      for (const r of rows) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        let payload: unknown = {};
+        try {
+          payload = JSON.parse(r.payload);
+        } catch {
+          // payload 损坏时按空对象回放,不中断整条流
+        }
+        await stream.writeSSE({
+          id: String(r.id),
+          data: JSON.stringify({ id: r.id, type: r.type, payload, createdAt: r.created_at }),
+        });
+      }
+      await ended;
+      unsub();
+      if (!c.req.raw.signal.aborted) await queue;
+    });
+  });
+
+  // L4:隔离分支的落地操作(合并 / 推送 / 建 PR / 丢弃)。
+  // 前端确认后调用,服务端再校验一次;只对有隔离分支的任务可用。
+  const withTask = async (id: string) => {
+    const t = taskStore.get(id);
+    return t ?? null;
+  };
+  app.post("/tasks/:id/merge", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { confirm?: boolean };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能合并" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (!t.worktree || !t.branch) return c.json({ error: "该任务没有待合并的隔离分支" }, 400);
+    try {
+      const output = await mergeBranch(t.workspace, t.branch);
+      await removeWorktree(t.workspace, t.worktree, t.branch);
+      taskStore.patch(t.id, { worktree: null, branch: null, diffStat: null });
+      return c.json({ ok: true, output });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  });
+  app.post("/tasks/:id/push", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { confirm?: boolean; remote?: string };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能推送" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (!t.branch) return c.json({ error: "该任务没有待推送的隔离分支" }, 400);
+    try {
+      const output = await pushBranch(t.workspace, t.branch, b.remote?.trim() || "origin");
+      return c.json({ ok: true, output });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  });
+  app.post("/tasks/:id/pr", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as {
+      confirm?: boolean; title?: string; body?: string; base?: string;
+    };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能建 PR" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (!t.branch) return c.json({ error: "该任务没有待推送的隔离分支" }, 400);
+    const title = b.title?.trim() || t.title || `子任务 ${t.role}`;
+    const body =
+      b.body?.trim() ||
+      [t.diffStat ? `## 变更\n\n\`\`\`\n${t.diffStat}\n\`\`\`` : "", t.result?.summary ?? ""]
+        .filter(Boolean)
+        .join("\n\n");
+    try {
+      // gh 建 PR 要求分支已在远端
+      await pushBranch(t.workspace, t.branch);
+      const r = await createPullRequest(t.workspace, t.branch, title, body, b.base);
+      if (r && "url" in r) return c.json({ ok: true, url: r.url });
+      if (r && "error" in r) return c.json({ ok: false, error: r.error }, 400);
+      // 没装 gh:给出 compare 链接,由用户自己开
+      const remote = await remoteUrl(t.workspace);
+      const compareUrl = remote ? `${remote}/compare/${t.baseSha ?? "main"}...${t.branch}` : null;
+      return c.json({ ok: false, error: "未安装 gh,无法自动建 PR", compareUrl }, 400);
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  });
+  app.post("/tasks/:id/discard", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { confirm?: boolean };
+    if (b.confirm !== true) return c.json({ error: "需要确认后才能丢弃" }, 400);
+    const t = await withTask(c.req.param("id"));
+    if (!t) return c.json({ error: "not found" }, 404);
+    if (t.status === "running") return c.json({ error: "任务还在运行,先停止再丢弃" }, 400);
+    if (!t.worktree || !t.branch) return c.json({ error: "该任务没有待丢弃的隔离分支" }, 400);
+    try {
+      await removeWorktree(t.workspace, t.worktree, t.branch);
+      taskStore.patch(t.id, { worktree: null, branch: null, diffStat: null });
+      return c.json({ ok: true });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
   });
 
   // 修改会话:工作区(Code/Work 绑定项目目录)、标题重命名、归档开关;至少给一个字段
@@ -1167,15 +1496,79 @@ export function createApp(
       return c.json({ error: e instanceof Error ? e.message : "write failed" }, 400);
     }
   });
+  // F7:先按权限规则判定。deny 直接 403;ask 且未确认返回 409 并给出规则与原因
+  const shellVerdict = (workspace: string, command: string, confirmed?: boolean) => {
+    const rules = loadPermissions(workspace, { homeDir: homedir() });
+    const req = { kind: "Bash" as const, tool: "bash", command };
+    const v = decide(rules, req);
+    if (v.decision === "allow" || confirmed) return { ok: true as const, verdict: v };
+    return { ok: false as const, verdict: v };
+  };
   app.post("/tools/shell", async (c) => {
     const b = (await c.req.json()) as { workspace: string; command: string; shell?: string; confirmed?: boolean };
+    const check = shellVerdict(b.workspace, b.command, b.confirmed);
+    if (!check.ok) {
+      const status = check.verdict.decision === "deny" ? 403 : 409;
+      return c.json(
+        { error: check.verdict.reason, needsConfirm: check.verdict.decision === "ask", rule: suggestRule({ kind: "Bash", tool: "bash", command: b.command }), reason: check.verdict.reason },
+        status,
+      );
+    }
     try {
-      const r = await shellExec(b);
+      const r = await shellExec({ ...b, confirmed: true });
       auditTool("tool.shell", { workspace: b.workspace, shell: r.shell, command: r.command, exitCode: r.exitCode });
       return c.json(r);
     } catch (e) {
       const err = e as Error & { needsConfirm?: boolean };
       return c.json({ error: err.message, needsConfirm: err.needsConfirm === true }, err.needsConfirm ? 409 : 400);
+    }
+  });
+
+  // F7:流式执行。逐块推送输出,最后一条是完整结果;客户端断开时结束进程树
+  app.post("/tools/shell/stream", async (c) => {
+    const b = (await c.req.json()) as { workspace: string; command: string; shell?: string; confirmed?: boolean };
+    const check = shellVerdict(b.workspace, b.command, b.confirmed);
+    if (!check.ok) {
+      const status = check.verdict.decision === "deny" ? 403 : 409;
+      return c.json(
+        { error: check.verdict.reason, needsConfirm: check.verdict.decision === "ask", rule: suggestRule({ kind: "Bash", tool: "bash", command: b.command }), reason: check.verdict.reason },
+        status,
+      );
+    }
+    return streamSSE(c, async (stream) => {
+      const ac = new AbortController();
+      stream.onAbort(() => ac.abort());
+      try {
+        const r = await shellExec({
+          ...b,
+          confirmed: true,
+          signal: ac.signal,
+          onData: (data, s) => void stream.writeSSE({ data: JSON.stringify({ type: "output", stream: s, data }) }),
+        });
+        auditTool("tool.shell", { workspace: b.workspace, shell: r.shell, command: r.command, exitCode: r.exitCode });
+        await stream.writeSSE({ data: JSON.stringify({ type: "result", ...r }) });
+      } catch (e) {
+        if (!ac.signal.aborted)
+          await stream.writeSSE({ data: JSON.stringify({ type: "error", error: e instanceof Error ? e.message : "shell failed" }) });
+      }
+    });
+  });
+
+  // F7:权限规则查询与"本项目始终允许"
+  app.get("/tools/permissions", (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    const rules = loadPermissions(workspace, { homeDir: homedir() });
+    return c.json({ workspace, ...rules });
+  });
+  app.post("/tools/permissions/allow", async (c) => {
+    const b = (await c.req.json()) as { workspace: string; rule: string };
+    if (!b?.workspace || !b.rule?.trim()) return c.json({ error: "缺少 workspace 或 rule" }, 400);
+    try {
+      addAllowRule(b.workspace, b.rule.trim());
+      auditTool("permissions.allow", { workspace: b.workspace, rule: b.rule.trim() });
+      return c.json({ ok: true });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : "写入失败" }, 400);
     }
   });
   app.post("/tools/git/status", async (c) => {
@@ -1236,6 +1629,20 @@ export function createApp(
 
   // ---- Work(阶段 5):文档导入、来源记录、待办 ----
   app.get("/work/docs", (c) => c.json(work.listDocs(c.req.query("workspace") || undefined)));
+  // F8:文档检索。返回命中块(bm25 排序),snippet 带高亮标记,前端点开定位到块。
+  // 必须注册在 /work/docs/:id 之前,否则 "search" 会被当成 id。
+  app.get("/work/docs/search", (c) => {
+    const q = (c.req.query("q") ?? "").trim();
+    if (!q) return c.json([]);
+    const limit = Math.min(Number(c.req.query("limit")) || 10, 50);
+    const hits = work.searchDocs(q, limit, c.req.query("workspace") || undefined);
+    return c.json(
+      hits.map((d) => ({
+        docId: d.id, title: d.title, source: d.source, kind: d.kind, workspace: d.workspace,
+        ord: d.ord, start: d.start, end: d.end, snippet: d.snippet,
+      })),
+    );
+  });
   app.get("/work/docs/:id", (c) => {
     const d = work.getDoc(c.req.param("id"));
     return d ? c.json(d) : c.json({ error: "not found" }, 404);
@@ -1243,7 +1650,7 @@ export function createApp(
   app.post("/work/docs/import-file", async (c) => {
     const b = (await c.req.json()) as { workspace: string; path: string; sessionId?: string };
     try {
-      const d = work.importFile(b.workspace, b.path, b.sessionId);
+      const d = await work.importFile(b.workspace, b.path, b.sessionId);
       auditTool("work.doc.import", { kind: "file", source: d.source, title: d.title });
       return c.json(d);
     } catch (e) {
@@ -1266,6 +1673,24 @@ export function createApp(
     const b = (await c.req.json()) as { title: string; content: string; workspace?: string; sessionId?: string };
     if (!b.content?.trim()) return c.json({ error: "缺少 content" }, 400);
     return c.json(work.importPaste(b.title || "粘贴资料", b.content, b));
+  });
+  // F8:拖入 PDF / Word。文件只转成文本存为资料,不写进用户工作区
+  app.post("/work/docs/upload", async (c) => {
+    const form = await c.req.parseBody().catch(() => null);
+    const file = form?.file;
+    if (!file || typeof file === "string") return c.json({ error: "缺少文件(multipart 字段 file)" }, 400);
+    const workspace = typeof form?.workspace === "string" ? form.workspace : "";
+    const sessionId = typeof form?.sessionId === "string" ? form.sessionId : undefined;
+    if (!isConvertible(file.name)) return c.json({ error: "只支持拖入 PDF 或 Word(.docx)文件" }, 415);
+    try {
+      const r = await convertToText(file.name, Buffer.from(await file.arrayBuffer()));
+      if (!r.text.trim()) return c.json({ error: r.warning ?? "文件没有可提取的文字" }, 415);
+      const doc = work.importConverted(file.name, file.name, r.text, { workspace, sessionId });
+      auditTool("work.doc.import", { kind: "upload", source: file.name, title: doc.title, bytes: r.text.length });
+      return c.json(r.warning ? { ...doc, warning: r.warning } : doc);
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : "import failed" }, 400);
+    }
   });
   app.delete("/work/docs/:id", (c) => {
     work.removeDoc(c.req.param("id"));
@@ -1292,6 +1717,54 @@ export function createApp(
 
   // ---- Skill(阶段 6):导入不自动启用,禁用后立即不再注入 ----
   app.get("/skills", (c) => c.json(skills.list()));
+
+  // ---- B3:MCP ----
+  app.get("/mcp/servers", async (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    const servers = await mcp.status(workspace);
+    const tools = await mcp.toolList(workspace).catch(() => []);
+    const { projectPending } = effectiveConfig(workspace);
+    return c.json({ servers, tools, projectPending, projectTrusted: workspace ? isProjectTrusted(workspace) : true });
+  });
+  app.get("/mcp/config", (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    return c.json({ user: loadUserConfig(), project: workspace ? loadProjectConfig(workspace) : { mcpServers: {} } });
+  });
+  app.put("/mcp/config", async (c) => {
+    const body = (await c.req.json().catch(() => null)) as { user?: unknown } | null;
+    const cfg = body?.user as { mcpServers?: unknown } | undefined;
+    if (!cfg || typeof cfg !== "object" || typeof cfg.mcpServers !== "object" || cfg.mcpServers === null)
+      return c.json({ error: "格式必须是 { mcpServers: { ... } }" }, 400);
+    for (const [name, sc] of Object.entries(cfg.mcpServers as Record<string, unknown>)) {
+      if (!name.trim()) return c.json({ error: "服务器名不能为空" }, 400);
+      const s = sc as Record<string, unknown>;
+      const remote = s.type === "http" || s.type === "sse";
+      if (remote ? typeof s.url !== "string" : typeof s.command !== "string")
+        return c.json({ error: `${name}:${remote ? "缺少 url" : "缺少 command"}` }, 400);
+    }
+    saveUserConfig(cfg as { mcpServers: Record<string, never> });
+    return c.json({ ok: true });
+  });
+  app.post("/mcp/servers/:name/restart", async (c) => {
+    const workspace = c.req.query("workspace") ?? "";
+    const ok = await mcp.restart(workspace, c.req.param("name"));
+    return c.json({ ok });
+  });
+  // 项目级配置信任:首次使用前需批准;内容变化后需重新批准
+  app.post("/mcp/trust", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { workspace?: string; revoke?: boolean };
+    if (!b.workspace) return c.json({ error: "缺少 workspace" }, 400);
+    if (b.revoke) revokeProjectTrust(b.workspace);
+    else trustProject(b.workspace);
+    return c.json({ ok: true, trusted: isProjectTrusted(b.workspace) });
+  });
+  app.post("/mcp/import/claude-desktop/preview", (c) => c.json(previewClaudeDesktopImport()));
+  app.post("/mcp/import/claude-desktop/apply", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { names?: unknown };
+    const names = Array.isArray(b.names) ? b.names.filter((x): x is string => typeof x === "string") : [];
+    if (!names.length) return c.json({ error: "缺少 names" }, 400);
+    return c.json(applyClaudeDesktopImport(names));
+  });
   app.post("/skills/import", async (c) => {
     const b = (await c.req.json()) as { path: string };
     try {
@@ -1513,6 +1986,12 @@ export function createApp(
     if (parsed instanceof Response) return parsed;
     const convs = parsed.conversations.filter((x) => x.messages.length);
     const dates = convs.map((x) => x.createdAt).sort();
+    // L2:可提取记忆的会话数(至少 2 轮 user)与 token 估算,供前端展示成本
+    const extractable = convs.filter((x) => x.messages.filter((m) => m.role === "user").length >= 2);
+    const estTokens = extractable.reduce(
+      (n, x) => n + estimateTokens(x.messages.map((m) => m.content).join("\n")),
+      0,
+    );
     return c.json({
       source: parsed.source,
       conversations: convs.length,
@@ -1521,12 +2000,17 @@ export function createApp(
       empty: parsed.conversations.length - convs.length,
       from: dates[0] ?? null,
       to: dates[dates.length - 1] ?? null,
+      extractable: extractable.length,
+      estimatedTokens: estTokens,
     });
   });
   app.post("/admin/import/external", async (c) => {
     const parsed = await readExternal(c);
     if (parsed instanceof Response) return parsed;
+    // L2:导入后可选从这些对话批量提取记忆(前端在预览弹窗勾选,用 ?extract=1 传)
+    const extract = c.req.query("extract") === "1";
     const added = { sessions: 0, messages: 0 };
+    const addedIds: string[] = [];
     const skipped = { duplicate: 0, empty: 0 };
     try {
       db.exec("BEGIN");
@@ -1549,6 +2033,7 @@ export function createApp(
         }
         setHead.run(conv.headKey == null ? null : (idOf.get(conv.headKey) ?? null), sid);
         added.sessions++;
+        addedIds.push(sid);
       }
       db.exec("COMMIT");
     } catch (e) {
@@ -1558,7 +2043,22 @@ export function createApp(
     db.prepare("INSERT INTO events (type, payload, created_at) VALUES ('data.import.external', ?, ?)").run(
       JSON.stringify({ source: parsed.source, added, skipped }), now(),
     );
-    return c.json({ ok: true, source: parsed.source, added, skipped });
+    // L2:勾选了就创建提取作业(至少 2 轮 user 的会话才进队列);
+    // 记忆模型没配置时不让整次导入失败,只返回提示
+    let job: ReturnType<MemoryJobRunner["create"]> | null = null;
+    let jobError: string | undefined;
+    if (extract && addedIds.length) {
+      const usable = addedIds.filter(
+        (sid) => (db.prepare("SELECT COUNT(*) c FROM messages WHERE session_id = ? AND role = 'user'").get(sid) as { c: number }).c >= 2,
+      );
+      if (!memoryProvider()) jobError = "没有可用的记忆模型,已导入但未提取记忆";
+      else if (!usable.length) jobError = "导入的对话不足 2 轮,没有可提取的内容";
+      else {
+        job = memoryJobs.create({ source: `import:${parsed.source}`, sessionIds: usable, scope: "global" });
+        void memoryJobs.run(job.id);
+      }
+    }
+    return c.json({ ok: true, source: parsed.source, added, skipped, ...(job ? { job } : {}), ...(jobError ? { jobError } : {}) });
   });
 
   return app;

@@ -15,11 +15,19 @@ export type ModelRole =
 // 接口协议(M2 / D-021):openai = Chat Completions 兼容(含 Azure、各家网关);anthropic = Messages API;gemini = Gemini API
 export type ProviderProtocol = "openai" | "anthropic" | "gemini";
 
+// 模型价格(L5):单位为「每百万 tokens」;缺省视为未定价,不计入成本账本。
+export interface ModelPricing {
+  input: number; // 每百万输入 tokens 价格
+  output: number; // 每百万输出 tokens 价格
+  cachedInput?: number; // 每百万缓存命中 tokens 价格;缺省按 input 计
+}
+
 // 同一个 Provider 下的一个可选模型;未填的上下文 / 能力沿用 Provider 级配置
 export interface ModelInfo {
   id: string;
   contextLength?: number;
   capabilities?: string[];
+  pricing?: ModelPricing;
 }
 
 export interface ModelParams {
@@ -44,6 +52,7 @@ export interface ProviderConfig {
   headers?: Record<string, string>;
   query?: Record<string, string>;
   params?: ModelParams;
+  currency?: string; // 账本计价货币,缺省 USD
 }
 
 // Provider 的全部可选模型:默认模型在首位,继承 Provider 级上下文长度与能力
@@ -58,6 +67,7 @@ export function modelsOf(c: Pick<ProviderConfig, "model" | "models" | "contextLe
       id,
       ...(m.contextLength ?? c.contextLength ? { contextLength: m.contextLength ?? c.contextLength } : {}),
       ...(m.capabilities?.length || c.capabilities?.length ? { capabilities: m.capabilities?.length ? m.capabilities : c.capabilities } : {}),
+      ...(m.pricing ? { pricing: m.pricing } : {}),
     });
   };
   // 默认模型若在列表里有单独的上下文 / 能力设置,以列表项为准
@@ -72,6 +82,16 @@ export function withModel(c: ProviderConfig, model?: string | null): ProviderCon
   const info = all.find((m) => m.id === model) ?? all[0];
   if (!info) return c;
   return { ...c, model: info.id, contextLength: info.contextLength, capabilities: info.capabilities };
+}
+
+// 某个模型的价格(每百万 tokens);未配置返回 undefined(视为未定价,不计入成本)
+export function pricingOf(
+  c: { model: string; models?: ModelInfo[] },
+  model?: string | null,
+): ModelPricing | undefined {
+  const id = (model ?? c.model ?? "").trim();
+  if (!id) return undefined;
+  return (c.models ?? []).find((m) => m?.id === id)?.pricing;
 }
 
 export type ChatBlock =
@@ -95,6 +115,7 @@ export type ChatBlock =
       runId?: string; // 仅 awaiting:确认请求发往该运行(POST /runs/:id/confirm)
       rule?: string; // 仅 awaiting:"本项目始终允许"将写入的规则,如 Bash(npm run *)
       reason?: string; // 仅 awaiting:为什么需要确认
+      checkpoint?: string; // 执行前的快照 sha(L1),可用于回退
     }
   | { id: string; kind: "text"; text: string }
   // 仅 user 消息;文件引用带工作区相对路径与引用时内容的指纹(F4:之后文件变更时提示模型内容可能过时)
@@ -142,6 +163,8 @@ export interface TokenUsage {
 export interface ChatMessage {
   // id 仅持久化消息有(数据库自增主键);流式中的临时气泡没有
   id?: number;
+  // 本轮开始前的工作区快照(L1);只有 user 消息有,用于"回退到这里"
+  checkpointSha?: string;
   // tool 仅出现在发给模型的请求里(agent 循环中的工具结果)
   role: "system" | "user" | "assistant" | "tool";
   content: string;
@@ -184,6 +207,10 @@ export interface Fact {
   validFrom: string;
   validTo: string | null;
   deletedAt: string | null;
+  // L2:出处回链。sourceMessageId 指向产生这条记忆的原消息
+  sourceMessageId?: number;
+  sourceKind?: string; // import:chatgpt / import:claude / extract:<sessionId>
+  sourceSessionId?: string; // 产生这条记忆的会话(定位「查看出处」)
 }
 
 // 阶段 2:候选记忆。提取流水线产出,用户确认后才成为事实。
@@ -202,6 +229,33 @@ export interface MemoryCandidate {
   status: "pending" | "confirmed" | "rejected";
   createdAt: string;
   resolvedAt: string | null;
+  // L2:出处(确认成事实时传给 Fact)
+  sourceMessageId?: number;
+  sourceKind?: string;
+  sourceSessionId?: string;
+}
+
+// L2:批量记忆提取作业(导入历史后初始化记忆)
+export type MemoryJobStatus = "queued" | "running" | "paused" | "done" | "cancelled";
+
+export interface MemoryJob {
+  id: string;
+  source: string;
+  status: MemoryJobStatus;
+  total: number;
+  done: number;
+  failed: number;
+  error: string | null;
+  scope: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryJobItem {
+  sessionId: string;
+  status: string;
+  factsAdded: number;
+  error: string | null;
 }
 
 export interface SessionMeta {
@@ -352,4 +406,32 @@ export interface SubagentTask {
   startedAt: string | null;
   finishedAt: string | null;
   durationMs: number | null;
+  // L4:隔离工作区。写角色(code 模式)任务在 git 仓库里跑独立 worktree + 分支,
+  // 改动不直接落在用户工作区,需用户确认后合并 / 推送。
+  worktree?: string | null; // worktree 绝对路径
+  branch?: string | null; // 分支名(xiyun/<taskId>)
+  baseSha?: string | null; // 分支起点(用户工作区当时的 HEAD)
+  steps?: number | null; // 模型调用步数
+  usage?: TokenUsage | null; // token 用量
+  diffStat?: string | null; // 相对 baseSha 的变更统计(git diff --stat)
+}
+
+// L5:用量账本一行(按天 / 会话 / 服务商 / 模型聚合后的结果)
+export interface UsageRow {
+  key: string; // 聚合键(日期 / 会话 id / provider id / 模型名)
+  label: string; // 展示名
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  cost: number; // 计价货币下的金额
+}
+
+export interface UsageSummary {
+  groupBy: "day" | "session" | "provider" | "model";
+  rows: UsageRow[];
+  total: UsageRow;
+  currency: string;
+  budget?: number | null; // 日预算(未设置时为 null)
+  spentToday?: number; // 今日已花费
 }
